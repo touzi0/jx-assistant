@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -376,12 +377,64 @@ func pingModel(p *ProviderCfg, model string) error {
 	return nil
 }
 
+// flexStrings 是形态不固定的字符串列表字段：同一个 modalities，有的端点写
+// ["text","image"]，有的网关写 {"input":["text","image"],"output":["text"]}，
+// 还有的模型整个字段不写。硬绑 []string 时只要有一个模型写法不同，整份清单就
+// 解析失败（用户实际踩到过），所以这里一律摊平成扁平字符串列表：
+//   - 字符串 → 单个元素；数组 → 逐项摊平
+//   - 对象   → 按 key 字典序摊平各值（input 自然排在 output 前）
+//   - null/缺失/数字等非字符串 → 忽略，不报错
+//
+// 消费方只关心「里面有没有 image」「有哪些思考档位」，摊平后语义不变。
+type flexStrings []string
+
+func (f *flexStrings) UnmarshalJSON(b []byte) error {
+	*f = appendFlexStrings(nil, b)
+	return nil
+}
+
+// appendFlexStrings 把一个 JSON 值里的字符串摊平追加到 dst。
+func appendFlexStrings(dst []string, raw json.RawMessage) []string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return dst
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+			dst = append(dst, s)
+		}
+	case '[':
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) == nil {
+			for _, it := range items {
+				dst = appendFlexStrings(dst, it)
+			}
+		}
+	case '{':
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) == nil {
+			keys := make([]string, 0, len(obj))
+			for k := range obj {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys) // 不依赖 Go 的 map 随机序：同一份响应每次解析结果一致
+			for _, k := range keys {
+				dst = appendFlexStrings(dst, obj[k])
+			}
+		}
+	}
+	return dst
+}
+
 // FetchModels 从提供方拉取可用模型清单（GET {baseURL}/models），
 // 新条目按 ID 猜测上下文窗口与图片能力自动填好。
-// FetchModels 从提供方拉取可用模型清单（GET {baseURL}/models）。
 // DeepSeek 等较新的兼容端会在清单里直接给出 context_window /
-// max_output_tokens / input_modalities / effort.supported_levels——
-// 这些真实字段优先；只返回 id 的老式端点回退到按 ID 猜测。
+// max_output_tokens / input_modalities / reasoning_levels /
+// effort.supported_levels——这些真实字段优先；只返回 id 的老式端点回退到按 ID 猜测。
+// 这些字段的 JSON 形态各家不一（数组/对象/缺失都见过），统一走 flexStrings
+// 归一，单个模型的写法差异不会让整份清单解析失败。
 func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -403,15 +456,16 @@ func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 	}
 	var out struct {
 		Data []struct {
-			ID              string   `json:"id"`
-			Name            string   `json:"name"`
-			ContextWindow   int      `json:"context_window"`
-			ContextLength   int      `json:"context_length"` // 部分端点的同义字段
-			MaxOutputTokens int      `json:"max_output_tokens"`
-			InputModalities []string `json:"input_modalities"`
-			Modalities      []string `json:"modalities"`
+			ID              string      `json:"id"`
+			Name            string      `json:"name"`
+			ContextWindow   int         `json:"context_window"`
+			ContextLength   int         `json:"context_length"` // 部分端点的同义字段
+			MaxOutputTokens int         `json:"max_output_tokens"`
+			InputModalities flexStrings `json:"input_modalities"`
+			Modalities      flexStrings `json:"modalities"` // 数组或 {"input":[],"output":[]}
+			ReasoningLevels flexStrings `json:"reasoning_levels"`
 			Effort          struct {
-				SupportedLevels []string `json:"supported_levels"`
+				SupportedLevels flexStrings `json:"supported_levels"`
 			} `json:"effort"`
 		} `json:"data"`
 	}
@@ -443,7 +497,12 @@ func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 				}
 			}
 		}
-		levels := m.Effort.SupportedLevels
+		// 思考档位：扁平写法 reasoning_levels 优先，其次 effort.supported_levels，
+		// 都没有才按模型 ID 猜（空数组也算没有，回退到猜测）。
+		levels := []string(m.ReasoningLevels)
+		if len(levels) == 0 {
+			levels = []string(m.Effort.SupportedLevels)
+		}
 		if len(levels) == 0 {
 			levels = guessReasoningLevels(m.ID)
 		}
