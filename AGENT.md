@@ -1080,7 +1080,7 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
 | 模式 | 说明 | 工具 |
 |---|---|---|
 | `task` | 任务会话，实际干活 | 读/写/编辑/glob/grep/shell（含后台作业 job_*）/web_fetch/**web_search（联网搜索，经服务端搜索网关，见 websearch.go；服务端半边是 jxaiserver 的 search.go，协议改动需双侧同步）** + ask_user_question / exit_plan_mode / progress_write + **dispatch_sub（派子对话）** + **call_api（与前端同接口的通用直调，见 callapi.go）** + **request_manager（找长期助理协调，见 requestmgr.go）** + 历史查询 |
-| `assistant` | 数字助理总控（左上角唯一入口，不占侧栏） | 编排：list_sessions / read_session_summary / **dispatch_task（派顶层工作任务）** / send_to_session（给已有会话发话：执行中＝**插话**注入当前轮、空闲＝直接开跑，可选 permission 只能同等或降权）/ stop_session（按用户指示分级停止：协作取消→3 秒未收口自动强制终结，与人工停止按钮同一停止函数、仅触发者不同）/ **call_api（与前端同接口的通用直调，见 callapi.go）** + deliver_result（把派发产出的成果文件登记为本对话的交付卡片，只展示不搬文件）+ **只读四件套 read/list_dir/glob/grep + web_fetch（答小问题：约十步内的查看自己看文件回答，大文件通读与批量分析仍派任务；写与执行类工具绝不给总控——纪律见 agent.go 的 assistantPrompt）**+ 历史查询 |
+| `assistant` | 数字助理总控（左上角唯一入口，不占侧栏） | 编排：list_sessions / read_session_summary / **dispatch_task（派顶层工作任务）** / send_to_session（给已有会话发话：执行中＝**插话**注入当前轮、空闲＝直接开跑，可选 permission 只能同等或降权；2026-11-15 起两工具另有 thinking 思考档位与 unsandboxed/browser/computer 三个能力开关参数，见下文「派发关系」）/ stop_session（按用户指示分级停止：协作取消→3 秒未收口自动强制终结，与人工停止按钮同一停止函数、仅触发者不同）/ **call_api（与前端同接口的通用直调，见 callapi.go）** + deliver_result（把派发产出的成果文件登记为本对话的交付卡片，只展示不搬文件）+ **只读四件套 read/list_dir/glob/grep + web_fetch（答小问题：约十步内的查看自己看文件回答，大文件通读与批量分析仍派任务；写与执行类工具绝不给总控——纪律见 agent.go 的 assistantPrompt；2026-11-15 assistantPrompt 换为用户逐段审定的定稿：八节结构（只判断只转手 / 转达 / 派人 / 派发参数 / 求助与审批 / 汇报 / 沉淀 / 复盘改进 + 附提问分寸），原 managerCoordPrompt 协调段与 askTierPrompt 附注已并入正文，systemPrompt 对 assistant 不再重复拼接那两段）**+ 历史查询 |
 | `aux` | 辅助对话：早期的只读答疑小会话（右栏可见；新建子对话自 0007 起改为分支克隆，见下节） | 只读文件 + web_fetch/web_search + 历史查询 |
 | `skill-create` | 创建技能：把「怎么做」沉淀成给后续 AI 照做的 SKILL.md 教程——用户点按钮录演示让 AI 分析，或直接派活让 AI 探路总结；**默认完全访问**（演示记录与亲自验证都刚需电脑/浏览器）；提示词核心是「顿悟操作逻辑 + 写大致步骤不写死细节」（推荐/避免方式、快捷键、抗界面变化，见 agent.go `skillPrompt`） | task 全量工具 + **register_skill（注册/覆盖技能）**；演示录制归用户直控（界面按钮经 `/api/demo-record/*`，材料以【演示记录】通知进对话） |
 
@@ -1106,6 +1106,38 @@ interject mode=steer），目标空闲则直接作为
 成果时把文件登记成交付卡片展示在本对话——文件本身可能已被任务会话交付到位，总控只
 负责让用户在总控对话里看得见、拿得到，不重复搬运；路径填绝对值，登记失败多半是文件
 已被搬走，翻该会话的【交付结果】/【交付完成】注记找新位置）。
+
+**提示词改动（2026-11-15）**：① `assistantPrompt` 整体换为用户逐段审定的定稿
+（见上表 assistant 行，协调段与提问分寸并入正文）；② `officePrompt` 工作准则
+第 2 条由「动手优先：需要资料就检索文件与网页……」改为「**数据可靠**：数据与
+事实不凭空捏造，该算就用工具算（执行命令/脚本）；查不到、又算不出来的就如实
+说明，不要编造」——用户口径：从强调动手改成强调数据、不要凭空捏造就够了，
+之前它有点太爱去查东西（其余模式一字未动）。钉提示词文本的断言同步更新：
+`orchestration_test.go` 的 `TestAssistantLosesSubDispatchTools`（「建会话一律用
+dispatch_task」→「建会话只用 dispatch_task」）与 `TestAssistantReadOnlyTools`
+（纪律关键词换成定稿表述）。
+
+**派发新参数（2026-11-15，`dispatch_task` 与 `send_to_session` 各加四个，全部可选、
+不传时行为与之前逐字节一致——有单测钉死：`TestDispatchNewParamsAbsentKeepBehavior`）**：
+
+- `thinking`：思考档位，取值 `enabled/disabled/low/medium/high/max` 或空——与
+  PATCH `/api/sessions/{id}` 的白名单、设置里会话思考档位**同一套枚举**（单源
+  `validThinkingLevel`，sessioncreate.go）。dispatch_task 落进新会话的
+  `sessions.thinking`（开轮即生效）；send_to_session 写目标会话配置再投递——
+  对方空闲则开出的新轮即生效，正在执行的那一轮不中途切换（思考档位不在
+  `syncRunPerms` 的每步同步范围，与人工 PATCH 同款边界）、下一轮起生效。
+- `unsandboxed` / `browser` / `computer`：三个能力开关，**字段名照会话权限模型的
+  真实现**——就是 `SessionMeta.Tools`（sessions 表 tools 列）里的能力 id，与权限
+  芯片勾选、`hasCapability` 门控写同一个东西（存会话配置，非运行态；运行中的
+  会话每步经 `syncRunPerms` 从库同步 Permission/Tools，能力改动下一步即生效）。
+  语义**只能关、不能开**（`applyDispatchCaps`，assistant.go）：`false`＝强制关闭
+  （收窄永远安全）；`true`＝要求开启，先校验**派发方自己实际拥有**该能力
+  （完全访问档的捆绑视为拥有），没有即拒绝并报错——不借派发参数提权、不静默
+  钳制；不传＝不动（新会话按模式默认能力，已有会话保持现状）。目标为完全访问
+  档时三项是捆绑能力（`bundleFullAccessCaps`）：true 无实际变化、false 拒绝
+  （不可单独关闭，与权限面板联动一致）。注意接口语义是「布尔三态」：参数省略
+  ＝不动，显式 `false` 才是关——所以 Go 侧用 `*bool` 解析（`dispatchCaps` 以
+  **匿名字段**内嵌进参数结构，命名字段会让平铺的 `browser` 键解不进来）。
 
 ## 执行的生死与对话中途发消息
 
@@ -1236,8 +1268,9 @@ report_ready / done / stopped），前端常驻订阅：父对话里的子任务
   计划模式暂停；只带文本、不携带权限——经理后续动作仍受它自己的权限档与用户
   审批约束，这条通道不构成提权路径。
 - **提示词成对**：执行模式拿 agent.go 的 `managerAskPrompt`（什么时候找、找什么、
-  不用等），数字助理拿 `managerCoordPrompt`（它们不等你、你可以插话/派活/先不动、
-  排先后是你的事）；工具说明只留一句「这是求助用的，不要滥用」。
+  不用等），数字助理侧的对应口径在 `assistantPrompt` 定稿的第五节「任务来找你、
+  审批来找你」（2026-11-15 换版时由原独立拼接段 `managerCoordPrompt` 并入正文，
+  拼接段已删除）；工具说明只留一句「这是求助用的，不要滥用」。
 
 ## 上下文管理（核心特色）
 

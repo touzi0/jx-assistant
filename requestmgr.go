@@ -15,7 +15,7 @@ package main
 //     也不给任务侧添超时/兜底这类必须写对的参数；
 //   - 经理侧不需要新工具：它已经有 send_to_session / dispatch_task，
 //     「回不回、什么时候回、怎么回」由它按全局情况决定（准则见 agent.go 的
-//     managerAskPrompt 与 managerCoordPrompt 两段提示词）。
+//     managerAskPrompt 与 assistantPrompt 定稿的「任务来找你」节）。
 //
 // 设计边界（与既有约定一致）：
 //   - 只有顶层任务会话能用：子对话拿到工具也调不通（调用时硬拦，与 dispatch_sub

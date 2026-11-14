@@ -38,6 +38,22 @@ func createSessionErrCode(err error) int {
 	return 500
 }
 
+// thinkingLevelsDoc 是思考档位的人话枚举（报错文案共用，与 PATCH /api/sessions/{id}
+// 的白名单、设置里会话思考档位同一套）。
+const thinkingLevelsDoc = "enabled/disabled/low/medium/high/max"
+
+// validThinkingLevel 判断思考档位是否合法（空串＝服务端默认，合法；max 是
+// deepseek/Anthropic 的档位）。单源：PATCH 改会话设置、dispatch_task /
+// send_to_session 的 thinking 参数、人工建会话三处共用同一枚举，避免各写一份
+// 漂移（各协议渠道对档位的映射见 llm.go / llmproto.go，这里只管合法值）。
+func validThinkingLevel(t string) bool {
+	switch t {
+	case "", "enabled", "disabled", "low", "medium", "high", "max":
+		return true
+	}
+	return false
+}
+
 // createSessionParams 三入口共用的建会话参数。权限/模式是**入口校验后的最终
 // 值**（service 只兜底默认：模式未知退 task、权限空按「workspace-write +
 // 创建技能/长期助理主对话 full」补——与人工口径一致；派发入口总是显式传值，

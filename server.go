@@ -2275,19 +2275,18 @@ func (a *App) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Thinking != nil {
-		// 合法档位枚举全集（不分协议：同一档位串在不同协议渠道由协议层各自
-		// 映射，见 llmproto.go；max 是 deepseek/Anthropic 的档位，漏了它会让
-		// 已有会话切到 max 被 400 拒绝）
-		switch t := strings.TrimSpace(*body.Thinking); t {
-		case "", "enabled", "disabled", "low", "medium", "high", "max":
-			old := m.Thinking
-			m.Thinking = t
-			if old != t {
-				notes = append(notes, ctxNote{ctxThinking, "思考档位：" + old + " → " + t})
-			}
-		default:
-			writeErr(w, 400, "thinking 档位必须是 enabled/disabled/low/medium/high/max 或空")
+		// 合法档位枚举单源在 validThinkingLevel（sessioncreate.go）：PATCH 改设置、
+		// 派发工具的 thinking 参数、人工建会话三处同一套（同一档位串在不同协议
+		// 渠道由协议层各自映射，见 llmproto.go）
+		t := strings.TrimSpace(*body.Thinking)
+		if !validThinkingLevel(t) {
+			writeErr(w, 400, "thinking 档位必须是 "+thinkingLevelsDoc+" 或空")
 			return
+		}
+		old := m.Thinking
+		m.Thinking = t
+		if old != t {
+			notes = append(notes, ctxNote{ctxThinking, "思考档位：" + old + " → " + t})
 		}
 	}
 	if body.PlanMode != nil {

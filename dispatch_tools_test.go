@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -76,7 +77,8 @@ func paramTypes(t *testing.T, tl Tool) map[string]any {
 // 两个派发工具的 schema 都要有新增的参数格子（含类型）。
 func TestDispatchToolsSchemaHasNewParams(t *testing.T) {
 	taskProps := paramTypes(t, dispatchTaskTool())
-	for _, k := range []string{"task", "title", "workspace", "model", "mode", "plan_mode", "attachments", "permission"} {
+	for _, k := range []string{"task", "title", "workspace", "model", "mode", "plan_mode", "attachments", "permission",
+		"thinking", "unsandboxed", "browser", "computer"} {
 		if _, ok := taskProps[k]; !ok {
 			t.Fatalf("dispatch_task 缺参数 %s", k)
 		}
@@ -87,11 +89,35 @@ func TestDispatchToolsSchemaHasNewParams(t *testing.T) {
 	if got := taskProps["attachments"].(map[string]any)["type"]; got != "array" {
 		t.Fatalf("attachments 应是 array, got %v", got)
 	}
+	for _, k := range []string{"unsandboxed", "browser", "computer"} {
+		if got := taskProps[k].(map[string]any)["type"]; got != "boolean" {
+			t.Fatalf("dispatch_task 的能力开关 %s 应是 boolean, got %v", k, got)
+		}
+	}
+	// thinking 的说明要列出全部档位（与 PATCH 白名单同一套枚举）
+	thinkingDesc, _ := taskProps["thinking"].(map[string]any)["description"].(string)
+	for _, lv := range []string{"enabled", "disabled", "low", "medium", "high", "max"} {
+		if !strings.Contains(thinkingDesc, lv) {
+			t.Fatalf("dispatch_task 的 thinking 说明里没有档位 %s：%s", lv, thinkingDesc)
+		}
+	}
 	// 模式清单直接写进 mode 参数的说明（值来自 chatModes），模型不问就知道有哪些
 	modeDesc, _ := taskProps["mode"].(map[string]any)["description"].(string)
 	for _, m := range chatModes {
 		if !strings.Contains(modeDesc, m.Value) {
 			t.Fatalf("dispatch_task 的 mode 说明里没有列出模式 %s：%s", m.Value, modeDesc)
+		}
+	}
+
+	sendProps := paramTypes(t, sendToSessionTool())
+	for _, k := range []string{"session_id", "task", "permission", "thinking", "unsandboxed", "browser", "computer"} {
+		if _, ok := sendProps[k]; !ok {
+			t.Fatalf("send_to_session 缺参数 %s", k)
+		}
+	}
+	for _, k := range []string{"unsandboxed", "browser", "computer"} {
+		if got := sendProps[k].(map[string]any)["type"]; got != "boolean" {
+			t.Fatalf("send_to_session 的能力开关 %s 应是 boolean, got %v", k, got)
 		}
 	}
 
@@ -382,5 +408,210 @@ func TestChatModesEndpointServesCanonicalList(t *testing.T) {
 		if m != chatModes[i] {
 			t.Fatalf("第 %d 项与清单不一致: %+v vs %+v", i, m, chatModes[i])
 		}
+	}
+}
+
+// ---------- thinking 与能力开关参数（2026-11-15 新增，dispatch_task / send_to_session） ----------
+
+// thinking 参数：落到新任务的会话配置上（派发结果注明）；非法档位拒绝且不建
+// 会话，报错列出全部可选档位（与 PATCH 白名单同一套枚举）。
+func TestRunDispatchTaskThinking(t *testing.T) {
+	a, main := newDispatchTestApp(t)
+	out, err := runDispatchTask(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"task": "深度分析", "thinking": "high",
+	}))
+	if err != nil {
+		t.Fatalf("派发失败: %v", err)
+	}
+	if !strings.Contains(out, "思考档位：high") {
+		t.Fatalf("派发结果应说明思考档位：%s", out)
+	}
+	sub := otherSessions(t, a)[0]
+	if sub.Thinking != "high" {
+		t.Fatalf("新任务思考档位应为 high, got %q", sub.Thinking)
+	}
+
+	a2, main2 := newDispatchTestApp(t)
+	if _, err := runDispatchTask(dispatchCtx(a2, main2), mustArgs(t, map[string]any{
+		"task": "x", "thinking": "ultra",
+	})); err == nil || !strings.Contains(err.Error(), thinkingLevelsDoc) {
+		t.Fatalf("非法思考档位应被拒绝并列出可选值, got %v", err)
+	}
+	if subs := otherSessions(t, a2); len(subs) != 0 {
+		t.Fatalf("被拒绝的派发不该建会话, got %d 个", len(subs))
+	}
+}
+
+// 能力开关参数：以模式默认能力为基准——false 收掉默认开启的 browser；
+// true 要先过「派发方自己拥有」这道校验（没有即拒绝、不静默钳制、不建会话），
+// 派发方拥有时可以开出默认不开的 computer；完全访问目标档的捆绑能力不可单关。
+func TestRunDispatchTaskCaps(t *testing.T) {
+	// 默认派发（workspace-write）：模式默认能力 = [browser]，false 收掉它
+	a, main := newDispatchTestApp(t)
+	if _, err := runDispatchTask(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"task": "收掉浏览器", "browser": false,
+	})); err != nil {
+		t.Fatalf("派发失败: %v", err)
+	}
+	sub := otherSessions(t, a)[0]
+	if hasCapability(sub, capBrowser) {
+		t.Fatalf("browser=false 应把新任务的浏览器能力收掉: tools=%v", sub.Tools)
+	}
+
+	// 提权拒绝：main 没开 computer，computer=true 借派发打开 = 拒绝且不建会话
+	a2, main2 := newDispatchTestApp(t)
+	_, err := runDispatchTask(dispatchCtx(a2, main2), mustArgs(t, map[string]any{
+		"task": "越权试试", "computer": true,
+	}))
+	if err == nil || !strings.Contains(err.Error(), "不能借派发参数打开") {
+		t.Fatalf("computer=true 在本会话无该能力时应拒绝, got %v", err)
+	}
+	if subs := otherSessions(t, a2); len(subs) != 0 {
+		t.Fatalf("被拒绝的派发不该建会话, got %d 个", len(subs))
+	}
+
+	// 派发方自己开了 computer（权限芯片同款字段）：computer=true 允许开出，
+	// 且不吞掉默认的 browser
+	a3, main3 := newDispatchTestApp(t)
+	main3.Tools = []string{capComputer}
+	out, err := runDispatchTask(dispatchCtx(a3, main3), mustArgs(t, map[string]any{
+		"task": "要桌面操控", "computer": true,
+	}))
+	if err != nil {
+		t.Fatalf("派发失败: %v", err)
+	}
+	if !strings.Contains(out, "能力开关：") {
+		t.Fatalf("派发结果应说明能力开关调整：%s", out)
+	}
+	sub3 := otherSessions(t, a3)[0]
+	if !hasCapability(sub3, capComputer) || !hasCapability(sub3, capBrowser) {
+		t.Fatalf("新任务应带 computer 且保留默认 browser: tools=%v", sub3.Tools)
+	}
+
+	// 完全访问目标档：捆绑能力不可单关（与权限面板联动一致）
+	a4, main4 := newDispatchTestApp(t)
+	main4.Permission = permFull
+	_, err = runDispatchTask(dispatchCtx(a4, main4), mustArgs(t, map[string]any{
+		"task": "全档再关浏览器", "permission": permFull, "browser": false,
+	}))
+	if err == nil || !strings.Contains(err.Error(), "捆绑") {
+		t.Fatalf("完全访问档下 browser=false 应被拒绝, got %v", err)
+	}
+	if subs := otherSessions(t, a4); len(subs) != 0 {
+		t.Fatalf("被拒绝的派发不该建会话, got %d 个", len(subs))
+	}
+}
+
+// 不传任何新参数（thinking / 三个能力开关）时，派发行为与改动前完全一致：
+// 新任务的思考档位为空、能力走模式默认（workspace-write 的执行模式默认开
+// browser），任务书正文逐字节等于【数字助理派发】+ task，结果说明里不出现
+// 思考档位/能力开关字样；send_to_session 不动目标会话的任何配置。
+func TestDispatchNewParamsAbsentKeepBehavior(t *testing.T) {
+	a, main := newDispatchTestApp(t)
+	out, err := runDispatchTask(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"task": "普通活", "title": "旧行为",
+	}))
+	if err != nil {
+		t.Fatalf("派发失败: %v", err)
+	}
+	if strings.Contains(out, "思考档位") || strings.Contains(out, "能力开关") {
+		t.Fatalf("不传新参数时结果说明不该出现新字样：%s", out)
+	}
+	subs := otherSessions(t, a)
+	if len(subs) != 1 {
+		t.Fatalf("应恰好派发 1 个任务会话, got %d", len(subs))
+	}
+	sub := subs[0]
+	if sub.Thinking != "" {
+		t.Fatalf("不传 thinking 时新任务应为空（服务端默认）, got %q", sub.Thinking)
+	}
+	if fmt.Sprint(sub.Tools) != fmt.Sprint([]string{capBrowser}) {
+		t.Fatalf("不传能力开关时应走模式默认能力 [browser], got %v", sub.Tools)
+	}
+	// 任务书正文逐字节一致（不因新参数引入任何附加块）
+	msgs, err := a.Store.RawMessagesAll(sub.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskMsg := ""
+	for _, m := range msgs {
+		if strings.Contains(m.Text(), "【数字助理派发】") {
+			taskMsg = m.Text()
+		}
+	}
+	if taskMsg != "【数字助理派发】\n普通活" {
+		t.Fatalf("任务书正文应逐字节等于【数字助理派发】+task, got %q", taskMsg)
+	}
+
+	// send_to_session 不传新参数：目标会话的权限/思考档位/能力一律不动
+	target := &SessionMeta{ID: "target", Title: "已有任务", Mode: "task", Workspace: a.Cfg.Workspace,
+		Permission: permWorkspace, Tools: []string{capBrowser, "sandbox-write"},
+		CreatedAt: now(), UpdatedAt: now()}
+	if err := a.Store.Create(target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runSendToSession(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"session_id": target.ID, "task": "接着干",
+	})); err != nil {
+		t.Fatalf("转发失败: %v", err)
+	}
+	fresh, err := a.Store.Get(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Thinking != "" || permModeOf(fresh) != permWorkspace ||
+		fmt.Sprint(fresh.Tools) != fmt.Sprint([]string{capBrowser, "sandbox-write"}) {
+		t.Fatalf("不传新参数时目标会话配置不该有任何变化: thinking=%q perm=%s tools=%v",
+			fresh.Thinking, permModeOf(fresh), fresh.Tools)
+	}
+}
+
+// send_to_session 的 thinking 与能力开关：写进目标会话配置并落库；提权
+//（本会话没有的能力传 true）拒绝且目标配置保持原样。
+func TestSendToSessionThinkingAndCaps(t *testing.T) {
+	a, main := newDispatchTestApp(t)
+	target := &SessionMeta{ID: "tgt", Title: "已有任务", Mode: "task", Workspace: a.Cfg.Workspace,
+		Permission: permWorkspace, Tools: []string{capBrowser},
+		CreatedAt: now(), UpdatedAt: now()}
+	if err := a.Store.Create(target); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runSendToSession(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"session_id": target.ID, "task": "换档并收掉浏览器", "thinking": "low", "browser": false,
+	}))
+	if err != nil {
+		t.Fatalf("转发失败: %v", err)
+	}
+	if !strings.Contains(out, "思考档位：low") || !strings.Contains(out, "关闭「操作浏览器」") {
+		t.Fatalf("转发结果应说明思考档位与能力开关：%s", out)
+	}
+	fresh, err := a.Store.Get(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Thinking != "low" {
+		t.Fatalf("目标思考档位应为 low, got %q", fresh.Thinking)
+	}
+	if hasCapability(fresh, capBrowser) {
+		t.Fatalf("browser=false 应收掉目标会话的浏览器能力: tools=%v", fresh.Tools)
+	}
+
+	// 提权拒绝：main 没有 computer，true 被拒且目标配置不变
+	_, err = runSendToSession(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"session_id": target.ID, "task": "越权试试", "computer": true,
+	}))
+	if err == nil || !strings.Contains(err.Error(), "不能借派发参数打开") {
+		t.Fatalf("computer=true 在本会话无该能力时应拒绝, got %v", err)
+	}
+	fresh2, _ := a.Store.Get(target.ID)
+	if fresh2.Thinking != "low" || hasCapability(fresh2, capComputer) {
+		t.Fatalf("被拒绝的转发不应改动目标配置: thinking=%q tools=%v", fresh2.Thinking, fresh2.Tools)
+	}
+
+	// 非法思考档位：人话报错列出可选值
+	if _, err := runSendToSession(dispatchCtx(a, main), mustArgs(t, map[string]any{
+		"session_id": target.ID, "task": "x", "thinking": "deep",
+	})); err == nil || !strings.Contains(err.Error(), thinkingLevelsDoc) {
+		t.Fatalf("非法思考档位应被拒绝并列出可选值, got %v", err)
 	}
 }

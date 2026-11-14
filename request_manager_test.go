@@ -207,7 +207,7 @@ func TestRequestManagerGuards(t *testing.T) {
 	}
 }
 
-// 提示词成对到位：执行模式拿「找经理帮忙」，数字助理拿「任务来找你协调」，aux 都没有。
+// 提示词成对到位：执行模式拿「找经理帮忙」，数字助理拿定稿第五节「任务来找你、审批来找你」，aux 都没有。
 func TestManagerPromptWiring(t *testing.T) {
 	a, _ := newRequestMgrTestApp(t)
 	for _, mode := range []string{"task", "office", "coding", "beginner-coding", "skill-create"} {
@@ -218,19 +218,20 @@ func TestManagerPromptWiring(t *testing.T) {
 		if !strings.Contains(sys, "不要滥用") {
 			t.Fatalf("模式 %s 的提示词应带一句「不要滥用」", mode)
 		}
-		if strings.Contains(sys, "## 任务来找你协调") {
+		if strings.Contains(sys, "任务来找你、审批来找你") {
 			t.Fatalf("模式 %s 不该拿到数字助理的处理准则", mode)
 		}
 	}
 	as := a.systemPrompt(&SessionMeta{Mode: "assistant", Workspace: a.Cfg.Workspace})
-	if !strings.Contains(as, "## 任务来找你协调") || !strings.Contains(as, "不会等你") {
-		t.Fatalf("数字助理的系统提示词缺少「任务来找你协调」段：%.400s", as)
+	// 2026-11-15 定稿：原独立拼接段 managerCoordPrompt 并入 assistantPrompt 第五节
+	if !strings.Contains(as, "任务来找你、审批来找你") || !strings.Contains(as, "不等你") {
+		t.Fatalf("数字助理的系统提示词缺少「任务来找你、审批来找你」节：%.400s", as)
 	}
 	if strings.Contains(as, "## 找经理帮忙") {
 		t.Fatal("数字助理不该拿到发起侧的「找经理帮忙」段")
 	}
 	aux := a.systemPrompt(&SessionMeta{Mode: "aux", Workspace: a.Cfg.Workspace})
-	if strings.Contains(aux, "## 找经理帮忙") || strings.Contains(aux, "## 任务来找你协调") {
+	if strings.Contains(aux, "## 找经理帮忙") || strings.Contains(aux, "任务来找你、审批来找你") {
 		t.Fatal("aux 两侧都不该有（它既不发求助也不处理求助）")
 	}
 }
