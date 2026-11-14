@@ -3302,6 +3302,42 @@ function connectEvents() {
   } catch (e) { /* 不支持 SSE 时退化为手动刷新 */ }
 }
 
+/* ---------- 远程壳「刷新」：重连 + 补拉（jx-link 首页浮条右侧那颗刷新按钮） ----------
+   手机远程访问时断的往往不是「页面」，而是两条长连接：全局事件流 /api/events 与
+   当前会话的执行流。它们各自有重连，但真掉线过一轮之后状态未必都对得上（SSE 垫片
+   3 秒自连、执行流接不回就只剩一页静态消息）。用户点刷新要的是「现在就对一次」，
+   而不是整页 reload——整页 reload 会把他打到一半的输入与滚动位置一起清掉。
+   所以这里只做三件事，别的一概不动：
+   ① 关掉旧的 /api/events 连接重建（远程模式下它就是 remote-boot 的
+      RemoteEventSource 垫片：close 会停掉它的重连定时器，不会留下两条流；
+      重连成功的 onopen 顺带补拉审批/提问清单）；
+   ② 当前会话若正跟着执行流，先断掉这条本地流，再按后端是否还在跑重新接；
+   ③ reloadMessages 把断线期间漏掉的消息补回来（会话清单也顺手对一次）。
+   探不到电脑端就直接抛出去：由壳提示「网络未恢复」并给整页刷新的兜底。 */
+async function reconnectRemote() {
+  const view = mainView;
+  const sid0 = view.state.cur && view.state.cur.id;
+  try { if (eventStream) eventStream.close(); } catch (e) { /* 已经断了 */ }
+  eventStream = null;
+  connectEvents();                  // ① 事件流重建
+  const probe = api('/api/status'); // 「网络恢复了吗」的判据：电脑端答得上话
+  if (sid0) detachStream(view);     // ② 断掉本地这条流；后端执行照旧跑，不受影响
+  await probe;
+  await loadSessions();             // 断线期间可能新建/改名/归档过会话
+  if (!sid0 || !view.state.cur || view.state.cur.id !== sid0) return; // 首页或已切走
+  if (await backendRunning(sid0, view)) attachRun(view); // 还在跑：接回执行流（内部先 reloadMessages）
+  else await reloadMessages(view);                       // ③ 没在跑：补拉当前会话
+}
+
+// 壳调用的入口（DeviceActivity 用 evaluateJavascript 注入）：结果要回给原生壳，所以
+// 走 JXLink 桥的 refreshDone——浏览器里没有这个桥，只留一行日志，页面本身不受影响。
+window.jxRemoteRefresh = function () {
+  const done = (ok) => {
+    try { if (window.JXLink && window.JXLink.refreshDone) window.JXLink.refreshDone(!!ok); } catch (e) { /* 桥不在：忽略 */ }
+  };
+  reconnectRemote().then(() => done(true), (e) => { console.warn('[JX] 远程刷新失败', e); done(false); });
+};
+
 function removeLive(view) {
   clearTimeout(livePendingTimer); // 降频档的补渲染定时器随 live 清场一起作废
   livePendingTimer = 0;
