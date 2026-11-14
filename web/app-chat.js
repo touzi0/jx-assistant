@@ -5250,6 +5250,7 @@ function runHintOff(view) {
 
 function setStreamUI(on, view) {
   view = view || mainView;
+  if (on) streamAlive(view); // 一条新流开始跑：静默时间从这里重新计时（看门狗用，见「会话流健康看门狗」）
   // 发送按钮保持可用：执行中发送 = 插话或排队（常规页「对话中途发送行为」）
   view.stopBtn.classList.toggle('hidden', !on);
   if (!on) view.hint.textContent = '';
@@ -5599,22 +5600,23 @@ async function retryRun(view) {
   view.state.streaming = true;
   view._pinned = false; // 主动重试：恢复跟随
   setStreamUI(true, view);
-  view.state.abort = new AbortController();
+  const abort = new AbortController(); // 这条流自己的取消器：收尾时据此辨认界面是否已换了流
+  view.state.abort = abort;
   view.state.streamText = '';
   view.state.streamThinking = '';
   let aborted = false;
   try {
     const res = await fetch(`/api/sessions/${cur.id}/retry`, {
-      method: 'POST', signal: view.state.abort.signal,
+      method: 'POST', signal: abort.signal,
     });
     if (!res.ok) throw new Error(res.statusText || '重试失败');
-    await consumeStream(res, view, cur.id);
+    await consumeStream(res, view, cur.id, abort);
   } catch (e) {
     if (e.name === 'AbortError') aborted = true;
     // 慢网下请求失败可能晚于切走：报错条只落在仍停在这个会话的界面上
     else if (view.state.cur && view.state.cur.id === cur.id) showRunError(view, '重试失败：' + e.message);
   }
-  await endTurn(view, aborted, { sid: cur.id, abort: view.state.abort });
+  await endTurn(view, aborted, { sid: cur.id, abort });
 }
 
 // endTurn 一轮结束后的收尾（send / retry / edit / attach 共用）：收流式、对齐状态、刷新周边。
@@ -6122,6 +6124,7 @@ async function send(forceContent, view) {
   const pre = await prepareSend(forceContent, view);
   if (!pre) return;
   const { input, content, sid, fromInput } = pre;
+  const abort = view.state.abort; // 这条流自己的取消器（prepareSend 建好）：收尾时据此辨认界面是否已换了流
 
   let aborted = false;
   // 服务端是否已收下这条消息：handleChat 在返回响应头之前就完成了落库并启动
@@ -6135,14 +6138,14 @@ async function send(forceContent, view) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, voiceUsed: !!pre.voiceUsed }),
-      signal: view.state.abort.signal,
+      signal: abort.signal,
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       throw new Error(d.error || res.statusText);
     }
     accepted = true;
-    await consumeStream(res, view, sid);
+    await consumeStream(res, view, sid, abort);
   } catch (e) {
     if (e.name === 'AbortError') {
       aborted = true; // 用户主动停止（已另行请求后端停止）：排队消息保留
@@ -6184,7 +6187,7 @@ async function send(forceContent, view) {
       }
     }
   }
-  await endTurn(view, aborted, { sid, abort: view.state.abort });
+  await endTurn(view, aborted, { sid, abort });
 }
 
 /* ---------- 编辑历史用户消息并重发（语义对齐 ZCode 的 editUserQuery：
@@ -6299,7 +6302,8 @@ async function resendEdit(m, content, view, mode) {
   view.state.streaming = true;
   view._pinned = false; // 编辑重发也是自己的动作：恢复跟随
   setStreamUI(true, view);
-  view.state.abort = new AbortController();
+  const abort = new AbortController(); // 这条流自己的取消器：收尾时据此辨认界面是否已换了流
+  view.state.abort = abort;
   view.state.streamText = '';
   view.state.streamThinking = '';
   if (view === mainView) JX.emit('send', { content });
@@ -6310,7 +6314,7 @@ async function resendEdit(m, content, view, mode) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ seq: m.seq, content, workspaceMode: wm }),
-      signal: view.state.abort.signal,
+      signal: abort.signal,
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
@@ -6321,7 +6325,7 @@ async function resendEdit(m, content, view, mode) {
       }
       throw new Error(d.error || res.statusText);
     }
-    await consumeStream(res, view, sid);
+    await consumeStream(res, view, sid, abort);
     return true;
   };
   try {
@@ -6335,7 +6339,7 @@ async function resendEdit(m, content, view, mode) {
       showRunError(view, '编辑发送失败：' + e.message); // 真实失败进报错条，不插进对话区
     }
   }
-  await endTurn(view, aborted, { sid, abort: view.state.abort });
+  await endTurn(view, aborted, { sid, abort });
   return !aborted;
 }
 
@@ -6344,15 +6348,27 @@ async function resendEdit(m, content, view, mode) {
 // consumeStream 读一条 SSE 响应直到流结束，每帧交给 handleEvent。
 // sid 是这条流所属的会话：中途切到别的会话后本函数立刻收手——帧不能再写进
 // 新会话的界面（后端执行不受影响，回来时重新接上即可）。
-async function consumeStream(res, view, sid) {
+// abort 是这条流自己的取消器：界面已经放弃它（看门狗重建/切走）时，即便假死的
+// 连接事后又活过来，字节也只读不落地——同一条会话不能有两个消费方往界面上写。
+// 每收到一段字节就把「最后收到数据的时间」刷新一次（含服务端每 15s 一个的
+// ": ping" 注释帧），看门狗据此判活。
+async function consumeStream(res, view, sid, abort) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      if (abort && view.state.abort !== abort) return; // 已放弃这条流：断开不算错
+      throw e;
+    }
+    if (chunk.done) break;
+    if (abort && view.state.abort !== abort) return;  // 界面已换过流：丢弃
     if (sid && (!view.state.cur || view.state.cur.id !== sid)) return; // 已切走：丢弃
-    buf += dec.decode(value, { stream: true });
+    streamAlive(view);
+    buf += dec.decode(chunk.value, { stream: true });
     let idx;
     while ((idx = buf.indexOf('\n\n')) >= 0) {
       const frame = buf.slice(0, idx).trim();
@@ -6400,10 +6416,16 @@ async function refreshIfDangling(view) {
 }
 
 // reloadMessages 只重取当前会话的消息与待生效队列（不触发接流，避免与 attachRun 互相递归）
-async function reloadMessages(view) {
+// opts.sinceSeq：增量补拉——带上界面已有的最后一条消息序号，只把这条之后的新消息
+// 追加进列表（流重建自愈用）。服务端详情接口只支持 tail / before_seq，所以请求还是
+// 那一个基础窗，但「要哪一段」由这里的序号判定：窗口起点盖住了断点就追加、不重取
+// 历史（DOM 前缀照旧复用，视口原地不动）；盖不住（断流期间新增超过一个窗口）才退回
+// 整窗对齐，宁可多取一次也不让中间缺条。
+async function reloadMessages(view, opts) {
   view = view || mainView;
   if (!view.state.cur) return;
   if (view.state._loading) return; // 会话正在整包加载：由 loadSessionInto 收口，不并发重取
+  const sinceSeq = (opts && opts.sinceSeq) || 0;
   const nav = navTok[view.key]; // 导航令牌：慢网下响应可能晚于切走/回首页，落地前必须复验
   try {
     // 分批口径：只重取基础窗（tail），已上翻加载的头部原样保留——attached 事件
@@ -6412,19 +6434,25 @@ async function reloadMessages(view) {
     // 已被更新的导航取代：晚到的旧会话数据不落地——否则 state.cur 被旧 meta 复活、
     // 界面被旧消息顶回旧会话，正是远程访问时「切过去又被跳回来」的根源
     if (nav !== navTok[view.key]) return;
-    if (snapshotStale(view, view.state.cur.id, d.messages)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
-    const head = (d.messages && d.messages.length)
-      ? view.state.msgs.filter((m) => m.seq < d.messages[0].seq) : [];
-    if (head.length) {
-      d.messages = head.concat(d.messages);
-      if (d.older) d.older = { ...d.older, count: Math.max(0, (d.older.count || 0) - head.length) };
-    } else if (d.older) {
-      view.state._baseWinBase = { sys: d.older.sys, tools: d.older.tools }; // 基础窗边界前移（无上翻历史）：释放基线跟到最新
+    const incoming = d.messages || [];
+    const delta = sinceSeq > 0 && incoming.length > 0 && incoming[0].seq <= sinceSeq;
+    if (delta) {
+      // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）
+      view.state.msgs = view.state.msgs.concat(incoming.filter((m) => (m.seq || 0) > sinceSeq));
+    } else {
+      if (snapshotStale(view, view.state.cur.id, incoming)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
+      const head = incoming.length ? view.state.msgs.filter((m) => m.seq < incoming[0].seq) : [];
+      if (head.length) {
+        d.messages = head.concat(incoming);
+        if (d.older) d.older = { ...d.older, count: Math.max(0, (d.older.count || 0) - head.length) };
+      } else if (d.older) {
+        view.state._baseWinBase = { sys: d.older.sys, tools: d.older.tools }; // 基础窗边界前移（无上翻历史）：释放基线跟到最新
+      }
+      view.state.older = d.older ? { ...d.older, count: d.older.count || 0 } : undefined;
+      renderLoadOlderBar(view);
+      view.state.msgs = d.messages || [];
     }
-    view.state.older = d.older ? { ...d.older, count: d.older.count || 0 } : undefined;
-    renderLoadOlderBar(view);
     view.state.cur = d.meta;
-    view.state.msgs = d.messages || [];
     view.state.pendingSteer = (d.pending && d.pending.steer) || [];
     view.state.pendingQueue = (d.pending && d.pending.queue) || [];
     view.state.checkpoints = d.checkpoints || [];
@@ -6437,7 +6465,7 @@ async function reloadMessages(view) {
 }
 
 // attachRun 接上一个正在执行的会话的事件流（页面刷新/流断开后继续跟随输出）
-async function attachRun(view) {
+async function attachRun(view, opts) {
   view = view || mainView;
   const cur = view.state.cur;
   if (!cur || view.state.streaming) return;
@@ -6449,11 +6477,11 @@ async function attachRun(view) {
   view.state.streamThinking = '';
   hideRunError(view); // 执行还在跑：报错条收掉
   setStreamUI(true, view);
-  await reloadMessages(view); // 先对齐到服务端现状，再接流
+  await reloadMessages(view, opts); // 先对齐到服务端现状（可带 sinceSeq 只补增量），再接流
   try {
     const res = await fetch(`/api/sessions/${cur.id}/stream`, { signal: abort.signal });
     if (!res.ok || !res.body) throw new Error(res.statusText || '无法接上执行流');
-    await consumeStream(res, view, cur.id);
+    await consumeStream(res, view, cur.id, abort);
   } catch (e) {
     if (e.name !== 'AbortError') console.warn('[JX] 接回执行流失败', e);
   }
@@ -6477,6 +6505,114 @@ async function attachRun(view) {
     if (await backendRunning(cur.id, view)) attachRun(view);
   }
 }
+
+/* ---------- 会话流健康看门狗（远程/手机端「假死」根治） ----------
+   手机息屏或切到后台再回来，远程隧道上的那条会话流会「假死」：读流挂在一次
+   永不到达的 read 上，既不报错也不结束——下面的重连逻辑永远等不到触发，界面
+   就停在旧内容，只能退出重进或整页刷新。两条长连接的重连机制各管各的
+   （/api/events 有垫片 3s 自连，会话流断了有 reloadMessages 兜底），所以这里
+   补的是「假死」这一种：用一个时间戳判活，该断的主动断掉再重建。
+   判活口径：服务端 serveRun 每 15s 必发一个 ": ping" 注释帧，生成中也持续有
+   delta，所以界面侧 25 秒收不到任何字节＝这条流已经死了（正常执行绝不会）。
+   动手口径：只在「有流在跑 + 真的静默」时动手，空闲会话不重连；页面在后台不动手
+   （后台定时器被系统压制、网络也可能被挂起），留给回前台的那一次检查统一处理。
+   重建不是整页刷新：掐掉这条流 → 按后端状态接回/补拉 → 只补最后一条消息之后的
+   增量，已上翻的历史与视口原地不动。 */
+const STREAM_SILENT_MS = 25000;    // 静默多久判死（服务端 15s 一个 ping，留一倍余量）
+const STREAM_REVIVE_GAP_MS = 5000; // 同一会话两次重建的最小间隔（抖动时只重建一次）
+const STREAM_TICK_MS = 5000;       // 看门狗扫描间隔
+
+const streamReviveAt = new Map();  // 会话 id → 上次重建时间（节流按会话算，主/子视图共用）
+
+// 有字节到达＝这条流还活着（consumeStream 每段都会调；setStreamUI(true) 在每条
+// 新流开始时也刷一次，静默从那一刻起算）
+function streamAlive(view) { view._lastDataAt = Date.now(); }
+// 还没收到过任何字节（时间戳为空）＝这条流刚开始，按健康算
+function streamSilentMs(view) { return Date.now() - (view._lastDataAt || Date.now()); }
+// 界面已有的最后一条消息序号：补拉增量的起点
+function lastSeqOf(view) {
+  const msgs = view.state.msgs || [];
+  return msgs.length ? (msgs[msgs.length - 1].seq || 0) : 0;
+}
+
+// reviveSessionStream 把假死的那条流捅死重开：掐掉读取 → 探后端 → 接回或补拉。
+// 返回是否真的动过手（节流挡下时返回 false，调用方不必管）。
+async function reviveSessionStream(view, why) {
+  view = view || mainView;
+  const sid = view.state.cur && view.state.cur.id;
+  if (!sid || view._reviving) return false;
+  const now = Date.now();
+  if (now - (streamReviveAt.get(sid) || 0) < STREAM_REVIVE_GAP_MS) return false; // 抖动：5 秒内只重建一次
+  streamReviveAt.set(sid, now);
+  view._reviving = true;
+  const lastSeq = lastSeqOf(view);
+  console.info('[JX] 会话流重建：' + why + '（会话 ' + sid + '，从消息序号 ' + lastSeq + ' 之后补拉）');
+  view._lastDataAt = Date.now(); // 新一轮计时从这里起算
+  try {
+    if (view.state.streaming) detachStream(view); // 只掐界面这条读取：后端执行照旧跑
+    if (await backendRunning(sid, view)) {
+      // 会话还在跑：接回执行流（先按序号补增量对齐，服务端再把进行中的半句补发过来）
+      if (view.state.cur && view.state.cur.id === sid && !view.state.streaming) {
+        attachRun(view, { sinceSeq: lastSeq });
+      }
+    } else {
+      // 会话已经跑完（结束信号随那条死掉的流一起丢了）：补拉一次把结果落出来
+      await reloadMessages(view, { sinceSeq: lastSeq });
+      if (view === mainView) { loadSessions(); refreshCtxChip(); }
+      else { refreshDrawer(); refreshCtxChip(subView); }
+    }
+  } catch (e) {
+    console.warn('[JX] 会话流重建失败', e);
+  } finally {
+    view._reviving = false;
+  }
+  return true;
+}
+
+// 看门狗：有流在跑 + 真的静默 → 判死重建；空闲会话、正常生成中的会话都不碰。
+// 页面在后台时整轮跳过：后台定时器被系统压制、网络也可能被挂起，那种「静默」
+// 不代表流死了，交给回前台的那一次体检统一处理。
+function streamWatchdogTick() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+  for (const view of foldViews()) {
+    if (!(view.state.streaming && view.state.cur)) continue;
+    if (streamSilentMs(view) <= STREAM_SILENT_MS) continue;
+    reviveSessionStream(view, '静默 ' + Math.round(streamSilentMs(view) / 1000) + ' 秒（界面仍是执行态）');
+  }
+}
+
+// 回前台/网络恢复时的体检：有流在跑就查它活没活（不健康立刻重建）；没有本地流
+// 而会话其实还在跑（执行体在服务端，脱手了）就接回去；空闲会话只探一次、不重建。
+async function resumeStreamCheck(why) {
+  for (const view of foldViews()) {
+    const sid = view.state.cur && view.state.cur.id;
+    if (!sid) continue;
+    if (view.state.streaming) {
+      if (streamSilentMs(view) > STREAM_SILENT_MS) await reviveSessionStream(view, why);
+      continue;
+    }
+    if (view._wakeBusy) continue;
+    view._wakeBusy = true;
+    try {
+      const running = await backendRunning(sid, view);
+      if (running && view.state.cur && view.state.cur.id === sid && !view.state.streaming) {
+        console.info('[JX] ' + why + '：会话仍在执行，接回执行流（会话 ' + sid + '）');
+        attachRun(view, { sinceSeq: lastSeqOf(view) });
+      }
+    } finally {
+      view._wakeBusy = false;
+    }
+  }
+}
+
+// 三个转折点：页面变可见（息屏/切后台回来）、bfcache 恢复、网络恢复。
+// 都只做一次体检，不复位任何界面状态。
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) resumeStreamCheck('页面回到前台');
+});
+window.addEventListener('pageshow', () => resumeStreamCheck('页面从后台恢复'));
+window.addEventListener('online', () => resumeStreamCheck('网络恢复'));
+setInterval(streamWatchdogTick, STREAM_TICK_MS);
 
 // stopRun 显式停止：后端执行体独立于页面，必须让服务端停——本地只是等着这条流自己收尾
 // （取消会立刻作用到模型流/工具/等待，服务端写入的收尾记录也就随流到达）。
