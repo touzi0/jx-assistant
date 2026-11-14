@@ -120,6 +120,27 @@ if ($exeItem.Length -lt 30MB) {
 }
 Write-Host ("== stage exe 校验通过：PE AMD64 / {0:N1} MB" -f ($exeItem.Length / 1MB))
 
+# ★ 版本串自检（2026-11-14 硬化，踩过的坑：把旧 exe 复制改名当新包，用户端
+# 版本号永远不变、反复弹更新）。判据只有一条：exe 二进制里必须能扫到本次
+# $Version 的版本串——即 appVersion 真的被 -X 注进了产物，或者 -ExeSource
+# 给的正是这一版。扫不到一律拒绝出包，不允许「先发出去再说」。
+$verBytes = [Text.Encoding]::ASCII.GetBytes($Version)
+$exeBytes = [IO.File]::ReadAllBytes($exe)
+$hitAt = -1
+for ($i = 0; $i -le ($exeBytes.Length - $verBytes.Length); $i++) {
+  if ($exeBytes[$i] -eq $verBytes[0]) {
+    $okAll = $true
+    for ($j = 1; $j -lt $verBytes.Length; $j++) {
+      if ($exeBytes[$i + $j] -ne $verBytes[$j]) { $okAll = $false; break }
+    }
+    if ($okAll) { $hitAt = $i; break }
+  }
+}
+if ($hitAt -lt 0) {
+  throw ("stage\{0}.exe 里扫不到版本串「{1}」——产物不是本版编译的（疑似旧 exe 改名，或 appVersion 注入丢失），拒绝出包" -f $ExeBaseName, $Version)
+}
+Write-Host ("== 版本串自检通过：exe 内命中「{0}」（偏移 {1:N0}）" -f $Version, $hitAt)
+
 Write-Host "== 暂存技能目录（含便携 Python 运行时，体积较大）"
 Copy-Item $SkillsSource (Join-Path $stage "技能") -Recurse -Force
 

@@ -195,17 +195,23 @@ def main():
             if not hasattr(sherpa_onnx, "OfflineRecognizer"):
                 raise ImportError("sherpa_onnx 不完整（缺 OfflineRecognizer）")
         except Exception:
-            missing.append("sherpa-onnx")
+            # 版本锚定 1.13.8（与共享运行时基线一致）：pip 默认装最新（2.x）会带
+            # ORT API 28 的 dll，与识别链路按 1.13.x 的配套不符（2026-11-14 实测
+            # 新版预热即崩 "API version [28] not available"）
+            missing.append("sherpa-onnx==1.13.8")
         try:
             import numpy  # noqa: F401 —— transcribe 的 pcm→float 转换用
         except Exception:
-            missing.append("numpy")
+            missing.append("numpy==2.5.4")  # 锚基线版本（同 sherpa-onnx 的锚定理由）
         if not missing:
             return
         import subprocess
         print(f"[voice] 首次使用/修复：安装 {' '.join(missing)}（清华镜像）…", file=sys.stderr)
+        # 不用 --no-deps：sherpa-onnx 的 wheel 自身不带 onnxruntime.dll，靠依赖
+        # onnxruntime 包补齐（2026-11-14 实测：--no-deps 装出的 lib 缺 dll，引擎
+        # 构造即崩）；版本锚定保证配套。
         r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
-                            "--no-deps", *missing,
+                            *missing,
                             "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"])
         if r.returncode != 0:
             raise RuntimeError("依赖自动安装失败：请手动执行 "

@@ -81,6 +81,7 @@ Write-Host "完成：$exe（开发桌面版·隔离数据，gitignore 的本地�
 
 # 5) 启动：专属互斥体 + 隔离配置 + 随机高位端口（子进程继承本进程环境变量）
 $env:JX_DESKTOP_MUTEX = "JX-Desktop-Dev"
+$env:JX_SKIP_MIGRATIONS = "1"   # 开发实例兜底闸：启动时整体跳过迁移（不读不写账本、不碰技能目录；正式版不设此变量，行为不变）
 $port = Get-Random -Minimum 20000 -Maximum 60000
 Write-Host ("启动：互斥体 JX-Desktop-Dev（不与正式实例互斥），端口 $port（碰撞时自动改系统分配）")
 Write-Host "开发数据目录：$devData"

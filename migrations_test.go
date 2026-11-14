@@ -139,6 +139,25 @@ func TestMigrationLedgerScopedToSkillsDir(t *testing.T) {
 	}
 }
 
+// TestRunMigrationsSkipSwitch JX_SKIP_MIGRATIONS 兜底闸（2026-11-14 止血）：
+// 开发/隔离实例注入该变量后迁移整体跳过——泄漏技能目录原样保留、任何账本
+// （新/旧位置）都不写。正式版不设变量走原路径，由其余测试覆盖回归。
+func TestRunMigrationsSkipSwitch(t *testing.T) {
+	t.Setenv("JX_SKIP_MIGRATIONS", "1")
+	a := newSkillTestApp(t)
+	target := plantLeakedSkill(t, a)
+	a.runMigrations()
+	if !dirExists(target) {
+		t.Fatal("开关生效时迁移被整体跳过，泄漏技能目录不应被动到")
+	}
+	if exists(filepath.Join(a.Cfg.SkillsDir, migrationsFileName)) {
+		t.Fatal("开关生效时不应写技能目录账本")
+	}
+	if exists(a.legacyMigrationsPath()) {
+		t.Fatal("开关生效时不应写数据目录旧账本")
+	}
+}
+
 // TestMigrationLegacyLedgerHonored 升级路径：老版本账本在数据目录
 // （data/migrations.json，没有点前缀——当年就是这么写的，别拿新账本的文件名去
 // 找它），新版本账本在技能目录。首跑必须认老账本、把老记账搬进本域账本，绝不

@@ -72,7 +72,9 @@ def detect_provider():
     files = dict(enc=one("encoder*.int8.onnx"), dec=one("decoder*.onnx"),
                  joi=one("joiner*.int8.onnx"), tok=one("tokens.txt"))
     if not all(files.values()):
-        raise RuntimeError(f"xasr 模型文件不完整: {MODEL_DIR}")
+        # 缺哪个列哪个：残缺组件/半解压包一眼可辨（2026-11-14 线上排查要求日志可诊断）
+        miss = sorted(k for k, v in files.items() if not v)
+        raise RuntimeError(f"xasr 模型文件不完整（缺 {miss}）: {MODEL_DIR}")
 
     provider = "cpu"
     kwargs = {}
@@ -308,7 +310,51 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": {"message": f"{type(e).__name__}: {e}", "type": "server_error"}})
 
 
+def ensure_deps():
+    """运行时依赖自愈——与主程序组件 asr_worker.ensure_deps 同款（2026-11-14 移植）。
+
+    为什么悬浮窗也要：共享便携运行时（技能/_runtime）不随语音组件装配清单走，
+    新装机/热更机上可能没有 sherpa-onnx。主程序听写有 worker 自愈兜底，
+    悬浮窗此前没有——import 失败进程直接退出，识别服务永远起不来，
+    用户看到的就是"识别中"卡死。缺啥装啥（清华镜像，sherpa-onnx 约 20MB），
+    装完清 sys.modules 缓存（本进程可能已 import 过坏包，不清拿到的是残骸）。
+    """
+    missing = []
+    try:
+        import sherpa_onnx  # noqa: F401
+        # 校验到属性为止：半卸载/损坏的包纯 import 也能成功（worker 实测踩过）
+        if not hasattr(sherpa_onnx, "OfflineRecognizer"):
+            raise ImportError("sherpa_onnx 不完整（缺 OfflineRecognizer）")
+    except Exception:
+        # 版本锚定 1.13.8（与共享运行时基线一致）：装最新（2.x）会带 ORT API 28
+        # 的 onnxruntime.dll，而基线运行时/识别链路按 1.13.x 配套（2026-11-14 实测
+        # 装新版预热即崩 "API version [28] not available, only [1,17]"）
+        missing.append("sherpa-onnx==1.13.8")
+    try:
+        import numpy  # noqa: F401
+    except Exception:
+        missing.append("numpy==2.5.4")
+    if not missing:
+        return
+    import subprocess
+    print(f"[vt-asr] 首次使用/修复：安装 {' '.join(missing)}（清华镜像）…", file=sys.stderr)
+    # 不用 --no-deps：sherpa-onnx 的 wheel 自身不带 onnxruntime.dll，靠依赖
+    # onnxruntime 包补齐（2026-11-14 实测：--no-deps 装出的 lib 缺 dll，引擎
+    # 构造即崩）；版本锚定保证配套。
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--force-reinstall",
+                        *missing,
+                        "-i", "https://pypi.tuna.tsinghua.edu.cn/simple"])
+    if r.returncode != 0:
+        raise RuntimeError("依赖自动安装失败：请手动执行 "
+                           + sys.executable + " -m pip install " + " ".join(missing))
+    for k in [k for k in list(sys.modules)
+              if k == "sherpa_onnx" or k.startswith("sherpa_onnx.")
+              or k == "numpy" or k.startswith("numpy.")]:
+        del sys.modules[k]
+
+
 def main():
+    ensure_deps()
     print("[vt-asr] 预热引擎（GPU/CPU 自动探测）...", file=sys.stderr)
     get_recognizer()
     get_vad()

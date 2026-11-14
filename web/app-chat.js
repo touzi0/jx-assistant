@@ -3419,7 +3419,7 @@ function handleGlobalEvent(ev) {
     case 'pending':
       // 插话/排队队列变化：只更新对应的那个视图（自己窗口的操作也会推回来，天然多端一致）
       if (state.cur && ev.sessionId === state.cur.id) applyPending(mainView, ev.pending);
-      if (subState.cur && ev.sessionId === state.cur.id) applyPending(subView, ev.pending);
+      if (subState.cur && ev.sessionId === subState.cur.id) applyPending(subView, ev.pending);
       break;
     case 'stopped':
       // 用户显式停止（runtime.go 终态广播）：不算「完成未查看」，只刷列表
@@ -5252,12 +5252,10 @@ function handleEvent(ev, view) {
       // 插话落库兜底：正式消息到达即摘掉同内容的虚线插话框。实框走本流
       // （message 事件），虚框清理靠全局总线的 pending 广播——两条通道独立，
       // 广播在断线重连窗口/订阅者跟不上被丢帧时，实框已现、虚框残留成双框
-      // （插话打断模型流的瞬间事件最密集，最易撞上）。按内容本地摘除，
-      // pending 广播正常到达时快照整体覆盖，两边不冲突。
-      if (ev.message && ev.message.role === 'user' && typeof ev.message.content === 'string'
-        && (view.state.pendingSteer || []).some((p) => p.content === ev.message.content)) {
-        view.state.pendingSteer = view.state.pendingSteer.filter((p) => p.content !== ev.message.content);
-      }
+      // （插话打断模型流的瞬间事件最密集，最易撞上）。按内容本地摘除
+      // （pruneLandedSteer），pending 广播正常到达时快照整体覆盖，两边不冲突。
+      if (ev.message && ev.message.role === 'user'
+        && typeof ev.message.content === 'string') pruneLandedSteer(view, ev.message.content);
       if (view.state.attached) {
         // 跟随别的连接发起的执行：以服务端为准整体重取，避免与已落库内容重复
         //（节流合并：汇报轮里几十条 message 事件连发，不再每条整包拉一次）
@@ -5861,6 +5859,23 @@ function applyPending(view, pending) {
   if (view.state.cur) renderMessages(view.state.msgs, view);
 }
 
+// pruneLandedSteer 摘掉「正文已作为用户消息落库」的插话虚线框，返回是否有摘除。
+// 虚线框只属于还没送达的插话；消息一旦落库（打断注入、下一步注入都一样），
+// 正常气泡随即到达，框必须退场。两个消费点：①message 事件里作为广播丢失的
+// 双保险（插话打断模型流的瞬间事件最密集，pending 广播可能被丢帧）——landed
+// 传刚到的这条正文（此刻它还没 push 进 msgs）；②sendMidrun 的响应回画后对账
+// ——慢链路/远程中继下 interject 响应在手时插话往往已注入生效（摘框事件早已
+// 发过），照（可能过期的）快照或回显画上去就成了无人再摘的幽灵框。
+function pruneLandedSteer(view, landed) {
+  const st = view.state;
+  if (!st.pendingSteer || !st.pendingSteer.length) return false;
+  const isLanded = (c) => c === landed || st.msgs.some((m) =>
+    m.role === 'user' && typeof m.content === 'string' && m.content === c);
+  const before = st.pendingSteer.length;
+  st.pendingSteer = st.pendingSteer.filter((p) => !isLanded(p.content));
+  return st.pendingSteer.length < before;
+}
+
 // 执行中发出的消息：按「对话中途发送行为」插话或排队（两种模式都在服务端排队）
 // 默认值=等待排队：新装/没设置过 jx.midrun 时排队；只有用户在设置里显式选过
 // 「插话」（localStorage 里存了 interject）才走 steer。手动切换照旧存同一个键。
@@ -5872,17 +5887,25 @@ async function sendMidrun(content, viaInput, view, voiceUsed) {
       method: 'POST', body: JSON.stringify({ content, mode, voiceUsed: !!voiceUsed }),
     });
     if (!d.accepted) { pendingHint(view, '发送失败：该会话当前不接受消息'); return; }
-    // 本地立即出效果（插话贴到对话末尾，排队进坞）；服务端的 pending 广播可能
-    // 先于本次响应到达，按 id 去重，避免同一条显示两次
-    const known = view.state.pendingSteer.concat(view.state.pendingQueue).some((p) => p.id === d.id);
-    if (!known) {
-      const pm = { id: d.id, content: content, createdAt: '' };
-      if (d.mode === 'steer') view.state.pendingSteer.push(pm);
-      else view.state.pendingQueue.push(pm);
-    }
-    renderQueueDock(view);
+    // 画不画「插话中」虚线框以响应里的服务端快照为准（不按 mode 盲回显）：steer
+    // 打断后的排水落库极快，慢链路下响应到手时插话往往已注入生效——快照里已没
+    // 它就别画。快照是服务端**写响应时刻**的值，中继/慢网在途延迟仍可能让它过期，
+    // 画完再用 pruneLandedSteer 对一次账（正文已落库的不画），双保险后才可靠。
     view._pinned = false; // 插话/排队展示在对话末尾：恢复跟随看得到回执
-    renderMessages(view.state.msgs, view);
+    if (d.pending) {
+      applyPending(view, d.pending); // 与 pending 广播同一份快照结构，整体覆盖即去重（内含重绘）
+    } else {
+      // 兜底（老后端无快照字段）：沿用本地回显 + 广播按 id 去重
+      const known = view.state.pendingSteer.concat(view.state.pendingQueue).some((p) => p.id === d.id);
+      if (!known) {
+        const pm = { id: d.id, content: content, createdAt: '' };
+        if (d.mode === 'steer') view.state.pendingSteer.push(pm);
+        else view.state.pendingQueue.push(pm);
+      }
+      renderQueueDock(view);
+      renderMessages(view.state.msgs, view);
+    }
+    if (d.mode === 'steer' && pruneLandedSteer(view)) renderMessages(view.state.msgs, view);
     pendingHint(view, d.mode === 'steer' ? '已插话：模型输出中立即打断生效；工具执行中等下一步调用模型' : '已排队：本轮结束后自动发送');
   } catch (e) {
     pendingHint(view, '发送失败：' + e.message);

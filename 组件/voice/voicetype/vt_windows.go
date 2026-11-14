@@ -1450,13 +1450,18 @@ var (
 	vtMutexHandle    uintptr // 常驻持有：句柄一关，锁就没了
 )
 
+// vtMutexName 单实例互斥体名。默认产品名；同机跑隔离验证实例时用
+// -ldflags "-X main.vtMutexName=..." 改名与正在运行的用户实例并存
+//（asrPort 同理，见 main.go 的 var 块——两者只服务测试隔离，产品路径不变）。
+var vtMutexName = "VoiceTypeGo_SingleInstance"
+
 // vtSingleInstanceGuard 只允许一个实例运行。
 //
 // 为什么要它：两个实例＝两套 WH_KEYBOARD_LL 钩子 + 两个悬浮窗 + 两份录音，
 // 症状是「同一句话被粘两遍」或「一个实例绑住了 ASR 端口 8320，另一个识别永远
 // 不就绪」——都会被误当成"判定坏了"。交付给用户的产品更不能出现这种叠加。
 func vtSingleInstanceGuard() bool {
-	name, err := syscall.UTF16PtrFromString("VoiceTypeGo_SingleInstance")
+	name, err := syscall.UTF16PtrFromString(vtMutexName)
 	if err != nil {
 		return true
 	}

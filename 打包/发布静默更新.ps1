@@ -115,6 +115,24 @@ if ($ExeSource -ne "") {
   if ($LASTEXITCODE -ne 0) { throw "go build 失败" }
 }
 $engineZip = Join-Path $outDir "engine-$Version.zip"
+
+# ★ 版本串自检（2026-11-14 硬化）：engine 里的 exe 必须真带本版版本号。漏注入或
+# 拿旧 exe 改名会让客户端认不出「已是新版」——待重启横幅不消、反复弹更新。
+$verBytes = [Text.Encoding]::ASCII.GetBytes($Version)
+$exeBytes = [IO.File]::ReadAllBytes($exe)
+$hitAt = -1
+for ($i = 0; $i -le ($exeBytes.Length - $verBytes.Length); $i++) {
+  if ($exeBytes[$i] -eq $verBytes[0]) {
+    $okAll = $true
+    for ($j = 1; $j -lt $verBytes.Length; $j++) {
+      if ($exeBytes[$i + $j] -ne $verBytes[$j]) { $okAll = $false; break }
+    }
+    if ($okAll) { $hitAt = $i; break }
+  }
+}
+if ($hitAt -lt 0) { throw ("engine 的 exe 里扫不到版本串「{0}」——不是本版编译产物（旧 exe 改名 / appVersion 注入丢失），拒绝出包" -f $Version) }
+Write-Host ("== 版本串自检通过：engine exe 内命中「{0}」（偏移 {1:N0}）" -f $Version, $hitAt)
+
 New-CleanZip -SourceDir $work -ZipPath $engineZip
 Remove-Item $work -Recurse -Force
 
