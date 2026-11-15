@@ -948,6 +948,17 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   margin: 12px 0 0 9px; padding: 2px 0 2px 15px;
 }
 
+/* 承接段的「更早 N 条」：只带必要上下文之后，更早的父会话历史按需懒加载
+   （GET /api/sessions/{id}/inherit），点一次取一批，取完自己消失 */
+.tf-sec.inherit > .inherit-more {
+  display: block; width: 100%; margin: 0 0 6px;
+  border: 1px dashed var(--border); border-radius: 8px;
+  background: none; padding: 5px 10px; color: var(--text-3);
+  font-size: .9em; font-family: inherit; text-align: left; cursor: pointer;
+}
+.tf-sec.inherit > .inherit-more:hover:not(:disabled) { color: var(--text-2); background: var(--hover); }
+.tf-sec.inherit > .inherit-more:disabled { cursor: default; opacity: .7; }
+
 /* 过程行：思考行与工具行统一样式（单行标题，点开看详情） */
 .proc-row { margin: 0; font-size: 1em; } /* 基准＝对话区基准：过程行/工具行/文件改动行与正文同大，行内次要信息 -1 档（.93em） */
 .proc-row + .proc-row { margin-top: 2px; }

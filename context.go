@@ -426,10 +426,15 @@ func envLineKey(l string) string {
 
 // ---------- 子对话的上下文继承（分支克隆） ----------
 
-// inheritMark 是继承标记行的正文（前端只需 count 来切分继承段与自有消息）。
+// inheritMark 是继承标记行的正文（前端据此切分继承段与自有消息，并按需懒加载
+// 更早的历史）。Title/From/Total 是 2026-11-16 新增的「承接锚点」：老会话的标记
+// 行只有 parent/count，前端缺字段时退回旧文案（不报错、不崩）。
 type inheritMark struct {
 	Parent string `json:"parent"`
-	Count  int    `json:"count"`
+	Count  int    `json:"count"`           // 已承接的行数（父会话里 From 起到末尾的可继承行）
+	Title  string `json:"title,omitempty"` // 父会话标题：折叠条显示「承接自 <标题>」
+	From   int64  `json:"from,omitempty"`  // 父会话里第一条被承接行的 seq（懒加载游标）
+	Total  int    `json:"total,omitempty"` // 父会话可继承行总数（From 之前还有 Total-Count 条）
 }
 
 // trimOpenToolGroup 剥掉尾部未闭合的工具调用组，返回可安全复制的前缀。
@@ -479,18 +484,24 @@ func trimOpenToolGroup(rows []*StoredMessage) []*StoredMessage {
 }
 
 // prepareInheritedRows 读父会话历史，产出「可以整批灌进子会话」的行：首行 inherit
-// 标记、seq 已重排、摘要覆盖边界已重映射。**不落库**——它和 sessions 行由
-// Store.CreateWithRows 在同一个事务里一次写完（2026-11-16：此前 sessions 行先落库、
-// 消息再逐行写，中间十几秒里列表上是个正文为空的半成品；用户在这个窗口归档/删除它，
-// 就得到一条「能对话但列表里没有」的会话，而且逐行提交要 4000+ 次 fsync）。
+// 标记（承接锚点）、seq 已重排、摘要覆盖边界已重映射。**不落库**——它和 sessions 行
+// 由 Store.CreateWithRows 在同一个事务里一次写完（2026-11-16：此前 sessions 行先落库、
+// 消息再逐行写，中间十几秒里列表上是个正文为空的半成品，用户在这个窗口归档/删除它，
+// 就得到一条「能对话但列表里没有」的会话；逐行提交还要 4000+ 次 fsync）。
 //
-// 复制口径：**模型可见的原始行**（chat/aiuser/env/summary/report）逐条保序复制，
-// 这样子会话组装出的消息序列与父会话此前的请求逐条一致，模型的 KV 前缀缓存照旧
-// 命中（见 AGENT.md「子对话：上下文继承与一级限制」）。三类不复制：
-//   - request / audit：本会话的诊断工件（模型输入快照与审计行），buildContext 跳过；
-//   - prompt：系统提示词/工具定义快照，纯前端展示行（buildContext 整类跳过），
-//     却是父会话历史体积的大头（实测占 87.8%：24.3MB / 27.7MB）。
-func (a *App) prepareInheritedRows(parentID string) ([]*StoredMessage, error) {
+// 承接什么（用户口径：真正需要复制的是「上一次发送的上下文」，也就是模型真正会收到
+// 的那一份）：
+//   - 生效的最后一条压缩摘要（模型头部摘要，边界之前的原文模型本来就看不到）；
+//   - 摘要边界之后的**原文行**（chat/aiuser/env/report，逐条保序）；
+//   - 不复制 request / audit（本会话诊断工件）、不复制 prompt（系统提示词/工具定义
+//     快照，纯前端展示行，buildContext 整类跳过，却占父历史体积的大头：87.8%）。
+//
+// 于是子会话组装出的模型消息序列与「父会话下一次请求」逐条一致：KV 前缀缓存照常
+// 命中，系统提示词与工具目录由子会话按自己的 mode 重建（本来就没复制过）。
+// 更早的历史留在父会话里，前端「承接自 …· 更早 N 条」按需经
+// GET /api/sessions/{id}/inherit 懒加载（锚点里的 from/total 就是它的游标）。
+func (a *App) prepareInheritedRows(parent *SessionMeta) ([]*StoredMessage, error) {
+	parentID := parent.ID
 	all, err := a.Store.RawMessagesAll(parentID)
 	if err != nil {
 		return nil, err
@@ -508,16 +519,50 @@ func (a *App) prepareInheritedRows(parentID string) ([]*StoredMessage, error) {
 	// 是尾部未闭合的工具调用组——见 trimOpenToolGroup。
 	rows = trimOpenToolGroup(rows)
 
-	mark, _ := json.Marshal(inheritMark{Parent: parentID, Count: len(rows)})
-	out := make([]*StoredMessage, 0, len(rows)+1)
+	// 承接点 = 生效摘要的覆盖边界（不是摘要行的 seq）：摘要行往往落在它覆盖的
+	// 边界之后（压缩完成时才追加），按行位置截会连带丢掉边界与摘要行之间那段
+	// **模型其实能看到**的原文（实测父会话少 275 行）。边界之前的原文已被摘要
+	// 替代（buildContext 直接跳过），复制过去只占体积。
+	sums := activeSummaries(rows)
+	boundary := int64(0)
+	for _, s := range sums {
+		if s.CoversUpTo > boundary {
+			boundary = s.CoversUpTo
+		}
+	}
+	total := len(rows)
+	kept := make([]*StoredMessage, 0, len(rows))
+	kept = append(kept, sums...) // 摘要排在前面（组装时它们就是头部摘要，逐条按序注入）
+	for _, x := range rows {
+		if x.Kind == "summary" || x.Seq <= boundary {
+			continue
+		}
+		kept = append(kept, x)
+	}
+	// 懒加载游标：父会话里第一条被承接行的 seq（更早的都留在父会话里，前端按需取）
+	var from int64
+	for _, x := range kept {
+		if from == 0 || x.Seq < from {
+			from = x.Seq
+		}
+	}
+
+	mark, _ := json.Marshal(inheritMark{
+		Parent: parentID,
+		Count:  len(kept),
+		Title:  parent.Title,
+		From:   from,
+		Total:  total,
+	})
+	out := make([]*StoredMessage, 0, len(kept)+1)
 	out = append(out, &StoredMessage{
 		Message: TextMessage("user", string(mark)), Kind: inheritKind, CreatedAt: now(), Seq: 1,
 	})
 	// 先算好整张新旧 seq 映射再产出：摘要的覆盖边界要按新 seq 重写，
 	// 否则子会话的组装边界会对不上（摘要按旧 seq 覆盖、新行全是新 seq）。
-	newOfOld := make(map[int64]int64, len(rows))
+	newOfOld := make(map[int64]int64, len(kept))
 	seq := int64(1) // 标记行占一个 seq
-	for _, x := range rows {
+	for _, x := range kept {
 		seq++
 		newOfOld[x.Seq] = seq
 	}
@@ -526,7 +571,7 @@ func (a *App) prepareInheritedRows(parentID string) ([]*StoredMessage, error) {
 	// 因此被复制的摘要总能找到对应行。
 	remap := func(oldCover int64) int64 {
 		var outSeq int64
-		for _, x := range rows {
+		for _, x := range kept {
 			if x.Seq > oldCover {
 				break
 			}
@@ -536,7 +581,7 @@ func (a *App) prepareInheritedRows(parentID string) ([]*StoredMessage, error) {
 		}
 		return outSeq
 	}
-	for _, x := range rows {
+	for _, x := range kept {
 		cp := &StoredMessage{
 			Message:    x.Message,
 			Kind:       x.Kind,

@@ -312,6 +312,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "GET /api/sessions", a.handleListSessions, apiMeta{Summary: "会话列表", Params: "parent=按父会话查子对话", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/sessions", a.handleCreateSession, apiMeta{Summary: "新建会话", Params: "mode/workspace/title/provider/model/permission/planMode/parent/inheritContext 等", Perm: permWorkspace})
 	a.apiRoute(mux, "GET /api/sessions/{id}", a.handleGetSession, apiMeta{Summary: "会话详情（含运行态/排队/最近错误）", Perm: permReadOnly})
+	a.apiRoute(mux, "GET /api/sessions/{id}/inherit", a.handleSessionInherit, apiMeta{Summary: "子对话承接段的更早历史（懒加载，只读）", Params: "before_seq=父会话游标、limit≤500（缺省 200）", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/sessions/{id}/messages", a.handleSessionMessages, apiMeta{Summary: "会话消息轻量文本列表", Params: "role 过滤（如 user）、limit 从最新往回收", Perm: permReadOnly})
 	a.apiRoute(mux, "PATCH /api/sessions/{id}", a.handlePatchSession, apiMeta{Summary: "改会话设置", Params: "title/model/provider/permission/thinking/archived/unread 等", Perm: permWorkspace})
 	a.apiRoute(mux, "DELETE /api/sessions/{id}", a.handleDeleteSession, apiMeta{Summary: "删除会话（历史不可恢复）", Perm: permWorkspace, Danger: "删除会话及其全部历史，不可恢复"})
@@ -2062,6 +2063,64 @@ func sliceMsgWindow(msgs []*StoredMessage, lo, hi int) ([]*StoredMessage, olderI
 		}
 	}
 	return msgs[lo:hi], info
+}
+
+// handleSessionInherit 是子对话「承接自 <父标题> · 更早 N 条」的只读数据源：按
+// 承接锚点回父会话里取更早的一批历史（懒加载），不复制、不写库。
+//
+// 接口契约（前端与验收都按这份走）：
+//
+//	GET /api/sessions/{id}/inherit?before_seq=<父会话 seq>&limit=<n，缺省 200，上限 500>
+//	200 {"parentId":"…","parentTitle":"…",
+//	     "messages":[ {seq,role,kind,content,toolCalls?,createdAt,…}, …按 seq 升序 ],
+//	     "older":{"count": <这条批之前还剩多少条>}}
+//	400 该会话没有承接锚点（旧版子对话：完整历史本来就在会话里，没有更早的可加载）
+//	404 会话不存在；500 读库失败
+func (a *App) handleSessionInherit(w http.ResponseWriter, r *http.Request) {
+	m := a.sessionFromPath(w, r)
+	if m == nil {
+		return
+	}
+	raw, err := a.Store.InheritMark(m.ID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var mark inheritMark
+	if x := strings.TrimSpace(raw); x != "" {
+		_ = json.Unmarshal([]byte(x), &mark)
+	}
+	if mark.Parent == "" || mark.From == 0 {
+		writeErr(w, 400, "该会话没有承接锚点：旧版子对话的完整历史已在会话内，没有更早的可加载")
+		return
+	}
+	before := mark.From
+	if v, perr := strconv.ParseInt(r.URL.Query().Get("before_seq"), 10, 64); perr == nil && v > 0 {
+		before = v
+	}
+	limit := 200
+	if v, perr := strconv.Atoi(r.URL.Query().Get("limit")); perr == nil && v > 0 {
+		limit = v
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, left, err := a.Store.InheritRowsBefore(mark.Parent, before, limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	trimMessagesForUI(rows) // 下发瘦身：库内原样，只削响应副本（同会话详情）
+	title := mark.Title
+	if title == "" {
+		if p, perr := a.Store.Get(mark.Parent); perr == nil {
+			title = p.Title
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"parentId": mark.Parent, "parentTitle": title,
+		"messages": rows, "older": map[string]any{"count": left},
+	})
 }
 
 func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {

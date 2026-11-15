@@ -1851,6 +1851,58 @@ func (s *Store) CopyUploadsOnBranch(fromID, toID string) error {
 	return nil
 }
 
+// InheritMark 读会话的承接锚点（首行 kind=inherit 的正文）；没有则返回空串。
+func (s *Store) InheritMark(id string) (string, error) {
+	var content sql.NullString
+	err := s.db.QueryRow(`SELECT content FROM messages WHERE session_id=? AND kind='inherit' ORDER BY seq LIMIT 1`, id).Scan(&content)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return content.String, nil
+}
+
+// InheritRowsBefore 取父会话里 seq < beforeSeq 的可继承行（口径与派生完全一致：
+// 排除诊断工件 request/audit 与纯展示的 prompt 快照），按 seq 升序返回最后 limit
+// 条，并返回「这条之前还剩多少条」。数据源是子对话「承接自 … · 更早 N 条」的懒加载。
+func (s *Store) InheritRowsBefore(id string, beforeSeq int64, limit int) ([]*StoredMessage, int, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	const notArtifact = `kind NOT IN ('prompt','request','audit')`
+	rows, err := s.db.Query(`SELECT `+messageCols+` FROM messages
+		WHERE session_id=? AND seq<? AND `+notArtifact+` ORDER BY seq DESC LIMIT ?`, id, beforeSeq, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []*StoredMessage{}
+	for rows.Next() {
+		sm, err := scanMessage(rows)
+		if err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		out = append(out, sm)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	var left int
+	if len(out) > 0 {
+		if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE session_id=? AND seq<? AND `+notArtifact,
+			id, out[0].Seq).Scan(&left); err != nil {
+			return nil, 0, err
+		}
+	}
+	return out, left, nil
+}
+
 // DeleteUploadsForSession 删除会话时清掉它的上传登记。
 func (s *Store) DeleteUploadsForSession(sessionID string) error {
 	s.mu.Lock()

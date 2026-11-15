@@ -1040,16 +1040,85 @@ function setSecOpen(sec, open) {
   if (open) showEl(body); else hideEl(body);
 }
 
-/* 继承段：子对话开头的「来自主对话」历史，整段折叠成一条，点开是完整对话流。
-   内部复用主线渲染（用户气泡 + 回合渲染），所以外观与正文完全一致；
-   父对话的系统提示词快照行也在其中（一目了然「含系统提示词」）。
+// 承接段懒加载缓存：sid → {rows: 已加载的更早行（父会话 seq 空间）, from: 游标,
+// left: 还有多少条更早的, loading, inited}。只在本页内存里，刷新即回到「更最近 N 条」。
+const inheritOlderCache = new Map();
+
+function inheritOlderOf(sid, mark) {
+  let c = inheritOlderCache.get(sid);
+  if (!c) {
+    c = { rows: [], from: 0, left: 0, loading: false, inited: false };
+    inheritOlderCache.set(sid, c);
+  }
+  if (!c.inited && mark) {
+    c.from = mark.from || 0;
+    c.left = Math.max(0, (mark.total || 0) - (mark.count || 0));
+    c.inited = true;
+  }
+  return c;
+}
+
+// 承接段的「更早 N 条」：回父会话取一批更早的行（只读接口，契约见
+// server.go handleSessionInherit），存进内存缓存后整段重渲染。
+async function loadInheritOlder(sid, sec) {
+  const view = viewOf(sid);
+  const st = view && view.state;
+  if (!st || !st.msgs || !st.msgs.length) return;
+  const cache = inheritOlderOf(sid, null);
+  if (!cache.from || cache.loading) return;
+  cache.loading = true;
+  const more = sec && sec.querySelector('.inherit-more');
+  if (more) { more.disabled = true; more.textContent = '加载中…'; }
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/inherit?before_seq=' + cache.from + '&limit=200');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const rows = data.messages || [];
+    if (rows.length) {
+      cache.rows = rows.concat(cache.rows);
+      cache.from = rows[0].seq; // 父会话 seq 空间里的新游标
+      cache.left = (data.older && data.older.count) || 0;
+    } else {
+      cache.left = 0;
+    }
+    cache.loading = false;
+    // 承接段属于「前缀」（会话开头的折叠段），前缀复用判定命中就不会重建它——
+    // 必须先把前缀记账作废，否则加载回来的更早历史画不出来、按钮永远停在「加载中」。
+    st._pfxSid = null;
+    renderMessages(st.msgs, view);
+  } catch (e) {
+    cache.loading = false;
+    if (more) { more.disabled = false; more.textContent = '加载失败，点击重试'; }
+  }
+}
+
+/* 继承段（承接段）：子对话开头的「承接自 XX 会话」的历史，整段折叠成一条，点开是
+   完整对话流。内部复用主线渲染（用户气泡 + 回合渲染），所以外观与正文完全一致。
+   2026-11-16 起派生只承接「摘要 + 摘要边界之后的原文」：更早的父会话历史按需经
+   GET /api/sessions/{id}/inherit 懒加载（锚点里的 from/total 是游标），点一次取一批，
+   取到的行存在本页内存（inheritOlderCache），不写库、不改会话消息。
    turns 由 renderMessages 分组后传入（分组状态上的基线随 turns.base 带出，
    供正文段接着比——子对话首条 prompt 快照与父相同时不再重复显示）。 */
-function inheritBlock(turns, items, sid) {
+function inheritBlock(turns, items, sid, mark) {
   const key = sid + ':inherit';
   const sec = document.createElement('div');
   sec.className = 'tf-sec inherit';
   sec.dataset.key = key;
+  mark = mark || {};
+  const cache = inheritOlderOf(sid, mark);
+  // 「更早 N 条」只在有承接锚点（from/total）时出现：旧版子对话把父历史整段复制了
+  // 进来，本来就没有更早的可加载。
+  const olderLeft = cache.left || 0;
+  if (mark.from || cache.rows.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'inherit-more';
+    more.textContent = cache.loading ? '加载中…'
+      : olderLeft > 0 ? '更早 ' + olderLeft + ' 条（点击加载）' : '没有更早的历史了';
+    more.disabled = olderLeft <= 0 || !!cache.loading;
+    if (!more.disabled) more.onclick = () => loadInheritOlder(sid, sec);
+    sec.appendChild(more);
+  }
   const bar = document.createElement('button');
   bar.type = 'button';
   bar.className = 'turn-fold';
@@ -1057,7 +1126,9 @@ function inheritBlock(turns, items, sid) {
   label.className = 'tf-label';
   // 环境快照行不显示（与正文一致），计数按可见条数
   const n = items.filter((m) => m.kind !== 'env').length;
-  label.textContent = '来自主对话 · ' + n + ' 条（含系统提示词）';
+  label.textContent = mark.title
+    ? '承接自「' + mark.title + '」· 最近 ' + n + ' 条'
+    : '来自主对话 · ' + n + ' 条（含系统提示词）'; // 旧锚点（没有 title）退回旧文案
   bar.appendChild(label);
   bar.insertAdjacentHTML('beforeend', chev('tf-chev'));
   const body = document.createElement('div');
@@ -3000,14 +3071,21 @@ function renderMessages(msgs, view, opts) {
   // 折叠成一条「来自主对话」折叠条，其余消息照常渲染。继承段先分组，
   // 正文段从它分组后的基线接着比——子对话自己的 prompt 快照与父对话相同
   // 时不再重复显示「工具定义/系统提示词」（真变了才出变更行）。
-  let inherited = null, rest = msgs, off = 0, inhTurns = null;
+  let inherited = null, rest = msgs, off = 0, inhTurns = null, inhMark = null;
   if (msgs[0].kind === 'inherit') {
-    let n = 0;
-    try { n = JSON.parse(String(msgs[0].content ?? '{}')).count || 0; } catch (e) { /* 坏行就当没有继承段 */ }
+    let mark = {};
+    try { mark = JSON.parse(String(msgs[0].content ?? '{}')) || {}; } catch (e) { /* 坏行就当没有继承段 */ }
+    inhMark = mark;
+    const n = mark.count || 0;
     inherited = msgs.slice(1, 1 + n);
     rest = msgs.slice(1 + n);
     off = 1 + n;
+    // 懒加载过的更早历史（本页内存）：拼在承接段前面一起分组、一起折叠
+    const cache = inheritOlderOf(sid, mark);
+    if (cache.rows.length) inherited = cache.rows.concat(inherited);
     inhTurns = groupTurns(inherited, resultOf);
+  } else {
+    inheritOlderCache.delete(sid); // 不是子对话（或旧会话没有标记行）：缓存作废
   }
   const kRel = lastTurnStart(rest);
   const k = kRel < 0 ? off : off + kRel; // 前缀长度：无真实用户消息时继承段之后全算尾部
@@ -3018,7 +3096,7 @@ function renderMessages(msgs, view, opts) {
     && st._pfxNodes > 0 && box.children.length >= st._pfxNodes;
   if (!reusable) {
     box.innerHTML = '';
-    if (inhTurns) box.appendChild(inheritBlock(inhTurns, inherited, sid));
+    if (inhTurns) box.appendChild(inheritBlock(inhTurns, inherited, sid, inhMark));
     turns.forEach((turn, ti) => {
       if (ti === turns.length - 1) return; // 最后一回合属尾部
       appendTurn(box, turn, sid + ':' + (turn.userMsg ? turn.userMsg.seq : 'head' + ti), view, false);

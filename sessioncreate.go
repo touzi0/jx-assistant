@@ -187,7 +187,7 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 	// 列表里不会出现「正文为空的半成品」，也就没有「创建中被归档/删除」这个撞车
 	// 窗口（2026-11-16 事故根因）；没有历史要继承就还是普通的一次 INSERT。
 	if p.CopyHistory {
-		rows, rerr := a.prepareInheritedRows(parent.ID)
+		rows, rerr := a.prepareInheritedRows(parent)
 		if rerr != nil {
 			return nil, createSessionErr(500, "继承父对话上下文失败: %v", rerr)
 		}
