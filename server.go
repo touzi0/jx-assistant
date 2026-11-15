@@ -2469,6 +2469,18 @@ func (a *App) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if m, err := a.Store.Get(id); err == nil {
 		oldWS = m.Workspace
 	}
+	// 正在执行的会话先停：否则删掉行之后运行协程还在往这个 id 写消息/广播事件，
+	// 既留下没有主人的行，也让前端收到指向已删会话的流式帧（2026-11-16 事故的
+	// 排查里实测到「删了还能继续对话」的表层观感之一）。停止走与「停止」按钮
+	// 同一套分级收口；随后最多等 3 秒让执行体真的收口再删，收不口就按强制终结
+	// 处理（forceStopRun 会把注册表摘掉，之后的写入由 wasKilled 拦住）。
+	if r0 := a.runOf(id); r0 != nil {
+		a.stopRunBy(id, stopActorUser, "会话已被删除")
+		deadline := time.Now().Add(stopWatchdogDefault + 2*time.Second)
+		for a.IsRunning(id) && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 	a.closeRemoteSession(id) // 断开该会话的 SSH 连接
 	if err := a.Store.Delete(id); err != nil {
 		writeErr(w, 500, err.Error())

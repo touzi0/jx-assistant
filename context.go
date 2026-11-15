@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"regexp"
 	"sort"
@@ -600,14 +599,8 @@ func (a *App) prepareInheritedRows(parent *SessionMeta) ([]*StoredMessage, error
 	return out, nil
 }
 
-// copyInheritedUploads 把父会话的上传登记复制给子会话（uid 原样保留）：继承来的
-// 注记里若引用了 u 编号，子会话里的 deliver_result（upload 参数）仍能解析到原件
-// 路径。失败只记日志——附件登记丢了不该让整条子对话建不出来。
-func (a *App) copyInheritedUploads(parentID, childID string) {
-	if err := a.Store.CopyUploadsOnBranch(parentID, childID); err != nil {
-		log.Printf("[上传] 继承 %s → %s 复制上传登记失败（子对话交付目标将不可解析）: %v", parentID, childID, err)
-	}
-}
+// （上传登记现在由 Store.CreateWithRows 与历史行同事务写入，见 sessioncreate.go；
+// 旧的 copyInheritedUploads 已撤除——建完会话再补写会撞上并发删除、留下孤儿登记。）
 
 // estimateTokens 粗估一组消息的 token 量（中文为主的启发式）。
 func estimateTokens(msgs []Message) int {

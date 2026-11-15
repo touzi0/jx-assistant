@@ -341,6 +341,15 @@ function renderSubDDPop() {
   neu.innerHTML = '<span class="d-status">＋</span><span class="d-title">新建子对话</span>';
   neu.onclick = () => { closePopovers(); newAuxChat(); };
   pop.appendChild(neu);
+  // 回收站入口（固定在最底下）：子对话下拉只看得到没归档的，归档掉的孩子要有个
+  // 稳定的去处——否则一旦它也继承了父对话的 assistant 模式而被各处过滤，用户就
+  // 彻底没有入口了（2026-11-16 事故）。点它等于左栏切到回收站视图。
+  const bin = document.createElement('button');
+  bin.className = 'drawer-item sub-dd-bin';
+  bin.innerHTML = '<span class="d-status">🗑</span><span class="d-title">回收站 ›</span>';
+  bin.title = '打开左栏回收站：归档的会话（含子对话）都在这里，可恢复';
+  bin.onclick = () => { closePopovers(); setBinView(true); };
+  pop.appendChild(bin);
 }
 
 // 子对话下拉项的「更多/右键」菜单：与主对话会话菜单（openSessionMenu）同一套
@@ -516,6 +525,12 @@ async function openSubSession(id) {
 
 // 新建子对话并就地打开：下拉「新建」与右栏直接发消息的懒创建路径（prepareSend）
 // 共用。返回创建的会话；无父可挂或失败返回 null（已就地提示，输入内容保留）。
+//
+// 连点/并发保护（2026-11-16）：派生一个长父会话要读几十 MB 历史，几百毫秒内
+// 按钮没有反馈，用户会再点一次——旧实现每次点击都发一个 POST，于是建出两条
+// 「子对话」（事故当晚 23:28:10 与 23:28:16 那两条就是这么来的）。这里用
+// 模块级 in-flight 标记收口：进行中再点只给提示，不重复下发。
+let auxChatCreating = false;
 async function newAuxChat() {
   const fid = drawerFamilyId();
   if (!fid) {
@@ -524,9 +539,15 @@ async function newAuxChat() {
     setTimeout(() => { subView.hint.textContent = ''; }, 2500);
     return null;
   }
+  if (auxChatCreating) {
+    subView.hint.textContent = '正在新建子对话，请稍候…';
+    setTimeout(() => { subView.hint.textContent = ''; }, 2500);
+    return null;
+  }
+  auxChatCreating = true;
   try {
-    // 子对话＝当前对话的分支：后端照抄父会话的模式/工作区/权限/能力并完整复制历史，
-    // 系统提示词与上下文与主对话一致（继承段在对话里折叠成一条「来自主对话」）
+    // 子对话＝当前对话的分支：后端照抄父会话的模式/工作区/权限/能力，并承接
+    // 「摘要 + 边界后原文」（见 context.go prepareInheritedRows）
     const s = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ parent: fid, title: '子对话', inheritContext: true }),
@@ -538,6 +559,8 @@ async function newAuxChat() {
   } catch (e) {
     alert('新建子对话失败：' + e.message);
     return null;
+  } finally {
+    auxChatCreating = false;
   }
 }
 $('rp-close').onclick = () => {

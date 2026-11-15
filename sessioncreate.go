@@ -14,6 +14,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -191,7 +192,21 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 		if rerr != nil {
 			return nil, createSessionErr(500, "继承父对话上下文失败: %v", rerr)
 		}
-		if err := a.Store.CreateWithRows(m, rows); err != nil {
+		// 上传登记也随分支继承（uid 原样保留）：继承来的注记里若引用了 u 编号，
+		// 子会话里的 deliver_result（upload 参数）仍能解析到原件路径。与历史行
+		// 同事务落库——否则「建好会话 → 复制登记」之间被删除插队就留下孤儿登记。
+		// 读失败只记日志（附件登记丢了不该让整条子对话建不出来）。
+		var uploads []*Upload
+		if ups, uerr := a.Store.UploadsFor(parent.ID); uerr != nil {
+			log.Printf("[上传] 读 %s 的上传登记失败（子对话交付目标将不可解析）: %v", parent.ID, uerr)
+		} else {
+			for _, u := range ups {
+				nu := *u
+				nu.ID, nu.SessionID = 0, m.ID
+				uploads = append(uploads, &nu)
+			}
+		}
+		if err := a.Store.CreateWithRows(m, rows, uploads); err != nil {
 			return nil, createSessionErr(500, "继承父对话上下文失败: %v", err)
 		}
 	} else if err := a.Store.Create(m); err != nil {
@@ -201,9 +216,8 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 	if m.Remote == nil {
 		(&toolContext{app: a, sess: m}).ensureJxAI()
 	}
-	if p.CopyHistory {
-		a.copyInheritedUploads(parent.ID, m.ID)
-	}
+	// 历史行与上传登记在 CreateWithRows 的同一个事务里已经写完，这里不再复制
+	// （重复复制会让子会话的 u 编号翻倍，deliver_result 的 upload 解析会指向错行）。
 	// 首页「先录后聊」的兜底入口：建创建技能会话时工作区若已有演示材料，
 	// 注入一条【演示记录】清单通知（同文件上传通知机制），模型开轮即知道
 	// 有哪些现成记录可分析——人工建的与 dispatch 派出的 skill-create 会话

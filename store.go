@@ -719,15 +719,20 @@ type dbExecer interface {
 	Exec(query string, args ...any) (sql.Result, error)
 }
 
-// CreateWithRows 在一个事务里建会话并整批写入它的历史行：要么全有、要么全无。
+// CreateWithRows 在一个事务里建会话并整批写入它的历史行（以及随分支继承过来的
+// 上传登记）：要么全有、要么全无。
 //
 // 为什么必须原子（2026-11-16 事故的两个根因都在这）：
 //  1. 列表里不会再出现「正文为空的半成品」——此前 sessions 行 0.04s 就落库可见，
 //     消息要十几秒才写完；用户在这个窗口里归档/删除它，就得到一条「能对话、但
 //     列表里找不到」的会话。
 //  2. 整批是一个提交——此前逐行 AppendRow 每行一次 fsync（实测 3.13ms/行，
-//     4400 行 = 13.9s），现在同一个父会话只要 0.4s 量级。
-func (s *Store) CreateWithRows(m *SessionMeta, rows []*StoredMessage) error {
+//     4400 行 = 13.9s），现在同一个父会话只要 0.2s 量级。
+//
+// uploads 由调用方先在事务外读好传进来（Store 的读方法自己取锁，事务内再读会死锁）；
+// 放进同一事务是因为「建好会话 → 复制上传登记」中间若被删除插队，那批登记就成了
+// 没有主人的死数据（实测：并发删除留下 3 条孤儿 uploads）。
+func (s *Store) CreateWithRows(m *SessionMeta, rows []*StoredMessage, uploads []*Upload) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
@@ -740,6 +745,12 @@ func (s *Store) CreateWithRows(m *SessionMeta, rows []*StoredMessage) error {
 	}
 	if err := insertMessagesTx(tx, m.ID, rows); err != nil {
 		return err
+	}
+	for _, u := range uploads {
+		if _, err := tx.Exec(`INSERT INTO uploads (session_id, uid, orig_path, copy_path, name, size, created_at)
+			VALUES(?,?,?,?,?,?,?)`, m.ID, u.UID, u.OrigPath, u.CopyPath, u.Name, u.Size, u.CreatedAt); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
