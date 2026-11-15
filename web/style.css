@@ -894,6 +894,21 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 .md th, .md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
 .md th { background: var(--code-bg); font-weight: 600; }
 .md b, .md strong { font-weight: 600; }
+/* marked 渲染器新增语法（引用块/分隔线/任务列表/嵌套列表/图片）：字号一律
+   继承 .msg-col 的 --chat-fs（em/浏览器默认相对值），不引入第二套字号体系 */
+.md blockquote {
+  margin: 8px 0; padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border-2); color: var(--text-2);
+}
+.md blockquote > :first-child { margin-top: 0; }
+.md blockquote > :last-child { margin-bottom: 0; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md li > ul, .md li > ol { margin: 3px 0; }
+.md input[type="checkbox"] {
+  width: .95em; height: .95em; margin: 0 6px 0 0;
+  vertical-align: middle; accent-color: var(--accent);
+}
+.md img { max-width: 100%; }
 
 /* ---------- 回合折叠条与过程行（思考/工具统一折叠体系，对齐 DSH） ---------- */
 

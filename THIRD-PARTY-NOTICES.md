@@ -192,6 +192,7 @@
 | 组件 | 版本 | 版权 | License | 来源 |
 |---|---|---|---|---|
 | qrcode（npm 包，浏览器版打包） | 1.5.4 | Copyright (c) 2012 Ryan Day | MIT | https://github.com/soldair/node-qrcode |
+| marked（浏览器压缩版，marked.lib.js；MD 查看器模板与右栏渲染页共用此份，见 §4） | 12.0.0 | Copyright (c) 2011-2024, Christopher Jeffrey | MIT | https://github.com/markedjs/marked |
 
 ## 7. 安卓（jx-link 壳 / android 主壳 / Termux 运行时快照）
 

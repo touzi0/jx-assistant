@@ -157,3 +157,27 @@ func TestHandleMDView(t *testing.T) {
 		t.Fatalf("未知会话应 404，got %d", resp.StatusCode)
 	}
 }
+
+// marked 单一副本注入：模板只带 /*__MARKED__*/ 占位符，启动时从 web/marked.lib.js
+//（go:embed web 的同一份字节）灌入。注入链断了（模板/lib 改名、占位符被删）
+// 这里第一时间红，而不是等到右栏查看器显示「解析失败」。
+func TestMDViewerTemplateMarkedInjected(t *testing.T) {
+	if !strings.Contains(mdViewerTemplateRaw, mdViewerMarkedSlot) {
+		t.Fatalf("模板缺少 %s 占位符（模板被改坏）", mdViewerMarkedSlot)
+	}
+	if strings.Contains(mdViewerTemplate, mdViewerMarkedSlot) {
+		t.Fatal("占位符未被替换：marked 没有注入模板")
+	}
+	// 注入的是能跑的 marked：UMD 头 + 挂到 globalThis.marked 的导出语句
+	if !strings.Contains(mdViewerTemplate, "marked v12.0.0") || !strings.Contains(mdViewerTemplate, "e.marked=ce") {
+		t.Fatal("注入内容不是 marked v12 浏览器版（web/marked.lib.js 被换错文件？）")
+	}
+	// 灌数据后整页可组装（renderMDViewerPage 的占位符口径未被注入破坏）
+	page, err := renderMDViewerPage(mdViewerTemplate, "t.md", "m", []byte("# x"))
+	if err != nil {
+		t.Fatalf("注入后的模板无法灌数据: %v", err)
+	}
+	if strings.Contains(page, "__B64__") || strings.Contains(page, mdViewerMarkedSlot) {
+		t.Fatal("渲染页残留占位符")
+	}
+}

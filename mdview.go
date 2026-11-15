@@ -28,7 +28,22 @@ import (
 )
 
 //go:embed md-viewer/viewer-template.html
-var mdViewerTemplate string
+var mdViewerTemplateRaw string
+
+// marked 渲染库全仓只存 web/marked.lib.js 一份：主 exe 里 go:embed 一次
+//（server.go 的 //go:embed web 与这里的注入共用同一份字节），启动时灌进
+// 查看器模板的 /*__MARKED__*/ 占位符；独立 MD查看器.exe 由 md-viewer/build.ps1
+// 构建时注入同一份。注入源异常时退回原文——查看器页会显示「解析失败」，
+// 主功能不受影响。
+const mdViewerMarkedSlot = "/*__MARKED__*/"
+
+var mdViewerTemplate = func() string {
+	lib, err := webFS.ReadFile("web/marked.lib.js")
+	if err != nil || !strings.Contains(mdViewerTemplateRaw, mdViewerMarkedSlot) || strings.Contains(string(lib), "</script>") {
+		return mdViewerTemplateRaw
+	}
+	return strings.Replace(mdViewerTemplateRaw, mdViewerMarkedSlot, string(lib), 1)
+}()
 
 const (
 	mdViewPrefix = "/api/md/" // 右栏 md 渲染页路由前缀（见 mdViewURL）
@@ -106,7 +121,7 @@ func jsStringEscape(s string) string {
 func renderMDViewerPage(tpl, title, meta string, body []byte) (string, error) {
 	for _, ph := range []string{"__TITLE__", "__B64__", "__META__", "__KEEP_RUNNING__"} {
 		if !strings.Contains(tpl, ph) {
-			return "", errors.New("md 查看器模板缺少占位符 " + ph + "（用 md-viewer/tools/assemble-template.js 重新生成）")
+			return "", errors.New("md 查看器模板缺少占位符 " + ph + "（模板文件被改坏：md-viewer/viewer-template.html）")
 		}
 	}
 	return strings.NewReplacer(

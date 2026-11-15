@@ -41,9 +41,15 @@ function buildTempHtml() {
   const filler = Array.from({ length: 30 }, (_, i) => `段落内容 ${i + 1}，用于撑高文档验证滚动。`).join('\n\n');
   md = md.replace(/^段落内容。$/gm, filler);
   const tpl = fs.readFileSync(tplPath, 'utf8');
+  // 模板只带 /*__MARKED__*/ 占位符（marked 本体全仓唯一一份在 web/marked.lib.js，
+  // 主程序 mdview.go 启动时注入；这里按同一规则注入后才能驱动真实页面）
+  const markedJs = fs.readFileSync(path.join(root, '..', 'web', 'marked.lib.js'), 'utf8');
+  if (!tpl.includes('/*__MARKED__*/')) throw new Error('template missing /*__MARKED__*/ slot');
+  if (/<\/script/.test(markedJs)) throw new Error('marked lib contains </script');
   const name = '目录测试.md';
   const b64 = Buffer.from(md, 'utf8').toString('base64');
   const html = tpl
+    .replace('/*__MARKED__*/', () => markedJs)
     .replace('__TITLE__', name)
     .replace('__META__', name + ' · ' + md.length + ' 字符')
     .replace('__KEEP_RUNNING__', 'false')

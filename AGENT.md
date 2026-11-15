@@ -438,10 +438,11 @@ WebView2 内核渲染（浏览器组件已全部内嵌进 exe，整个程序就
 - 未装 WebView2 运行时自动降级用系统浏览器打开；详见 `md-viewer/使用说明.txt`。
 - **右栏也用同一套渲染**（`mdview.go`）：产品里的 md 不再显示原文，右栏打开
   的就是这份 `viewer-template.html`（`go:embed` 进 exe，灌标题/正文/副标题），
-  与独立窗口同一套 marked 与样式、同一个目录侧栏。所以改模板（样式、断点、
-  渲染行为）要改 `viewer-template.src.html` 再用 `node
-  md-viewer/tools/assemble-template.js` 重新生成 `viewer-template.html`——
-  两处（独立窗口与右栏）一次生效，别去右栏另写渲染器。
+  与独立窗口同一套 marked 与样式、同一个目录侧栏。模板里 marked 只有
+  `/*__MARKED__*/` 占位符：marked 本体全仓唯一一份在 `web/marked.lib.js`
+ （对话区 md() 渲染也用它），`mdview.go` 启动时注入主 exe、`md-viewer/build.ps1`
+  构建时注入独立查看器 exe。改模板（样式、断点、渲染行为）直接改
+  `viewer-template.html`——两处（独立窗口与右栏）一次生效，别去右栏另写渲染器。
 
 ## 权限与执行模型（移植 DSH 官方沙箱机制，本栈重写）
 

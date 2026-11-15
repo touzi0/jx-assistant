@@ -7,10 +7,12 @@
 #   1) borrow WebView2 assemblies from the launcher's lib (repo root fallback,
 #      NuGet extraction last resort)
 #   2) app-logo.png -> app.ico via make-icon.cs
-#   3) compile ONE exe: WebView2 managed assemblies, native loader, and the
+#   3) inject the shared marked build (web/marked.lib.js, the repo's single
+#      copy) into the viewer template's /*__MARKED__*/ slot, then
+#   4) compile ONE exe: WebView2 managed assemblies, native loader, and the
 #      viewer template all embedded as resources (AssemblyResolve loads the
 #      managed ones at runtime; the loader drops to %LOCALAPPDATA%)
-#   4) ship exe + manual into <repo>\md-viewer\ (nothing else)
+#   5) ship exe + manual into <repo>\md-viewer\ (nothing else)
 $ErrorActionPreference = 'Stop'
 
 $devDir   = $PSScriptRoot
@@ -70,6 +72,21 @@ if ($missing.Count -gt 0) {
 if (-not (Test-Path $templateIn)) { throw "viewer template missing: $templateIn" }
 if (-not (Test-Path $welcomeIn)) { throw "welcome page missing: $welcomeIn" }
 
+# ---------- 0) Inject marked into the template ----------
+# marked exists exactly once in the repo (web/marked.lib.js). The template
+# carries only the /*__MARKED__*/ slot; the exe must embed a self-contained
+# page, so the build injects the same copy the main app injects at startup
+# (mdview.go). Output goes to build\, never touching the source template.
+$markedLibPath = Join-Path $repoDir 'web\marked.lib.js'
+if (-not (Test-Path $markedLibPath)) { throw "marked lib missing: $markedLibPath" }
+$markedJs   = [IO.File]::ReadAllText($markedLibPath)
+$templateRaw = [IO.File]::ReadAllText($templateIn)
+if ($templateRaw -notmatch '__MARKED__') { throw "viewer template missing the /*__MARKED__*/ slot: $templateIn" }
+if ($markedJs -match '</script') { throw "marked lib contains '</script', cannot inline" }
+$templateBuilt = Join-Path $buildDir 'viewer-template.html'
+[IO.File]::WriteAllText($templateBuilt, $templateRaw.Replace('/*__MARKED__*/', $markedJs))
+Write-Host "[0/3] Injected marked ($($markedJs.Length) chars) -> $templateBuilt"
+
 # ---------- 1) Generate app.ico via make-icon ----------
 Write-Host "[1/3] Generating app.ico ..."
 $makeIconExe = Join-Path $buildDir 'make-icon.exe'
@@ -103,7 +120,7 @@ Write-Host "[2/3] Compiling $exeName (single file, resources embedded) ..."
     "/resource:$coreDll,MDViewer.res.Microsoft.Web.WebView2.Core.dll" `
     "/resource:$winFormsDll,MDViewer.res.Microsoft.Web.WebView2.WinForms.dll" `
     "/resource:$loaderDll,MDViewer.res.WebView2Loader.dll" `
-    "/resource:$templateIn,MDViewer.res.viewer-template.html" `
+    "/resource:$templateBuilt,MDViewer.res.viewer-template.html" `
     "/resource:$welcomeIn,MDViewer.res.welcome.html" `
     (Join-Path $srcDir 'MDViewer.cs')
 if ($LASTEXITCODE -ne 0) { throw "viewer compilation failed (exit $LASTEXITCODE)" }

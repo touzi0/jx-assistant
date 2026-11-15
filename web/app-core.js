@@ -539,13 +539,7 @@ if (narrowMq) {
 
 window.addEventListener('resize', leaveNarrowIfNeeded);
 
-/* ---------- Markdown 渲染（围栏代码块、标题、列表、表格、行内样式、链接） ---------- */
-
-// 行内格式：代码 span → 粗体 → 链接（[文字](url) 与裸 http(s) URL）→ 文件路径。
-// 链接带 ext-link 类，点击由 app-chat.js 的委托处理器接管——在内嵌浏览器
-// （右栏面板）打开而非整页跳转；Ctrl/中键放行浏览器默认行为。
-// 转义次序：代码 span 先摘出占位（其中 URL 不做链接化），其余文本逐段 esc
-// 后拼链接，保证不破坏现有 XSS 防线。
+/* ---------- Markdown 渲染（marked v12 词法 + 自研白名单渲染器） ---------- */
 
 // 文件路径识别（对话中途输出的文件地址 → file-link，点击右栏预览）：
 // 盘符绝对路径或带分隔符的相对路径，且以字母开头的扩展名结尾（分隔符是
@@ -580,99 +574,153 @@ function pathLinks(seg) {
   return out + esc(seg.slice(last));
 }
 
-function inlineFmt(s) {
-  const codes = [];
-  let t = s.replace(/`([^`\n]+)`/g, (_, c) => {
-    codes.push(c);
-    return '\x00' + (codes.length - 1) + '\x00';
-  });
-  // 裸 URL 只认 ASCII URL 字符：中文与全角标点（如句号逗号）处截断，避免把后面的正文吞进链接
-  const linkRe = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[A-Za-z0-9\-._~:\/?#\[\]@!$&'*+,;=%]+)/g;
-  let out = '', last = 0, m;
-  while ((m = linkRe.exec(t))) {
-    out += pathLinks(t.slice(last, m.index));
-    const href = m[1] !== undefined ? m[2] : m[0];
-    const text = m[1] !== undefined ? m[1] : m[0];
-    out += '<a class="ext-link" href="' + esc(href) + '" rel="noopener">' + esc(text) + '</a>';
-    last = m.index + m[0].length;
+// 解析交给 marked（web/marked.lib.js，GFM + breaks），HTML 由下面的 render 函数
+// 自己拼——这是安全边界：只产出这里写死的白名单标签与属性，源文本里的标签
+// 不可能原样出去（html token 一律 esc 成文字；链接/图片只放行 http(s)，其余
+// 协议整段按原文转义显示）。esc() 与 marked 自带的转义（codespan 内容、
+// escape 字符、图片 alt 已转义，直接用）是全部 HTML 出口。
+// 视觉契约与旧自研渲染器保持一致：标题 h2 起步、段落内单换行=br（breaks:
+// true）、链接 ext-link 类、行内代码路径识别（codeSpanIsPath→file-link）、
+// 裸 URL 只吞 ASCII URL 字符（marked 会把后随中文也吞进链接，renderLink 里
+// 切回来）。
+const MD_OPTS = { gfm: true, breaks: true };
+const MD_HTTP = /^https?:\/\//i; // 链接/图片唯一放行的协议
+const MD_URL_TAIL = /^[A-Za-z0-9\-._~:\/?#\[\]@!$&'*+,;=%]+/; // ASCII URL 字符集（旧渲染器口径）
+
+function extLink(href, text) {
+  return '<a class="ext-link" href="' + esc(href) + '" rel="noopener">' + text + '</a>';
+}
+
+function renderLink(t) {
+  // 裸 URL 自动链接的 token raw 以协议/www 开头；[文字](url) 与 <url> 形态以 [ / < 开头。
+  // GFM 自动链接允许 URL 含任意非空白字符——中文语境里 URL 后紧跟的正文/标点
+  // 会被一并吞进链接，这里按 ASCII 字符集把尾巴切下来还原成正文。
+  if (/^(?:https?:\/\/|www\.)/i.test(t.raw)) {
+    const m = t.raw.match(MD_URL_TAIL);
+    const url = m ? m[0] : t.raw;
+    const href = /^https?:/i.test(url) ? url : 'http://' + url;
+    return extLink(href, esc(url)) + (m ? pathLinks(t.raw.slice(m[0].length)) : '');
   }
-  out += pathLinks(t.slice(last));
-  out = out
-    .replace(/\x00(\d+)\x00/g, (_, i) => {
-      const c = codes[+i];
-      return codeSpanIsPath(c)
-        ? '<code><a class="file-link" data-path="' + esc(c) + '">' + esc(c) + '</a></code>'
-        : '<code>' + esc(c) + '</code>';
-    })
-    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  if (!MD_HTTP.test(t.href || '')) return esc(t.raw); // 非白名单协议：整段原文转义
+  return extLink(t.href, renderInline(t.tokens));
+}
+
+function renderImage(t) {
+  if (!MD_HTTP.test(t.href || '')) return esc(t.raw);
+  // alt 已由 marked 转义；外链图懒加载且不带 referrer
+  return '<img src="' + esc(t.href) + '" alt="' + t.text + '" loading="lazy" referrerpolicy="no-referrer">';
+}
+
+// 行内 token → HTML（白名单：text/escape/codespan/strong/em/del/br/link/image）
+function renderInline(tokens) {
+  let out = '';
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'text': out += pathLinks(t.raw); break; // 纯文本：esc + 文件路径识别
+      case 'escape': out += esc(t.text); break;    // \* 反斜杠转义
+      case 'codespan': { // 内容 marked 已转义（&<>"' 全套）
+        const c = t.text;
+        out += codeSpanIsPath(c)
+          ? '<code><a class="file-link" data-path="' + c + '">' + c + '</a></code>'
+          : '<code>' + c + '</code>';
+        break;
+      }
+      case 'strong': out += '<strong>' + renderInline(t.tokens) + '</strong>'; break;
+      case 'em': out += '<em>' + renderInline(t.tokens) + '</em>'; break;
+      case 'del': out += '<del>' + renderInline(t.tokens) + '</del>'; break;
+      case 'br': out += '<br>'; break;
+      case 'link': out += renderLink(t); break;
+      case 'image': out += renderImage(t); break;
+      case 'html': out += esc(t.text); break; // 行内 HTML 不放行：按文字显示
+      default: out += pathLinks(String(t.raw != null ? t.raw : (t.text || ''))); break;
+    }
+  }
   return out;
 }
 
-function renderBlocks(seg) {
-  const lines = seg.split(/\r?\n/);
-  const out = [];
-  let i = 0;
-  const isTableSep = (l) => /^\s*\|[\s:|-]+\|\s*$/.test(l);
-  const isUl = (l) => /^\s*[-*]\s+\S/.test(l);
-  const isOl = (l) => /^\s*\d+[.、]\s+\S/.test(l);
-  const parseRow = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
-
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.trim()) { i++; continue; }
-
-    const h = line.match(/^(#{1,6})\s+(.*)$/);
-    if (h) {
-      const lv = Math.min(h[1].length + 1, 5); // 页面里 h2 起步
-      out.push(`<h${lv}>${inlineFmt(h[2])}</h${lv}>`);
-      i++; continue;
-    }
-
-    if (/^\s*\|.+\|\s*$/.test(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
-      const head = parseRow(line);
-      i += 2;
-      const rows = [];
-      while (i < lines.length && /^\s*\|.+\|\s*$/.test(lines[i])) rows.push(parseRow(lines[i++]));
-      let t = '<table><thead><tr>' + head.map((c) => `<th>${inlineFmt(c)}</th>`).join('') + '</tr></thead><tbody>';
-      for (const r of rows) t += '<tr>' + r.map((c) => `<td>${inlineFmt(c)}</td>`).join('') + '</tr>';
-      out.push(t + '</tbody></table>');
-      continue;
-    }
-
-    if (isUl(line) || isOl(line)) {
-      const ol = isOl(line) && !isUl(line);
-      const items = [];
-      while (i < lines.length && (ol ? isOl(lines[i]) : isUl(lines[i]))) {
-        items.push(lines[i].replace(ol ? /^\s*\d+[.、]\s+/ : /^\s*[-*]\s+/, ''));
-        i++;
+// 块级 token → HTML。inList：紧凑列表项内的裸文本不包 <p>（与 marked Parser
+// 的 loose 口径一致；顶层与松散列表包 <p>）。
+function renderBlocks(tokens, inList) {
+  let out = '';
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'space': case 'def': break;
+      case 'heading': {
+        const lv = Math.min(t.depth + 1, 5); // 页面里 h2 起步（沿用旧渲染器）
+        out += '<h' + lv + '>' + renderInline(t.tokens) + '</h' + lv + '>';
+        break;
       }
-      out.push((ol ? '<ol>' : '<ul>') + items.map((it) => `<li>${inlineFmt(it)}</li>`).join('') + (ol ? '</ol>' : '</ul>'));
-      continue;
+      case 'paragraph': out += '<p>' + renderInline(t.tokens) + '</p>'; break;
+      case 'text': {
+        const inner = t.tokens ? renderInline(t.tokens) : pathLinks(String(t.text || ''));
+        out += inList ? inner : '<p>' + inner + '</p>';
+        break;
+      }
+      case 'code': out += '<pre><code>' + esc(t.text.replace(/\n$/, '')) + '</code></pre>'; break;
+      case 'blockquote': out += '<blockquote>' + renderBlocks(t.tokens) + '</blockquote>'; break;
+      case 'hr': out += '<hr>'; break;
+      case 'html': out += '<p>' + esc(t.text).replace(/\n/g, '<br>') + '</p>'; break; // 块级 HTML 按文字显示
+      case 'table': {
+        const cell = (c, align, head) => {
+          const tag = head ? 'th' : 'td';
+          const st = (align === 'center' || align === 'right') ? ' style="text-align:' + align + '"' : '';
+          return '<' + tag + st + '>' + renderInline(c.tokens) + '</' + tag + '>';
+        };
+        let h = '<table><thead><tr>';
+        t.header.forEach((c, i) => { h += cell(c, t.align[i], true); });
+        h += '</tr></thead><tbody>';
+        for (const row of t.rows) {
+          h += '<tr>';
+          row.forEach((c, i) => { h += cell(c, t.align[i], false); });
+          h += '</tr>';
+        }
+        out += h + '</tbody></table>';
+        break;
+      }
+      case 'list': {
+        const tag = t.ordered ? 'ol' : 'ul';
+        const start = t.ordered && t.start !== '' && t.start !== 1 ? ' start="' + parseInt(t.start, 10) + '"' : '';
+        let items = '';
+        for (const it of t.items) {
+          const loose = it.loose || t.loose;
+          let inner = renderBlocks(it.tokens, !loose);
+          if (it.task) {
+            const box = '<input type="checkbox" disabled' + (it.checked ? ' checked' : '') + '>';
+            inner = loose ? inner.replace('<p>', '<p>' + box + ' ') : box + ' ' + inner;
+          }
+          items += '<li>' + inner + '</li>';
+        }
+        out += '<' + tag + start + '>' + items + '</' + tag + '>';
+        break;
+      }
+      default:
+        out += t.tokens ? renderBlocks(t.tokens, inList)
+          : '<p>' + pathLinks(String(t.raw != null ? t.raw : '')) + '</p>';
     }
-
-    const para = [];
-    while (i < lines.length && lines[i].trim() &&
-      !/^#{1,6}\s/.test(lines[i]) && !/^\s*\|/.test(lines[i]) && !isUl(lines[i]) && !isOl(lines[i])) {
-      para.push(lines[i]); i++;
-    }
-    if (para.length) out.push(`<p>${inlineFmt(para.join('\n')).replace(/\n/g, '<br>')}</p>`);
-    else { out.push(`<p>${inlineFmt(line)}</p>`); i++; } // 兜底：流式输出中的半成品表格行走到这里，必须强制前进，否则外层循环死循环卡死页面
   }
-  return out.join('');
+  return out;
+}
+
+// 中文顿号序号（1、 2、）不是 GFM 列表语法（GFM 只认 1. / 1)），旧渲染器认。
+// 交给 marked 前原位换成「数字.」（围栏代码块内不动，只动缩进 ≤3 空格的行，
+// 避免碰缩进代码块）——列表标记不进渲染结果（<ol> 自己出号），无可见差异。
+function mdPre(src) {
+  if (!/、[ \t]/.test(src)) return src;
+  return src.split('```').map((p, i) =>
+    i % 2 === 1 ? p : p.replace(/(^|\n)([ \t]{0,3}\d+)、[ \t]+/g, '$1$2. ')
+  ).join('```');
 }
 
 function md(text) {
-  const parts = String(text ?? '').split('```');
-  let html = '';
-  parts.forEach((part, i) => {
-    if (i % 2 === 1) {
-      const code = part.replace(/^[a-zA-Z0-9_#+-]*\r?\n/, '');
-      html += `<pre><code>${esc(code)}</code></pre>`;
-    } else if (part.trim()) {
-      html += renderBlocks(part);
-    }
-  });
-  return html;
+  const src = String(text ?? '');
+  if (!src) return '';
+  const fallback = () => '<p>' + esc(src).replace(/\n/g, '<br>') + '</p>';
+  if (typeof marked === 'undefined') return fallback(); // marked 缺席：按纯文字，绝不抛错
+  try {
+    return renderBlocks(marked.lexer(mdPre(src), MD_OPTS), false);
+  } catch (e) {
+    return fallback(); // 解析异常：全文按文字，不让渲染错误打断界面
+  }
 }
 
 function relTime(s) {
