@@ -478,20 +478,28 @@ func trimOpenToolGroup(rows []*StoredMessage) []*StoredMessage {
 	return rows
 }
 
-// copyInheritedContext 把父会话的完整消息历史复制进子会话，作为子对话继承的上下文。
-// 复制的是**原始行**（含摘要与压缩标记，逐行保序、seq 重排），不是渲染成的一段文本——
-// 这样复制后子会话的「模型可见序列」与父会话此前的请求逐条一致（同一套摘要边界、
-// 同一套规则压缩视图），DeepSeek 的前缀缓存才能命中整段父上下文。
-// 首行写一条 kind=inherit 标记行（前端折叠显示、组装时跳过），返回复制的行数。
-func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
+// prepareInheritedRows 读父会话历史，产出「可以整批灌进子会话」的行：首行 inherit
+// 标记、seq 已重排、摘要覆盖边界已重映射。**不落库**——它和 sessions 行由
+// Store.CreateWithRows 在同一个事务里一次写完（2026-11-16：此前 sessions 行先落库、
+// 消息再逐行写，中间十几秒里列表上是个正文为空的半成品；用户在这个窗口归档/删除它，
+// 就得到一条「能对话但列表里没有」的会话，而且逐行提交要 4000+ 次 fsync）。
+//
+// 复制口径：**模型可见的原始行**（chat/aiuser/env/summary/report）逐条保序复制，
+// 这样子会话组装出的消息序列与父会话此前的请求逐条一致，模型的 KV 前缀缓存照旧
+// 命中（见 AGENT.md「子对话：上下文继承与一级限制」）。三类不复制：
+//   - request / audit：本会话的诊断工件（模型输入快照与审计行），buildContext 跳过；
+//   - prompt：系统提示词/工具定义快照，纯前端展示行（buildContext 整类跳过），
+//     却是父会话历史体积的大头（实测占 87.8%：24.3MB / 27.7MB）。
+func (a *App) prepareInheritedRows(parentID string) ([]*StoredMessage, error) {
 	all, err := a.Store.RawMessagesAll(parentID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	rows := make([]*StoredMessage, 0, len(all))
 	for _, x := range all {
-		if x.Kind == "request" || x.Kind == "audit" {
-			continue // 模型输入快照与审计行是本会话的诊断工件，不随上下文继承
+		switch x.Kind {
+		case "request", "audit", "prompt":
+			continue // 诊断工件与纯展示快照不随上下文继承
 		}
 		rows = append(rows, x)
 	}
@@ -499,18 +507,16 @@ func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
 	// 所以整份复制即可，不判断"整轮"、也不区分父会话是否正在执行。唯一不能带走的
 	// 是尾部未闭合的工具调用组——见 trimOpenToolGroup。
 	rows = trimOpenToolGroup(rows)
-	if len(rows) == 0 {
-		return 0, nil
-	}
 
-	// 先算好整张新旧 seq 映射再落库：摘要的覆盖边界要按新 seq 重写，
+	mark, _ := json.Marshal(inheritMark{Parent: parentID, Count: len(rows)})
+	out := make([]*StoredMessage, 0, len(rows)+1)
+	out = append(out, &StoredMessage{
+		Message: TextMessage("user", string(mark)), Kind: inheritKind, CreatedAt: now(), Seq: 1,
+	})
+	// 先算好整张新旧 seq 映射再产出：摘要的覆盖边界要按新 seq 重写，
 	// 否则子会话的组装边界会对不上（摘要按旧 seq 覆盖、新行全是新 seq）。
-	last, err := a.Store.LastSeq(childID)
-	if err != nil {
-		return 0, err
-	}
 	newOfOld := make(map[int64]int64, len(rows))
-	seq := last + 1 // 标记行占一个 seq
+	seq := int64(1) // 标记行占一个 seq
 	for _, x := range rows {
 		seq++
 		newOfOld[x.Seq] = seq
@@ -519,23 +525,16 @@ func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
 	// 摘要的 covers_up_to 必定 ≤ 它自己的 seq（摘要只覆盖排在它之前的行），
 	// 因此被复制的摘要总能找到对应行。
 	remap := func(oldCover int64) int64 {
-		var out int64
+		var outSeq int64
 		for _, x := range rows {
 			if x.Seq > oldCover {
 				break
 			}
 			if n, ok := newOfOld[x.Seq]; ok {
-				out = n
+				outSeq = n
 			}
 		}
-		return out
-	}
-
-	mark, _ := json.Marshal(inheritMark{Parent: parentID, Count: len(rows)})
-	if err := a.Store.AppendRow(childID, &StoredMessage{
-		Message: TextMessage("user", string(mark)), Kind: inheritKind, CreatedAt: now(),
-	}); err != nil {
-		return 0, err
+		return outSeq
 	}
 	for _, x := range rows {
 		cp := &StoredMessage{
@@ -551,16 +550,18 @@ func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
 		if x.Kind == "summary" {
 			cp.CoversUpTo = remap(x.CoversUpTo)
 		}
-		if err := a.Store.AppendRow(childID, cp); err != nil {
-			return 0, err
-		}
+		out = append(out, cp)
 	}
-	// 上传登记也随上下文继承（uid 原样保留）：继承来的注记里若引用了
-	// u 编号，子会话里的 deliver_result（upload 参数）仍能解析到原件路径。失败只记日志。
+	return out, nil
+}
+
+// copyInheritedUploads 把父会话的上传登记复制给子会话（uid 原样保留）：继承来的
+// 注记里若引用了 u 编号，子会话里的 deliver_result（upload 参数）仍能解析到原件
+// 路径。失败只记日志——附件登记丢了不该让整条子对话建不出来。
+func (a *App) copyInheritedUploads(parentID, childID string) {
 	if err := a.Store.CopyUploadsOnBranch(parentID, childID); err != nil {
 		log.Printf("[上传] 继承 %s → %s 复制上传登记失败（子对话交付目标将不可解析）: %v", parentID, childID, err)
 	}
-	return len(rows), nil
 }
 
 // estimateTokens 粗估一组消息的 token 量（中文为主的启发式）。

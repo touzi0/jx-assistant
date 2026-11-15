@@ -713,14 +713,80 @@ const sessionCols = `id, title, mode, workspace, parent_id, provider, model, per
 
 func (s *Store) Create(m *SessionMeta) error { return s.SaveMeta(m) }
 
+// dbExecer 是 *sql.DB 与 *sql.Tx 的共同执行面：会话行的写入 SQL 只此一份
+// （SaveMeta 单条写、CreateWithRows 事务内写，都走 upsertSession）。
+type dbExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// CreateWithRows 在一个事务里建会话并整批写入它的历史行：要么全有、要么全无。
+//
+// 为什么必须原子（2026-11-16 事故的两个根因都在这）：
+//  1. 列表里不会再出现「正文为空的半成品」——此前 sessions 行 0.04s 就落库可见，
+//     消息要十几秒才写完；用户在这个窗口里归档/删除它，就得到一条「能对话、但
+//     列表里找不到」的会话。
+//  2. 整批是一个提交——此前逐行 AppendRow 每行一次 fsync（实测 3.13ms/行，
+//     4400 行 = 13.9s），现在同一个父会话只要 0.4s 量级。
+func (s *Store) CreateWithRows(m *SessionMeta, rows []*StoredMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // 已提交时是空操作
+	if err := upsertSession(tx, m); err != nil {
+		return err
+	}
+	if err := insertMessagesTx(tx, m.ID, rows); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// insertMessagesTx 在事务内整批插入消息行（调用方负责提交）；口径与 appendRowLocked
+// 一致：只有用户输入与模型最终输出会刷新 sessions.updated_at（见 touchesActivity）。
+func insertMessagesTx(tx *sql.Tx, id string, rows []*StoredMessage) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(insertMessageSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	touch := false
+	for _, sm := range rows {
+		args, err := messageInsertArgs(id, sm)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(args...); err != nil {
+			return err
+		}
+		if sm.touchesActivity() {
+			touch = true
+		}
+	}
+	if touch {
+		_, _ = tx.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, now(), id)
+	}
+	return nil
+}
+
 func (s *Store) SaveMeta(m *SessionMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 注意：下面的 UPDATE 刻意不写 status——它只由 UpdateStatus 维护（执行中/空闲）；
-	// 同理不写 voice_used——它只由 MarkVoiceUsed 单调置位（chat 上报路径），陈旧
-	// 内存对象全列回写不得把它冲回去。
-	// 否则 appendMessage 之类拿着陈旧内存对象回写，会把 running 冲成 idle，
-	// 导致「正在执行」在侧栏与重启恢复里都不生效。
+	return upsertSession(s.db, m)
+}
+
+// upsertSession 写会话行（列清单与 ON CONFLICT 的唯一来源）。
+// 注意：下面的 UPDATE 刻意不写 status——它只由 UpdateStatus 维护（执行中/空闲）；
+// 同理不写 voice_used——它只由 MarkVoiceUsed 单调置位（chat 上报路径），陈旧
+// 内存对象全列回写不得把它冲回去。
+// 否则 appendMessage 之类拿着陈旧内存对象回写，会把 running 冲成 idle，
+// 导致「正在执行」在侧栏与重启恢复里都不生效。
+func upsertSession(ex dbExecer, m *SessionMeta) error {
 	tools := ""
 	if len(m.Tools) > 0 {
 		if b, err := json.Marshal(m.Tools); err == nil {
@@ -740,7 +806,7 @@ func (s *Store) SaveMeta(m *SessionMeta) error {
 			remote = string(b)
 		}
 	}
-	_, err := s.db.Exec(`INSERT INTO sessions(`+sessionCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := ex.Exec(`INSERT INTO sessions(`+sessionCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, mode=excluded.mode,
 		workspace=excluded.workspace, parent_id=excluded.parent_id, provider=excluded.provider,
 		model=excluded.model, permission=excluded.permission, plan_mode=excluded.plan_mode,
@@ -1058,12 +1124,13 @@ func (sm *StoredMessage) touchesActivity() bool {
 	return false
 }
 
-func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
-	if sm.Seq == 0 {
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?`, id).Scan(&sm.Seq); err != nil {
-			return err
-		}
-	}
+// insertMessageSQL 与 messageInsertArgs 是消息行写入的唯一来源：单行追加
+// （appendRowLocked）与建会话时整批灌入（insertMessagesTx）共用同一份列顺序。
+const insertMessageSQL = `INSERT INTO messages
+		(session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, covers_from, superseded, created_at, thinking)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+func messageInsertArgs(id string, sm *StoredMessage) ([]any, error) {
 	var content any
 	if sm.Content != nil {
 		content = sm.Text()
@@ -1072,7 +1139,7 @@ func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
 	if len(sm.ToolCalls) > 0 {
 		b, err := json.Marshal(sm.ToolCalls)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		toolCalls = string(b)
 	}
@@ -1080,12 +1147,21 @@ func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
 	if sm.Compact != "" {
 		compact = sm.Compact
 	}
-	_, err := s.db.Exec(`INSERT INTO messages
-		(session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, covers_from, superseded, created_at, thinking)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, sm.Seq, sm.Role, content, toolCalls, sm.ToolCallID, sm.Kind, sm.Origin,
-		compact, sm.CoversUpTo, sm.CoversFrom, boolInt(sm.Superseded), sm.CreatedAt, sm.Thinking)
+	return []any{id, sm.Seq, sm.Role, content, toolCalls, sm.ToolCallID, sm.Kind, sm.Origin,
+		compact, sm.CoversUpTo, sm.CoversFrom, boolInt(sm.Superseded), sm.CreatedAt, sm.Thinking}, nil
+}
+
+func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
+	if sm.Seq == 0 {
+		if err := s.db.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?`, id).Scan(&sm.Seq); err != nil {
+			return err
+		}
+	}
+	args, err := messageInsertArgs(id, sm)
 	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(insertMessageSQL, args...); err != nil {
 		return err
 	}
 	// 只有用户输入与模型最终输出刷新「最近更新」时间（口径见 touchesActivity）

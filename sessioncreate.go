@@ -183,7 +183,18 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 	if m.GoalMode {
 		m.GoalStatus = "active" // 创建即带目标模式：状态从 active 起步
 	}
-	if err := a.Store.Create(m); err != nil {
+	// 建会话与继承历史：有历史要继承时**一个事务写完**（先在内存里备齐行再落库），
+	// 列表里不会出现「正文为空的半成品」，也就没有「创建中被归档/删除」这个撞车
+	// 窗口（2026-11-16 事故根因）；没有历史要继承就还是普通的一次 INSERT。
+	if p.CopyHistory {
+		rows, rerr := a.prepareInheritedRows(parent.ID)
+		if rerr != nil {
+			return nil, createSessionErr(500, "继承父对话上下文失败: %v", rerr)
+		}
+		if err := a.Store.CreateWithRows(m, rows); err != nil {
+			return nil, createSessionErr(500, "继承父对话上下文失败: %v", err)
+		}
+	} else if err := a.Store.Create(m); err != nil {
 		return nil, err
 	}
 	// 选定工作目录后即建 .jxai/tmp：模型临时文件的约定去处（见系统提示词）
@@ -191,11 +202,7 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 		(&toolContext{app: a, sess: m}).ensureJxAI()
 	}
 	if p.CopyHistory {
-		if _, err := a.copyInheritedContext(parent.ID, m.ID); err != nil {
-			// 上下文没复制成功就退回：留着半截继承的子对话比没有更糟
-			_ = a.Store.Delete(m.ID)
-			return nil, createSessionErr(500, "继承父对话上下文失败: %v", err)
-		}
+		a.copyInheritedUploads(parent.ID, m.ID)
 	}
 	// 首页「先录后聊」的兜底入口：建创建技能会话时工作区若已有演示材料，
 	// 注入一条【演示记录】清单通知（同文件上传通知机制），模型开轮即知道
