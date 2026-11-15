@@ -19,8 +19,6 @@ body.market-mode #composer-wrap { display: none; }
 .mk-head { display: flex; align-items: center; gap: 12px; flex: none; }
 .mk-title { display: flex; align-items: baseline; gap: 10px; flex: none; }
 #market-view h2 { font-size: 17px; font-weight: 600; }
-.mk-server { font-size: 12px; color: var(--text-3); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mk-server.off { color: var(--amber); }
 #mk-search { flex: 1; max-width: 430px; min-width: 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 13px; outline: none; }
 #mk-search:focus { border-color: var(--accent); }
 .mk-icon-btn { flex: none; width: 34px; height: 34px; border: none; border-radius: 9px; background: none; color: var(--text-2); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }

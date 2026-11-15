@@ -78,7 +78,8 @@ type App struct {
 	skillsReady         bool   // 技能母本是否已释放（SkillsDir 首次解析后置位）
 	skillsDirOurs       string // 已解析的技能目录（App 级缓存，避免跨实例污染）
 	marketMu            sync.Mutex
-	marketCache         marketCacheEntry // 市场清单拉取缓存（60s，见 market.go）
+	marketCache         marketCacheEntry   // 市场清单拉取缓存（60s，见 market.go）
+	marketNotices       []marketNoticeIn   // 服务端通知一次性队列（清单捎带/轮询取到即挪入，前端取走弹一次即清）
 	remoteMu            sync.Mutex
 	remotes             map[string]*remoteClient // SSH 远程连接池（remote.go）
 	listenPort          int                      // 本机监听端口（远程中继的桥接目标，热重启连接用）
@@ -470,6 +471,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	// 市场（技能/组件/插件，见 market.go）：清单视图 + 一键安装/卸载；
 	// 同样挂 /api/ 下让远程中继天然覆盖
 	mux.HandleFunc("GET /api/market", a.handleMarketView)
+	mux.HandleFunc("GET /api/market/notices", a.handleMarketNotices) // 服务端通知轻量轮询（市场页打开期间，30s）
 	mux.HandleFunc("POST /api/market/install", a.handleMarketInstall)
 	mux.HandleFunc("POST /api/market/uninstall", a.handleMarketUninstall)
 	// 更新（update.go / update_blocks.go）：手动立即检查（不等每小时轮询）与

@@ -824,17 +824,23 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 服务端两种成功形态：直接上架（entry）或进入审核（pending:true+message，
+	// 服务器开了 marketReview 时——技能包先落待审区，管理员批准后才上架）。
 	var srv struct {
-		Entry map[string]any `json:"entry"`
-		Error string         `json:"error"`
+		Entry   map[string]any `json:"entry"`
+		Error   string         `json:"error"`
+		Pending bool           `json:"pending"`
+		Message string         `json:"message"`
 	}
 	_ = json.Unmarshal(respBody, &srv)
 	if resp.StatusCode >= 400 {
+		// 服务器文案优先（2026-11-15 用户口径：弹窗内容由服务器下发）——服务器
+		// 给了 error 就原样弹，客户端不再包「市场服务器拒绝发布:」前缀。
 		msg := srv.Error
 		if msg == "" {
 			msg = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
-		writeErr(w, resp.StatusCode, "市场服务器拒绝发布: "+msg)
+		writeErr(w, resp.StatusCode, msg)
 		return
 	}
 	if resp.StatusCode != 200 && resp.StatusCode != 201 {
@@ -857,6 +863,12 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	if srv.Entry != nil {
 		out["entry"] = srv.Entry
+	}
+	if srv.Pending {
+		out["pending"] = true
+	}
+	if srv.Message != "" {
+		out["message"] = srv.Message
 	}
 	writeJSON(w, 200, out)
 }

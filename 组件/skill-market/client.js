@@ -21,6 +21,7 @@
   let mkTab = 'skill';      // 当前 tab：skill | component | plugin | mcp
   let mkLoading = false;    // 清单在途（防抖动重复渲染）
   let mkAutoTimer = 0;      // 市场页开着时的 60s 静默复查
+  let mkNoticeTimer = 0;    // 服务端通知轻量轮询（30s，/api/market/notices）
   let btnEl = null, btnEntry = null, viewEl = null, modalEl = null; // 本组件注入的节点（btnEntry＝插槽条目句柄）
   let legacyHost = false;  // 老前端硬编码形态（组件化之前的产品）：按钮/视图是 index.html 硬编码的，本组件整体让位
   const docKeys = [];       // document keydown 监听（dispose 逐个解绑）
@@ -83,8 +84,7 @@
       viewEl.innerHTML =
         '<div class="mk-head">' +
         '<div class="mk-title">' +
-        '<h2>企业技能包 / 工作流</h2>' +
-        '<span id="mk-server" class="mk-server" title="企业技能包 / 工作流 / 小程序平台地址（设置 · 网络访问 可改）"></span>' +
+        '<h2 id="mk-title">企业技能包 / 工作流</h2>' +
         '</div>' +
         '<input id="mk-search" type="search" placeholder="搜索名称 / 描述 / 标签…" autocomplete="off" spellcheck="false">' +
         '<button id="mk-refresh" class="mk-icon-btn" title="刷新清单">' +
@@ -165,16 +165,50 @@
     }
   }
 
-  /* 市场页开着时的自动复查（60 秒，静默：不闪「正在刷新」、不清已渲染的列表） */
+  /* 市场页开着时的自动复查（60 秒，静默：不闪「正在刷新」、不清已渲染的列表）；
+     通知轮询独立 30 秒一次（轻端点 /api/market/notices）——管理员在市场页开着
+     期间批准/拒绝/发通知，最多半个周期内弹窗送达，不用等下次拉清单 */
   function startMarketAuto() {
     stopMarketAuto();
     mkAutoTimer = setInterval(() => {
       if (!marketOpen() || document.hidden) return;
       loadMarket(true, true);
     }, 60 * 1000);
+    mkNoticeTimer = setInterval(pollNoticesOnce, 30 * 1000);
+    pollNoticesOnce(); // 打开市场页立即查一次，不等满 30 秒
   }
   function stopMarketAuto() {
     if (mkAutoTimer) { clearInterval(mkAutoTimer); mkAutoTimer = 0; }
+    if (mkNoticeTimer) { clearInterval(mkNoticeTimer); mkNoticeTimer = 0; }
+  }
+
+  async function pollNoticesOnce() {
+    if (!marketOpen() || document.hidden) return;
+    try {
+      const r = await api('/api/market/notices');
+      if (r && Array.isArray(r.notices)) mkPopNotices(r.notices);
+    } catch (_) { /* 轮询失败静默：下一轮再试 */ }
+  }
+
+  /* 主标题：默认名，服务器下发的市场名优先（h2 与侧栏按钮同步替换） */
+  const MK_DEFAULT_TITLE = '企业技能包 / 工作流';
+  function setMkTitle(name) {
+    const t = (name && String(name).trim()) || MK_DEFAULT_TITLE;
+    const h = $('mk-title');
+    if (h) h.textContent = t;
+    if (btnEl) {
+      const lb = btnEl.querySelector('.foot-btn-label');
+      if (lb) lb.textContent = t;
+      btnEl.title = t + '：安装/更新 技能、组件与插件';
+    }
+  }
+
+  /* 服务端通知弹窗：文案由服务器拼好（审核结果/管理员消息），多条合并一条弹 */
+  function mkPopNotices(arr) {
+    if (!Array.isArray(arr) || !arr.length) return;
+    const texts = arr.map((n) => (n && n.text) ? String(n.text) : '').filter(Boolean);
+    if (!texts.length) return;
+    setTimeout(() => alert(texts.join('\n\n')), 30); // 稍让过当前渲染帧，弹窗不卡列表
   }
 
   function toggleMarket() {
@@ -227,11 +261,13 @@
     const ubtn = $('mk-upload-btn'); // 「＋ 上传技能」只在技能 tab 出现
     if (ubtn) ubtn.classList.toggle('hidden', mkTab !== 'skill');
     if (!mkData) return renderMarketState('清单为空');
-    const server = $('mk-server');
-    if (server) {
-      server.textContent = mkData.configured ? (mkData.name || mkData.url || '已配置') : '未配置';
-      server.classList.toggle('off', !mkData.configured);
-    }
+    // 主标题用服务器下发的市场名（管理页·技能市场 可改；空/拉不到回落本地
+    // 默认名）——2026-11-15 修正：以前做成副标题小字，主标题写死本地，方向
+    // 反了；副标题已撤。
+    setMkTitle(mkData.name);
+    // 服务端通知（审核结果/管理员消息）：随清单捎带到达，取走即弹（服务端
+    // 已标记送达，本端只弹这一次）
+    mkPopNotices(mkData.notices);
     const ext = $('mk-ext-market');
     if (ext) ext.classList.toggle('hidden', mkTab !== 'plugin');
     if (!mkData.configured) { renderUnconfigured(); return; }
@@ -669,8 +705,17 @@
       const r = await api('/api/market/publish', { method: 'POST', body: JSON.stringify(body) });
       mkuBusy = false;
       btn.textContent = '发布到市场';
-      alert('已发布到市场：' + (r.id || id) + (r.version ? ' v' + r.version : '') +
-        (r.size ? '（' + mkuSize(r.size) + '，sha256 ' + String(r.sha256 || '').slice(0, 12) + '…）' : ''));
+      // 弹窗文案由服务器下发（2026-11-15 口径：服务器说了算——直接上架返回
+      // message，送审返回 pending:true+message；老服务器没有这些字段时回落
+      // 本地拼的旧文案）
+      if (r && r.pending) {
+        alert(String(r.message || '已上传成功，等待管理员审核，审核通过后会出现在市场里'));
+      } else if (r && r.message) {
+        alert(String(r.message));
+      } else {
+        alert('已发布到市场：' + (r.id || id) + (r.version ? ' v' + r.version : '') +
+          (r.size ? '（' + mkuSize(r.size) + '，sha256 ' + String(r.sha256 || '').slice(0, 12) + '…）' : ''));
+      }
       $('mk-upload-modal').classList.add('hidden');
       mkData = null;
       await loadMarket(true);

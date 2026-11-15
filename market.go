@@ -66,6 +66,18 @@ type marketManifestIn struct {
 	Components []marketEntryIn `json:"components"`
 	Plugins    []marketEntryIn `json:"plugins"`
 	Mcps       []marketEntryIn `json:"mcps"`
+	// Notices 服务端通知（jxai-server marketnotice.go，2026-11-15）：拉清单时
+	// 按身份头（X-Jxai-User）捎带的未送达通知——审核结果、管理员消息等。
+	// 服务端取走即标记（每条只弹一次）；这里立即挪进一次性队列（不进 60s
+	// 清单缓存），由 buildMarketView 交给前端弹 alert。
+	Notices []marketNoticeIn `json:"notices,omitempty"`
+}
+
+// marketNoticeIn 一条服务端通知：Text 是服务端拼好的完整弹窗文案（原样弹）。
+type marketNoticeIn struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+	Text string `json:"text"`
 }
 
 // marketEntryOut 清单条目 + 本机安装态（前端渲染用）。
@@ -92,7 +104,9 @@ type marketView struct {
 	Name       string           `json:"name,omitempty"`
 	Suggested  string           `json:"suggested,omitempty"` // 未配置时的建议值（中继网关同 host）
 	Me         *marketMe        `json:"me,omitempty"`        // 本机发布者身份（空=还没设置姓名，前端不显示发布者管理按钮）
-	Error      string           `json:"error,omitempty"`
+	// Notices 服务端通知（一次性，取走即清）：前端拿到就弹 alert。
+	Notices []marketNoticeIn `json:"notices,omitempty"`
+	Error   string           `json:"error,omitempty"`
 	UpdatedAt  string           `json:"updatedAt,omitempty"`
 	Skills     []marketEntryOut `json:"skills"`
 	Components []marketEntryOut `json:"components"`
@@ -220,6 +234,13 @@ func (a *App) fetchMarketManifest(rawURL string, force bool) (*marketManifestIn,
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("清单不是合法 JSON: %w", err)
 	}
+	// 服务端通知不进缓存：立即挪进一次性队列（同一清单 60s 内再取也不重复弹）
+	if len(m.Notices) > 0 {
+		a.marketMu.Lock()
+		a.marketNotices = append(a.marketNotices, m.Notices...)
+		a.marketMu.Unlock()
+		m.Notices = nil
+	}
 	a.marketMu.Lock()
 	a.marketCache = marketCacheEntry{url: rawURL, at: time.Now(), man: &m}
 	a.marketMu.Unlock()
@@ -292,7 +313,55 @@ func (a *App) buildMarketView() marketView {
 	v.Components = a.decorateEntries("component", man.Components, recs)
 	v.Plugins = a.decorateEntries("plugin", man.Plugins, recs)
 	v.Mcps = a.decorateEntries("mcp", man.Mcps, recs)
+	// 服务端通知（一次性）：取走即清，前端拿到弹 alert（每条只弹一次——
+	// 服务端标记 + 本端队列出清双保险）
+	a.marketMu.Lock()
+	if len(a.marketNotices) > 0 {
+		v.Notices = a.marketNotices
+		a.marketNotices = nil
+	}
+	a.marketMu.Unlock()
 	return v
+}
+
+// takeMarketNotices 取走一次性通知队列（轮询端点用；取走即清）。
+func (a *App) takeMarketNotices() []marketNoticeIn {
+	a.marketMu.Lock()
+	defer a.marketMu.Unlock()
+	out := a.marketNotices
+	a.marketNotices = nil
+	return out
+}
+
+// handleMarketNotices GET /api/market/notices：市场页打开期间的轻量轮询
+//（前端 30s 一次）——用户正停留在市场页时服务端审核完成等通知近实时送达。
+// 服务器侧同名端点（/market/notices，带 X-Jxai-User）实时取，本端一次性
+// 队列（清单捎带进来的）也一并带出。
+func (a *App) handleMarketNotices(w http.ResponseWriter, r *http.Request) {
+	out := append([]marketNoticeIn{}, a.takeMarketNotices()...)
+	raw := strings.TrimSpace(a.Cfg.MarketURL)
+	if raw != "" && a.marketUser() != "" {
+		if origin, err := marketOrigin(raw); err == nil {
+			if req, err := a.marketRequest(r.Context(), http.MethodGet, origin+"/market/notices", nil); err == nil {
+				if resp, err := marketHTTPClient.Do(req); err == nil {
+					data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+					resp.Body.Close()
+					if resp.StatusCode == 200 {
+						var srv struct {
+							Notices []marketNoticeIn `json:"notices"`
+						}
+						if json.Unmarshal(data, &srv) == nil {
+							out = append(out, srv.Notices...)
+						}
+					}
+				}
+			}
+		}
+	}
+	if out == nil {
+		out = []marketNoticeIn{}
+	}
+	writeJSON(w, 200, map[string]any{"notices": out})
 }
 
 func (a *App) decorateEntries(typ string, in []marketEntryIn, recs map[string]marketInstallRec) []marketEntryOut {
