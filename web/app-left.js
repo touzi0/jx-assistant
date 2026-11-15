@@ -648,7 +648,9 @@ async function restoreSession(s) {
 // 彻底删除工作目录：删除其名下全部会话记录、注销登记并拉黑（不碰磁盘文件夹）
 async function deleteWorkspace(ws) {
   const name = lsGet('jx.wsalias', {})[ws] || baseName(ws) || '默认工作区';
-  const targets = (state.sessions || []).filter((s) => s.mode !== 'assistant' && wsOf(s) === ws);
+  // 与回收站同口径：排除的只有「数字助理主对话本体」；子对话（含从长期助理克隆
+  // 出来的 assistant 子对话）是这个目录里真实发生过的活动，随目录一起删。
+  const targets = (state.sessions || []).filter((s) => !(s.mode === 'assistant' && !s.parentId) && wsOf(s) === ws);
   if (!(await confirmCenter(`彻底删除工作目录「${name}」及其 ${targets.length} 个对话？\n只从应用中移除记录，不会删除磁盘上的文件夹。默认工作区路径来自配置，删除后也不会再显示空目录，直到你重新添加它。\n此操作不可恢复。`))) return;
   if (!(await confirmCenter(`再次确认：目录「${name}」及其全部对话将被彻底删除、无法恢复。\n确定要继续吗？`, false, true))) return;
   for (const s of targets) {
@@ -720,8 +722,12 @@ function renderBin(box) {
   // 随父整组恢复与清空（collectEmptyTargets 的连坐删除同口径）
   const keep = new Set(lsGet('jx.wskeep', []));
   const archivedIds = new Set((state.sessions || []).filter((x) => x.archived).map((x) => x.id));
+  // 排除的只有「数字助理主对话本体」（mode=assistant 且没有父）：按 mode 一刀切会
+  // 把子对话也滤掉，而子对话会继承父会话的 mode——从长期助理克隆出来的子对话
+  // mode 也是 assistant，归档后既不在右栏下拉、又不进回收站，就彻底没了入口
+  // （2026-11-16 事故：4 条会话因此失踪）。
   const all = (state.sessions || []).filter((s) =>
-    s.mode !== 'assistant' && (!s.parentId || (s.archived && !archivedIds.has(s.parentId))));
+    s.parentId ? (s.archived && !archivedIds.has(s.parentId)) : s.mode !== 'assistant');
   const inBin = all.filter((s) => !keep.has(s.id) && (s.archived || recycledWs.includes(wsOf(s))));
   if (!recycledWs.length && !inBin.length) {
     box.innerHTML = '<div class="ws-empty">回收站是空的</div>';

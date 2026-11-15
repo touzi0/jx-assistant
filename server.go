@@ -817,9 +817,15 @@ func likePattern(q string) string {
 	return "%" + r.Replace(q) + "%"
 }
 
-// 可搜索的会话范围基座 = 侧栏可见范围：非助理主对话、非子会话。
-// 归档与目录过滤由 searchScopeWhere 按 bin/ws 参数装配（都缺省时等价旧行为 archived = 0）。
-const searchableSessionsBaseSQL = `mode != 'assistant' AND parent_id = ''`
+// searchableBaseSQL 生成「可搜索的会话范围」基座：只排除**数字助理主对话本体**
+// （mode=assistant 且没有父）。不能按 mode 一刀切——子对话会继承父会话的 mode，
+// 从长期助理克隆出来的子对话 mode 也是 assistant，那样它们归档后连回收站都搜
+// 不到（2026-11-16 事故：4 条归档子对话既不在下拉、也不在回收站、还搜不到）。
+// 「子会话只在回收站出现」这件事由 searchScopeWhere 按 bin 装配（正常视图追加
+// parent_id = ''）。pfx 为列名前缀（内容搜索是 join 查询，要 "s."）。
+func searchableBaseSQL(pfx string) string {
+	return `NOT (` + pfx + `mode = 'assistant' AND ` + pfx + `parent_id = '')`
+}
 
 // searchScopeWhere 按请求参数组装会话范围条件（pfx 为列名前缀，如 "s."）：
 //
@@ -834,6 +840,10 @@ func searchScopeWhere(r *http.Request, pfx string) (string, []any) {
 	cond := pfx + "archived = 0"
 	if bin {
 		cond = pfx + "archived = 1"
+	} else {
+		// 正常视图只搜顶层会话：子会话（含继承 assistant 的子对话）挂在主对话的
+		// 右栏里，归档后才在回收站那一侧出现（与左栏列表口径一致）。
+		cond += " AND " + pfx + "parent_id = ''"
 	}
 	var args []any
 	readList := func(key string) []string {
@@ -883,7 +893,7 @@ func (a *App) handleSearchTitle(w http.ResponseWriter, r *http.Request) {
 	scope, scopeArgs := searchScopeWhere(r, "")
 	rows, err := a.Store.db.Query(
 		`SELECT id, title, updated_at FROM sessions
-		 WHERE `+searchableSessionsBaseSQL+` AND `+scope+` AND title LIKE ? ESCAPE '\'
+		 WHERE `+searchableBaseSQL("")+` AND `+scope+` AND title LIKE ? ESCAPE '\'
 		 ORDER BY updated_at DESC LIMIT 50`,
 		append(scopeArgs, likePattern(q))...)
 	if err != nil {
@@ -915,7 +925,7 @@ func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.Store.db.Query(
 		`SELECT m.session_id, s.title, m.seq, m.role, m.content, m.created_at
 		 FROM messages m JOIN sessions s ON s.id = m.session_id
-		 WHERE s.`+searchableSessionsBaseSQL+` AND `+scope+`
+		 WHERE `+searchableBaseSQL("s.")+` AND `+scope+`
 		   AND m.kind = 'chat' AND m.content IS NOT NULL
 		   AND (m.role = 'user'
 		        OR (m.role = 'assistant' AND (m.tool_calls IS NULL OR m.tool_calls = '')))
