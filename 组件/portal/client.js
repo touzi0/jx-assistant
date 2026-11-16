@@ -1,12 +1,19 @@
 /* 组件：充值与个人中心（portal）—— 浏览器半边。
  *
  * 三处入口（全部由本组件掌管，开关关闭/服务端没开门户即全部消失）：
- *   1. 设置·模型 公司通道卡片：额度区旁「充值」按钮（挂载点由主程序 buildProvCard
- *      提供，.pf-card-slot；本组件监听 prov:render 事件重新挂——卡片是全量重建的）；
+ *   1. 设置·模型 公司通道卡片：**标题行**（收起态可见那一行，额度后面）的
+ *      「充值」胶囊按钮（挂载点由主程序 buildProvCard 提供，.pf-card-slot；
+ *      本组件监听 prov:render 事件重新挂——卡片是全量重建的）。2026-11-16 从
+ *      展开后的表单里挪上来：用户口径「充值不该藏在卡片里，要一点就能点到」；
  *   2. 向导接入完成：主程序广播 wizard:done（portalURL 非空=公司通道+门户已开），
  *      紧接着自动弹个人中心浮窗做引导（纯本地/个人配置不弹）；
  *   3. 报错条：主程序广播 run:error，本组件按词表判定「余额/积分不足」类报错
  *      （词表与 llm.go quotaWords 同源），在「重试」旁加「去充值」。
+ *
+ * 另外两处主程序文案随本组件生效（关掉即还原，都是「只改文本节点」的轻改，
+ * 不重建元素、不碰主程序函数）：
+ *   - 设置页左栏「模型」→「模型与充值」（充值入口就长在这一页，菜单名说清楚）；
+ *   - 该页页内大标题同口径。
  *
  * 浮窗内嵌 iframe 加载本地同源 /portal（portalproxy.go 反向代理到服务端门户，
  * 自签证书由程序证书策略接管——iframe 直连服务端会被浏览器证书校验静默拒绝）。
@@ -27,6 +34,7 @@
   let modalEl = null;          // 浮窗（常驻 DOM，hidden 控制）
   let frameEl = null;
   let docKey = null;           // Esc 监听（dispose 解绑）
+  let paneLabels = [];         // 被改名的设置页文案 [{node, orig}]（dispose 原样改回）
 
   const $id = (i) => document.getElementById(i);
 
@@ -146,10 +154,11 @@
 
   /* ---------- 三处入口 ---------- */
 
-  // 1) 模型页公司通道卡片：prov:render 后往挂载点放「充值」按钮（卡片全量重建
-  //    时按钮随之消失，靠这个事件补回）。挂载点 dataset.portalURL 空（服务端没
-  //    开门户）就不放——空容器不占位（client.css 的 :empty 规则）。dataset 是
-  //    主程序渲染卡片时的最新值，顺带同步进缓存（含「从有到无」的清空）。
+  // 1) 模型页公司通道卡片：prov:render 后往挂载点放「充值」胶囊按钮（卡片全量
+  //    重建时按钮随之消失，靠这个事件补回）。挂载点现在在卡片**标题行**上——收起
+  //    态就能看见、直接点，不用先展开卡片。挂载点 dataset.portalURL 空（服务端没
+  //    开门户）就不放——空容器不占位（style.css 的 .pf-card-slot:empty）。dataset
+  //    是主程序渲染卡片时的最新值，顺带同步进缓存（含「从有到无」的清空）。
   function onProvRender() {
     let fresh = null;
     document.querySelectorAll('.pf-card-slot[data-cx-slot="prov-actions"]').forEach((slot) => {
@@ -162,10 +171,42 @@
       btn.dataset.cxOwner = ID;
       btn.textContent = '充值';
       btn.title = '打开个人中心：注册 / 登录 / 给公司通道充值';
-      btn.onclick = (e) => { e.stopPropagation(); openPortal(); };
+      btn.onclick = (e) => { e.stopPropagation(); openPortal(); }; // 别把点击冒泡成「展开卡片」
       slot.appendChild(btn);
     });
     if (fresh !== null) portalURL = fresh;
+  }
+
+  /* ---------- 设置页文案：「模型」→「模型与充值」 ---------- */
+
+  // 充值入口就长在模型页里，菜单名把这件事直接说明白（2026-11-16 用户口径）。
+  // 只改既有的文本节点（页签的「模型」与页内大标题），不重建元素、不改主程序
+  // 函数：菜单宽度、选中态、手机端返回头取的都是同一处文字，自然跟着变。
+  // dispose 按记录原样写回——组件关掉后必须还是「模型」。
+  const PANE_TITLE = '模型与充值';
+  function renameModelPane() {
+    if (paneLabels.length) return;
+    // 页签文字与页内大标题各是一处独立文本：都找「文本正好是模型」的那个子节点，
+    // 找不到就不动（宁可这处不改，也不重建元素造成闪烁）。
+    const boxes = [
+      document.querySelector('.set-nav-item[data-pane="models"]'),
+      document.querySelector('#set-pane-models h3'),
+    ];
+    for (const box of boxes) {
+      const node = box && [...box.childNodes].find(
+        (n) => n.nodeType === 3 && n.textContent.trim() === '模型');
+      if (!node) continue;
+      const orig = node.textContent;
+      node.textContent = orig.replace('模型', PANE_TITLE);
+      paneLabels.push({ node, orig });
+    }
+  }
+
+  function restoreModelPane() {
+    for (const { node, orig } of paneLabels) {
+      if (node.parentNode) node.textContent = orig;
+    }
+    paneLabels = [];
   }
 
   // 2) 向导接入完成：紧接着自动弹个人中心（只在公司通道 + 服务端已开门户时——
@@ -218,6 +259,7 @@
     document.addEventListener('keydown', docKey, true);
     refreshPortalURL();
     onProvRender(); // 组件热重载/设置页已开着时补挂一次
+    renameModelPane(); // 设置页「模型」→「模型与充值」（dispose 改回）
   }
 
   function dispose() {
@@ -226,8 +268,9 @@
     window.JX.off('run:error', onRunError);
     if (docKey) { document.removeEventListener('keydown', docKey, true); docKey = null; }
     document.querySelectorAll('[data-cx-owner="' + ID + '"]').forEach((b) => b.remove());
+    restoreModelPane(); // 页签文字改回「模型」：关掉组件不许留半截文案
     closePortal();
-    if (modalEl) { modalEl.remove(); modalEl = null; frameEl = null; regEl = null; }
+    if (modalEl) { modalEl.remove(); modalEl = null; frameEl = null; }
   }
 
   CX.register({ id: ID, init, dispose });

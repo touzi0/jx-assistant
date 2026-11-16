@@ -451,6 +451,21 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 }
 .app-toast.hidden { display: none; }
 
+/* 关于页「联系我们」：邮箱 + 微信二维码。二维码必须白底——深色主题下与背景
+   混在一起就扫不出来，所以白底卡片不跟随主题变量。 */
+.contact-card { display: flex; align-items: flex-start; gap: 18px; flex-wrap: wrap; }
+.contact-lines { flex: 1; min-width: 10em; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.contact-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.contact-k { color: var(--text-3); flex-shrink: 0; }
+.contact-card a { color: var(--accent); text-decoration: none; word-break: break-all; }
+.contact-card a:hover { text-decoration: underline; }
+.contact-tip { margin: 2px 0 0; }
+.contact-qr {
+  flex: none; padding: 8px; border-radius: 10px;
+  background: #fff; border: 1px solid var(--border, #e2e4e9);
+}
+.contact-qr img { display: block; max-width: 180px; height: auto; border-radius: 4px; }
+
 /* 关于页问题反馈 */
 .fb-kinds { display: flex; gap: 8px; margin-bottom: 8px; }
 .fb-kind {
@@ -2601,6 +2616,10 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 .pv-head.off .pv-name { text-decoration: line-through; text-decoration-thickness: 1px; text-decoration-color: var(--text-3); }
 .pv-toggle { flex-shrink: 0; }
 .pv-edit { margin-left: auto; font-size: 12px; color: var(--text-3); }
+/* 组件插槽（公司通道卡片的标题行）：组件往里放按钮，主程序只认这个抓手。
+   空插槽不占位——组件没装/没开、或服务端没开门户时，标题行不多出空档。 */
+.pf-card-slot { display: inline-flex; align-items: center; gap: 0.4em; }
+.pf-card-slot:empty { display: none; }
 .pv-dirty { font-size: 11px; color: var(--amber); border: 1px solid currentColor; border-radius: 999px; padding: 0 8px; line-height: 17px; flex-shrink: 0; }
 .pv-form { padding: 4px 14px 14px; border-top: 1px solid var(--border); }
 .pf-label { font-size: 12px; color: var(--text-3); margin: 10px 0 4px; }

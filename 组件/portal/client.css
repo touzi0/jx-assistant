@@ -1,26 +1,32 @@
 /* 组件：充值与个人中心（portal）—— 样式。
- * 规范：字号挂 --chat-fs（设置·字体大小的全局落点），层级一律 em；
- * 空的卡片插槽容器不占位（主程序 buildProvCard 恒放挂载点，没按钮时隐 form 流）。 */
+ * 规范：字号挂 em（相对所在处文字基准，不写死 px）；颜色一律走主题变量。
+ * 插槽容器本身（.pf-card-slot 及其 :empty 不占位）由主程序 style.css 提供——
+ * 那是卡片标题行布局的一部分，与组件在不在无关。 */
 
-/* 模型页公司通道卡片插槽：组件按钮的容器（额度区按钮排同一行后面） */
-.pf-card-slot { display: inline-flex; align-items: center; gap: 0.5em; margin-left: 0.6em; }
-.pf-card-slot:empty { display: none; }
-
-/* 「充值」按钮（卡片插槽内）：与「刷新额度」同视觉档（pf-cancel），强调色描边 */
+/* 「充值」胶囊按钮（公司通道卡片标题行内，收起态也可见）：与同一行的额度/状态
+   徽标同高同色系，圆角做成胶囊（999px）——2026-11-16 用户口径「不要方框」。
+   强调色描边 + 淡底，hover 加深底色；不写死颜色与 px 字号。 */
 .pp-btn {
+  display: inline-flex;
+  align-items: center;
   border: 1px solid var(--accent, #4d6bfe);
   color: var(--accent, #4d6bfe);
-  background: none;
-  border-radius: 0.45em;
-  padding: 0.35em 1em;
-  font-size: 0.93em;               /* 相对卡片基准（pv-form 挂 --chat-fs） */
+  background: color-mix(in srgb, var(--accent, #4d6bfe) 8%, transparent);
+  border-radius: 999px;
+  padding: 0.12em 0.85em;
+  font-size: 0.8em;                /* 相对卡片标题行的文字基准（.pv-head 继承主界面字号） */
+  font-family: inherit;
+  line-height: 1.6;
   cursor: pointer;
   white-space: nowrap;
+  transition: background-color .12s ease, border-color .12s ease;
 }
-.pp-btn:hover { background: color-mix(in srgb, var(--accent, #4d6bfe) 8%, transparent); }
+.pp-btn:hover { background: color-mix(in srgb, var(--accent, #4d6bfe) 22%, transparent); }
+.pp-btn:active { background: color-mix(in srgb, var(--accent, #4d6bfe) 32%, transparent); }
 
-/* 报错条「去充值」：主体复用主程序 re-btn/re-retry，这里只给强调色 */
-.re-btn.pp-btn { color: var(--accent, #4d6bfe); border-color: var(--accent, #4d6bfe); font-size: inherit; padding: inherit; border-radius: inherit; }
+/* 报错条「去充值」：主体复用主程序 re-btn/re-retry，这里只给强调色
+   （形状与字号跟随主程序那排按钮，不套胶囊） */
+.re-btn.pp-btn { color: var(--accent, #4d6bfe); border-color: var(--accent, #4d6bfe); background: none; font-size: inherit; padding: inherit; border-radius: inherit; }
 
 /* 充值浮窗（.modal 遮罩是全局类）：中央卡片 = 标题栏 + iframe */
 #portal-modal { align-items: center; justify-content: center; }

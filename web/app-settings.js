@@ -233,41 +233,6 @@ async function openSettings(pane) {
     const st = await api('/api/status');
     $('about-version').textContent = '版本 ' + (st.version || '-');
     } catch (e) { /* 状态取不到时保留页面默认版本文本 */ }
-  loadAboutShell();
-}
-
-/* ---------- 关于页：远程外壳版本 + 一键清远程端缓存 ----------
-   版本 = 外壳内容哈希.代数（/api/shell-hash）。按钮 POST /api/shell-bump 把代数
-   +1：旧外壳里的嵌入版本随之全部「不一致」，remote-boot 自愈（清手机端缓存并
-   整页重拉）在它们的下一次加载时触发——见 remoteaccess.go handleShellBump。 */
-function fmtShellVer(h) {
-  // 显示带代数（哈希前 8 位 + .N）：按钮按下后版本行能看到变化
-  const i = h.lastIndexOf('.');
-  return i > 0 ? h.slice(0, 8) + '…' + h.slice(i) : h.slice(0, 12) + '…';
-}
-async function loadAboutShell() {
-  const ver = $('about-shell-ver');
-  try {
-    const d = await api('/api/shell-hash');
-    ver.textContent = d && d.hash ? '外壳版本 ' + fmtShellVer(d.hash) : '外壳版本未知';
-  } catch (e) { ver.textContent = '外壳版本读取失败'; }
-  const btn = $('btn-shell-bump');
-  if (!btn || btn.dataset.bound) return;
-  btn.dataset.bound = '1';
-  btn.onclick = async () => {
-    btn.disabled = true;
-    const done = $('about-shell-done');
-    try {
-      const d = await api('/api/shell-bump', { method: 'POST' });
-      if (d && d.hash) ver.textContent = '外壳版本 ' + fmtShellVer(d.hash);
-      done.style.display = '';
-      done.textContent = '已生效：远程端下次打开自动清缓存重载';
-    } catch (e) {
-      done.style.display = '';
-      done.textContent = '失败：' + e.message;
-    }
-    btn.disabled = false;
-  };
 }
 
 /* ---------- 组件清单（/api/components + CX 运行时热开关）
@@ -675,6 +640,18 @@ function buildProvCard(p, key) {
     offTag + viaTag + quotaChip +
     `<span class="pv-meta">${p.models.length} 个模型</span>` +
     (p.key ? '<span class="pv-dirty">密钥未保存</span>' : '');
+  // 组件插槽（2026-11-13 充值组件；2026-11-16 从展开后的表单挪到这条标题行）：
+  // 公司通道的组件按钮挂在「额度」后面，收起态也看得见、直接点——从前挂在展开
+  // 之后的表单底部，用户嫌点一下充值还要先展开卡片。主程序只给挂载点与
+  // prov:render 事件，不认识具体组件；空容器不占位（style.css 的 :empty）。
+  if (p.company) {
+    const slot = document.createElement('span');
+    slot.className = 'pf-card-slot';
+    slot.dataset.cxSlot = 'prov-actions';
+    slot.dataset.provId = p.id || '';
+    slot.dataset.portalURL = p.portalURL || '';
+    head.insertBefore(slot, head.querySelector('.pv-meta') || null);
+  }
   // 启停开关：停用的提供方不参与默认选择与会话解析（出了公司自动切到可用服务商
   // 就靠它）；公司通道另有「自动停用」，手动开启会一并清掉
   if (key !== 'new') {
@@ -884,19 +861,6 @@ function buildProvCard(p, key) {
       }
     };
     form.appendChild(refresh);
-  }
-
-  // 组件插槽（2026-11-13 充值组件）：公司通道卡片的按钮挂载点。充值组件监听
-  // prov:render 事件后往 .pf-card-slot 里放「充值」按钮（挂载点 dataset 带本卡
-  // portalURL，空则组件不放，空容器不占位）。这是通用机制：任何组件都能在此
-  // 贡献按钮，主程序只提供挂载点与渲染完成事件，不认识具体组件。
-  if (p.company) {
-    const slot = document.createElement('span');
-    slot.className = 'pf-card-slot';
-    slot.dataset.cxSlot = 'prov-actions';
-    slot.dataset.provId = p.id || '';
-    slot.dataset.portalURL = p.portalURL || '';
-    form.appendChild(slot);
   }
 
   // API 密钥：绝不回显，只标「已配置」，输入可替换

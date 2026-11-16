@@ -880,14 +880,27 @@
               </select>
             </div>
           </div>
-          <div class="gen-section">
-            <h4>远程外壳 <span class="sec-sub">远程端（手机）经中继加载的单文件页面</span></h4>
-            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-              <span class="tip-inline" id="about-shell-ver">外壳版本读取中…</span>
-              <button id="btn-shell-bump" type="button" class="fb-img-btn" style="margin-top:0">一键清除远程端缓存</button>
-              <span class="sf-desc" id="about-shell-done" style="display:none"></span>
+          <!-- 联系我们（2026-11-16）：占位原来是「远程外壳」（远程端经中继加载的
+               单文件页）——那套远程端已不再使用，按用户口径整块撤掉，换成联系入口。
+               二维码图片在 web/wechat-qr.png（随 exe 内嵌，离线也能显示）。 -->
+          <div class="gen-section" id="contact-section">
+            <h4>联系我们 <span class="sec-sub">邮箱与微信</span></h4>
+            <div class="contact-card">
+              <div class="contact-lines">
+                <div class="contact-line">
+                  <span class="contact-k">邮箱</span>
+                  <a href="mailto:tonghao.work@foxmail.com">tonghao.work@foxmail.com</a>
+                </div>
+                <div class="contact-line">
+                  <span class="contact-k">微信</span>
+                  <span>扫右侧二维码添加</span>
+                </div>
+                <p class="tip contact-tip">加微信请备注：来自数字助理</p>
+              </div>
+              <div class="contact-qr" title="微信二维码">
+                <img src="/wechat-qr.png" alt="微信二维码" width="180" height="180">
+              </div>
             </div>
-            <p class="tip" style="margin:8px 0 0">远程端每次打开本就拉最新外壳；此按钮把版本号 +1，让仍停留在旧页面或旧缓存里的远程端（含还停在旧版配对页上的手机）在下次加载时自动清缓存并整页重载。</p>
           </div>
           <div class="gen-section" id="feedback-section">
             <h4>问题反馈 <span class="sec-sub">本机必存；连了公司服务端还会同步一份供排查改进</span></h4>

@@ -344,7 +344,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/events", a.handleEvents)
 	mux.HandleFunc("GET /api/p2p-shell", a.handleP2PShell)
 	mux.HandleFunc("GET /api/shell-hash", a.handleShellHash)
-	mux.HandleFunc("POST /api/shell-bump", a.handleShellBump)     // 「关于」页一键清远程端缓存：外壳代数 +1
+	mux.HandleFunc("POST /api/shell-bump", a.handleShellBump)     // 远程端缓存兜底清零：外壳代数 +1（原「关于」页按钮已撤，接口留着给 call_api/排障用）
 	mux.HandleFunc("POST /api/webrtc-offer", a.handleWebRTCOffer) // P2P 直连信令：SDP 换 answer（p2pdirect.go，DataChannel 鉴权另过 auth 帧）
 	mux.HandleFunc("POST /api/feedback", a.handleFeedbackCreate)
 	mux.HandleFunc("POST /api/open-folder", a.handleOpenFolder)
