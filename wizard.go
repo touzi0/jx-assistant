@@ -170,7 +170,8 @@ func (a *App) applyProvisionPayload(payload *provisionPayload) []ModelCfg {
 	if payload.RegistryURL != "" {
 		a.Cfg.RegistryURL = strings.TrimRight(payload.RegistryURL, "/")
 	}
-	if payload.RelayHost != "" && a.Cfg.RemoteAccess.Host == defaultRemoteHost {
+	// 网关尚未配置（空）才采纳服务端下发；用户配过的不覆盖
+	if payload.RelayHost != "" && a.Cfg.RemoteAccess.Host == "" {
 		a.Cfg.RemoteAccess.Host = payload.RelayHost
 		if payload.RelayPort > 0 {
 			a.Cfg.RemoteAccess.Port = payload.RelayPort

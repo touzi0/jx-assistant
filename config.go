@@ -34,9 +34,8 @@ func genSecret(n int) string {
 
 // ensureRemoteIdentity 远程接入的身份补全：设备号/配对密钥为空时随机生成，
 // 并立即回写配置——不落盘的话每次启动都会换身份，手机存的入口就失效了。
-// defaultRemoteHost 出厂默认的中继网关域名：服务端下发 relayHost 时，只有当前值仍等于
-// 它才自动跟随（用户手改过就尊重用户的设置）。
-const defaultRemoteHost = "example.com"
+// 远程网关地址出厂不带默认值（Host 留空）：服务端下发 relayHost 时，仅当前值
+// 仍为空才自动跟随（用户/向导配过就尊重既有设置）。
 
 func ensureRemoteIdentity(cfg *Config, path string) {
 	generated := false
@@ -331,13 +330,13 @@ func DefaultConfig() *Config {
 		Experts:             defaultExperts(),
 		RemoteAccess: RemoteAccessCfg{
 			Enabled: false,
-			Host:    "example.com",
+			Host:    "",             // 出厂不带默认网关：由公司服务端下发（向导/广播）或用户手配
 			Port:    2227,
 			MyID:    "",            // 留空：首次加载时为每台安装生成唯一设备号（多人安装互不冲突）
 			RegKey:  "chat_p2p_v1", // legacy 全局口令：仅兼容未升级的旧网关；注册凭据实际走 PairKey 派生的 auth（remoteaccess.go hubAuthKey）
 		},
-		RegistryURL: "https://example.com:PORT", // 总服务器（公司名查询的入口）：内网发现超时后按公司名查它拿接入地址；"off"=禁用
-		UpdateURL:   "https://example.com:3000/api/v1/repos/your-org/your-repo/releases/latest",
+		RegistryURL: "https://jxaizz.com:2227", // 总服务器（公司名查询的入口）：内网发现超时后按公司名查它拿接入地址；"off"=禁用
+		UpdateURL:   "",                         // 更新源出厂不带默认值（装机时注入或用户手配）；空/"off"=不检查更新
 		UpdateMode:  "auto",
 		AskAlert:    AskAlertCfg{AfterSec: askAlertDefaultSec, Text: askAlertDefaultText},
 	}
@@ -467,18 +466,15 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.CompactMode = def.CompactMode
 		compactMigrated = true
 	}
-	// 远程接入：老配置没有这一键时补默认网关地址；设备号与配对密钥留空则
-	// 为本机随机生成并立即落盘——每台安装天然拿到互不冲突的设备号和独立
-	// 密钥，多台电脑共用一个网关也不会互相顶掉（网关按设备号路由注册）。
-	if cfg.RemoteAccess.Host == "" {
-		cfg.RemoteAccess.Host = def.RemoteAccess.Host
-	}
+	// 远程接入：网关地址出厂不带默认值（见 DefaultConfig），服务端下发/用户配置
+	// 之前保持留空；设备号与配对密钥留空则为本机随机生成并立即落盘——每台安装
+	// 天然拿到互不冲突的设备号和独立密钥，多台电脑共用一个网关也不会互相顶掉。
 	// 一次性迁移（2026-10）：老部署的远程网关填的是 QNAP DDNS 域名，而 2227 上
-	// 的证书只覆盖 example.com/.cn——老域名生成的配对二维码/入口链接手机端必报
+	// 的证书只覆盖 jxaizz.com——老域名生成的配对二维码/入口链接手机端必报
 	// 证书错误。启动时静默迁移到自有域名（仅精确匹配本家老地址，不动其他公司的网关）。
 	remoteHostMigrated := false
-	if cfg.RemoteAccess.Host == "nas.example.org" {
-		cfg.RemoteAccess.Host = "example.com"
+	if cfg.RemoteAccess.Host == "jxkj.mycloudnas.com" {
+		cfg.RemoteAccess.Host = "jxaizz.com"
 		remoteHostMigrated = true
 	}
 	if cfg.RemoteAccess.Port == 0 {
@@ -490,7 +486,7 @@ func LoadConfig(path string) (*Config, error) {
 	ensureRemoteIdentity(cfg, path)
 	// 一次性迁移（2026-10-25 明文停用）：存量配置里指向自家服务端的明文 http://
 	// 地址（向导/市场/搜索/更新/公司通道 baseURL）统一收敛到
-	// https://example.com:2227——TLS 证书只覆盖域名，IP 直连的 https 证书校验必
+	// https://jxaizz.com:2227——TLS 证书只覆盖域名，IP 直连的 https 证书校验必
 	// 失败；服务端明文口只剩 308 重定向。用户自配的第三方明文地址一律不碰。
 	plainSelfMigrated := false
 	swapPlain := func(u string) string {
@@ -517,8 +513,9 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.RegistryURL == "" {
 		cfg.RegistryURL = def.RegistryURL
 	}
-	// 更新检查：老配置没有这一键时补默认发布源；显式 "off" 原样保留
-	// （转成空的话，下一次保存配置又会被补回默认，用户就关不掉了）
+	// 更新检查：出厂默认空（=不检查，装机时由服务端注入或用户手配）；老配置
+	// 缺这一键时补默认（现为空）；显式 "off" 原样保留——空与 "off" 都不检查，
+	// 区别只在「向导/服务端后续下发时会不会被采纳」。
 	if cfg.UpdateURL == "" {
 		cfg.UpdateURL = def.UpdateURL
 	}
@@ -572,10 +569,11 @@ func LoadConfig(path string) (*Config, error) {
 
 // legacyPlainHosts 自家服务端的已知地址——存量配置里可能以明文 http:// 记录
 //（历史网关域名、内网 IP、外网域名），明文停用后统一收敛到正式域名。
-var legacyPlainHosts = []string{"example.com", "jxaizz.cn", "nas.example.org", "192.0.2.210"}
+//（jxaizz.cn 已弃用下线，不再列内；与内部开发线保持一致。）
+var legacyPlainHosts = []string{"jxaizz.com", "jxkj.mycloudnas.com", "192.168.0.210"}
 
 // migrateLegacyPlainURL 把「http://<自家host>[:任意端口]<路径…>」迁到
-// https://example.com:2227<路径…>（端口无关：2227/2228 是服务端口、3000/3001 是
+// https://jxaizz.com:2227<路径…>（端口无关：2227/2228 是服务端口、3000/3001 是
 // 内网明文直连 new-api 的历史下发，一律收敛到服务端 TLS 口；provider baseURL
 // 的 /v1 路径随地址完整保留）。host 不在自家清单（用户自配的第三方明文服务）
 // 原样返回。幂等：迁过即 https，不再匹配。
@@ -590,7 +588,7 @@ func migrateLegacyPlainURL(u string) (string, bool) {
 	for _, x := range legacyPlainHosts {
 		if pu.Hostname() == x {
 			pu.Scheme = "https"
-			pu.Host = "example.com:PORT"
+			pu.Host = "jxaizz.com:2227"
 			return pu.String(), true
 		}
 	}

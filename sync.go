@@ -228,8 +228,8 @@ func applyAnnounce(a *App, ann *announcePayload, server string, fromPublic bool)
 		changed = append(changed, "公司名→"+ann.Company)
 	}
 	// 小程序平台地址不再随公告下发（2026-11-03 用户口径）：一律从市场地址推导，
-	// 远程接入网关：出厂默认（example.com）才跟随服务端下发，手改过的保留
-	if ann.RelayHost != "" && a.Cfg.RemoteAccess.Host == defaultRemoteHost {
+	// 远程接入网关：尚未配置（空）才跟随服务端下发，配过的（手改/向导）保留
+	if ann.RelayHost != "" && a.Cfg.RemoteAccess.Host == "" {
 		if a.Cfg.RemoteAccess.Host != ann.RelayHost {
 			a.Cfg.RemoteAccess.Host = ann.RelayHost
 			changed = append(changed, "中继网关→"+ann.RelayHost)
