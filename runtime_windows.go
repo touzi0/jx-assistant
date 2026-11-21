@@ -6,4 +6,5 @@ const (
 	isWindowsRuntime = true
 	isLinuxRuntime   = false
 	isAndroidRuntime = false
+	isDarwinRuntime  = false
 )

@@ -5,6 +5,7 @@ package main
 //
 //	local Windows → 受限令牌 + ACL（sandbox_windows.go，对齐 sandbox-windows-acl）
 //	local Linux   → Landlock（经 sandboxhelper 自限制后 exec，对齐 sandbox-local）
+//	local macOS   → Seatbelt（sandbox-exec + SBPL 白名单，sandbox_darwin.go）
 //	SSH remote    → 上传同一 helper 到远端执行（对齐 sandbox-ssh：
 //	                「远端主机选择它安装的本地后端来执行策略」）
 //	policy = full → 不受限（对齐 danger-full-access：消费者直接绕过 confine）
@@ -66,6 +67,13 @@ func spawnConfinedLocal(ctx context.Context, r sandboxRun) (string, error) {
 		return spawnConfinedWindows(ctx, r)
 	case isLinuxRuntime:
 		return spawnConfinedLinuxReexec(r)
+	case isDarwinRuntime:
+		wsAbs, err := filepath.Abs(r.Workspace)
+		if err != nil {
+			return "", fmt.Errorf("sandbox unavailable: %w", err)
+		}
+		r.Workspace = wsAbs
+		return spawnConfinedDarwin(ctx, r)
 	case isAndroidRuntime:
 		// 安卓：内核禁用 Landlock 与非特权用户命名空间（android 内核
 		// CONFIG 均未启用），OS 级命令沙箱不可用。对齐 DSH 手机版社区
@@ -131,6 +139,13 @@ func startConfinedAsync(ctx context.Context, r sandboxRun, w io.Writer) (func() 
 		waitDone := make(chan struct{}, 1)
 		go func() { _ = cmd.Wait(); tree.finish(); os.RemoveAll(tempDir); close(waitDone) }()
 		return func() bool { <-waitDone; return true }, nil
+	case isDarwinRuntime:
+		wsAbs, err := filepath.Abs(r.Workspace)
+		if err != nil {
+			return nil, fmt.Errorf("sandbox unavailable: %w", err)
+		}
+		r.Workspace = wsAbs
+		return startConfinedDarwinAsync(ctx, r, w)
 	case isAndroidRuntime:
 		// 安卓后台作业：同前台，无 OS 级沙箱；内置运行时优先、未就绪回落系统 sh
 		// （见 spawnConfinedLocal 的安卓分支注释）。
@@ -202,8 +217,11 @@ func runDeniedMarker(policy, out string, remote bool) string {
 		}
 	}
 	sigs := posixDenialSigs
-	if isWindowsRuntime && !remote {
+	switch {
+	case isWindowsRuntime && !remote:
 		sigs = winDenialSigs
+	case isDarwinRuntime && !remote:
+		sigs = darwinDenialSigs
 	}
 	hit := false
 	for _, s := range sigs {
