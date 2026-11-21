@@ -1,4 +1,4 @@
-/* 小程序平台独立视图（sites-platform 组件的浏览器半边，后端 sitesproxy.go）：
+/* 企业小程序独立视图（sites-platform 组件的浏览器半边，后端 sitesproxy.go）：
    与市场视图平级的主区整页——让位规则照 market-mode 抄（#msg-zone 是运行时
    定位层，只藏 #messages 会平分主区高度）。不套壳：无 padding、iframe 无边框
    无圆角，顶栏以下直接就是平台网页（2026-10-30 用户口径：别出现"框中框"） */

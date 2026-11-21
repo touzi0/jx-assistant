@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chromedp/cdproto/emulation"
@@ -287,6 +288,9 @@ func (a *App) panelFrontendReset(dispatch func(f func()), mainWnd uintptr) {
 	a.panelMainWnd = mainWnd
 	a.panelVisible = ""
 	a.panelMu.Unlock()
+	// 浮层让位标记随前端复位：新页面 modal 全关，旧前端若在让位态中死亡，
+	// 不清零会让新前端的浏览器面板出生即被压底（永远白屏类事故）。
+	atomic.StoreInt32(&a.panelOverlayYield, 0)
 	for _, p := range old {
 		if lp, ok := p.(interface{ releaseAfterMainLoopGone() }); ok {
 			lp.releaseAfterMainLoopGone()
@@ -1355,6 +1359,46 @@ func (a *App) handleBrowserPanelRect(w http.ResponseWriter, r *http.Request) {
 	// 该会话面板落位成为当前显示：记账 + 其余面板收屏外（互斥显示）
 	a.panelSetVisible(browserProfileKey(p.Session))
 	a.panelHideOthers(browserProfileKey(p.Session))
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleBrowserPanelOverlay HTML 浮层让位信号：桌面壳里 HTML 无法浮于原生
+// 浏览器面板之上，设置等全屏 .modal 打开时前端（app-right.js 的 MutationObserver）
+// 上报 on=true，宿主把面板压到主 WebView2 之下（YieldTop）；全部 modal 关闭后
+// on=false 恢复提顶。写者纪律同 handleBrowserPanelRect：仅浏览器 UA + desktop
+// 标记（网页/远程形态的页面发不来，Electron 壳的 webview 是 DOM 元素天然让位、
+// 也不该发）。标记记在 App 级（panelOverlayYield），惰性创建的面板首次落位
+// 同样生效。
+func (a *App) handleBrowserPanelOverlay(w http.ResponseWriter, r *http.Request) {
+	var p struct {
+		On      bool `json:"on"`
+		Desktop bool `json:"desktop"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		writeErr(w, http.StatusBadRequest, "参数解析失败: "+err.Error())
+		return
+	}
+	if !p.Desktop || !strings.Contains(r.UserAgent(), "Mozilla") {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	v := int32(0)
+	if p.On {
+		v = 1
+	}
+	atomic.StoreInt32(&a.panelOverlayYield, v)
+	a.panelMu.Lock()
+	dispatch := a.panelDispatch
+	a.panelMu.Unlock()
+	if dispatch == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	a.panelEach(func(t browserTarget) {
+		if bp, ok := t.(interface{ YieldTop(yield bool) }); ok && bp != nil {
+			bp.YieldTop(p.On)
+		}
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

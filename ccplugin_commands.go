@@ -183,6 +183,10 @@ func (a *App) ccExpandSlashMessage(ctx context.Context, sess *SessionMeta, conte
 	}
 	cmdName := strings.TrimPrefix(first[0], "/")
 	args := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(content), first[0]))
+	// 会话级插件覆盖：本对话把某插件关了，它的 mod 命令与插件命令都不展开
+	pluginAllowed := func(key string) bool {
+		return sess == nil || a.cxoPluginEnabled(sess.ID, "claude", key)
+	}
 	// mod 注册的命令：执行 command.run，返回文本作为消息
 	if a.CCPlugins != nil && a.CCPlugins.hasMods() {
 		if text, ok := a.ccModRunCommand(ctx, sess, cmdName, args); ok {
@@ -197,7 +201,7 @@ func (a *App) ccExpandSlashMessage(ctx context.Context, sess *SessionMeta, conte
 		return content
 	}
 	entry, plugin, ok := a.CCPlugins.ccCommandByName(cmdName)
-	if !ok {
+	if !ok || !pluginAllowed(plugin.Key) {
 		return content
 	}
 	userCfg := a.CCPlugins.UserConfigOf(plugin)
@@ -230,16 +234,22 @@ func expandCommandPlaceholders(body, args string) string {
 // ---------- HTTP ----------
 
 // handleCCPluginCommands 给前端 / 命令弹层：命令清单（插件命令 + mod 命令）。
+// ?s=<会话id>：按该会话的插件生效集过滤（会话把某插件关了，它的命令不出场）。
 func (a *App) handleCCPluginCommands(w http.ResponseWriter, r *http.Request) {
 	if a.CCPlugins == nil {
 		writeJSON(w, 200, map[string]any{"commands": []any{}})
 		return
 	}
+	sid := strings.TrimSpace(r.URL.Query().Get("s"))
+	allow := func(pluginKey string) bool { return sid == "" || a.cxoPluginEnabled(sid, "claude", pluginKey) }
 	out := []map[string]any{}
 	for _, c := range a.CCPlugins.ccCommands() {
+		if !allow(c.PluginKey) {
+			continue
+		}
 		out = append(out, map[string]any{"name": c.Name, "description": c.Description, "argumentHint": c.ArgumentHint, "plugin": c.PluginName})
 	}
-	for _, c := range a.CCPlugins.ccModCommandList() {
+	for _, c := range a.CCPlugins.ccModCommandListFiltered(allow) {
 		out = append(out, c)
 	}
 	writeJSON(w, 200, map[string]any{"commands": out})

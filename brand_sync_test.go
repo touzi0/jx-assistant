@@ -4,6 +4,8 @@ package main
 // 只在该换时下载一次、老服务端（brand=nil）不动本地、服务端删图回退默认。
 
 import (
+	"bytes"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -100,5 +102,39 @@ func TestApplyBrandDownloadFail(t *testing.T) {
 	}
 	if b := a.loadBrandLocal(); b.LogoHash != "" || b.Name != "X" {
 		t.Fatalf("文字应应用、hash 不落: %+v", b)
+	}
+}
+
+// /logo-default.png：关于页固定 LOGO——只出内置默认图（embed 的 web/logo.png），
+// 即便 data/brand/ 已有服务端下发的缓存图也不跟随（走品牌的是 /logo.png）。
+func TestDefaultLogoRoute(t *testing.T) {
+	static, err := fs.Sub(webFS, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{Cfg: &Config{DataDir: t.TempDir()}, static: static}
+
+	// 预置品牌缓存图（模拟服务端已下发换装）：/logo-default.png 仍应出内置图
+	if err := os.MkdirAll(a.brandDir(), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(a.brandLogoPath(), []byte("\x89PNG-fake-brand-logo"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	a.handleDefaultLogo(w, httptest.NewRequest("GET", "/logo-default.png", nil))
+	if w.Code != 200 {
+		t.Fatalf("状态码 got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("Content-Type got %q", ct)
+	}
+	want, err := fs.ReadFile(static, "logo.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(w.Body.Bytes(), want) {
+		t.Fatalf("应原样返回内置默认图（%d 字节），got %d 字节", len(want), w.Body.Len())
 	}
 }

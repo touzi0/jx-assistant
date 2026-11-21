@@ -15,9 +15,10 @@ import (
 // 单条消息的完整性是硬要求：早先的实现把每条消息固定截到 3000 字，于是几千字的
 // 最终报告读到固定位置必断、**加大 chars 预算也没用**。现在两条路都通：
 //   - 窗口读取（from_seq）按预算装，装不下就把预算填满并写明「本条共 X 字，已显示
-//     前 Y 字」+ 续读入口（seq= 或 seq= + from_char=）；
-//   - 单条读取（seq）整条完整返回（histSingleMax 是唯一上限，超了给 from_char 续读）。
-// 工具调用参数仍按 argKeepLimit 折叠（防 write 把整份文件内容灌进上下文）。
+//     前 Y 字」+ 续读入口（seq= 或 seq= + from_char=）；该档位下工具调用参数按
+//     argKeepLimit 折叠（预算场景的防灌入，seq 完整读取是兜底入口）；
+//   - 单条读取（seq）整条完整返回——正文、思考、工具调用参数全部原样
+//     （histSingleMax 是唯一上限，超了给 from_char 续读）。
 
 const (
 	histEntryClip = 3000   // 倒序翻页视图里单条消息的截断长度（截断时给完整读取入口）
@@ -186,7 +187,7 @@ func runReadSessionMessages(t *toolContext, args json.RawMessage) (string, error
 		lines := []string{fmt.Sprintf("（会话 %s 共 %d 条，从第 %d 条开始从旧到新，预算 %d 字）", sid, total, rows[start].Seq, chars)}
 		used, next := 0, int64(0)
 		for i := start; i < end; i++ {
-			head, body := historyRowParts(rows[i])
+			head, body := historyRowParts(rows[i], false)
 			headLen, bodyLen := len([]rune(head)), len([]rune(body))
 			remain := chars - used - headLen
 			if remain <= 0 {
@@ -274,7 +275,7 @@ func findHistoryRow(all, rows []*StoredMessage, seq int64) (*StoredMessage, stri
 // renderHistoryEntry 把一条消息渲染为倒序翻页视图的文本行：思考过程前置
 //（【思考】段），正文与工具调用并入同一条；超长时截断并给出完整读取入口。
 func renderHistoryEntry(m *StoredMessage) string {
-	head, body := historyRowParts(m)
+	head, body := historyRowParts(m, false)
 	if r := []rune(body); len(r) > histEntryClip {
 		return head + string(r[:histEntryClip]) +
 			fmt.Sprintf("…（本条共 %d 字，已显示前 %d 字；完整读取：read_session_messages(session_id=%s, seq=%d)）",
@@ -283,16 +284,22 @@ func renderHistoryEntry(m *StoredMessage) string {
 	return head + body
 }
 
-// renderHistoryEntryFull 完整渲染一条消息（seq 模式用）：不截断正文与思考，
-// 工具调用参数仍按 argKeepLimit 折叠（防 write 把整份文件内容灌进上下文）。
+// renderHistoryEntryFull 完整渲染一条消息（seq 模式用）：正文、思考、工具调用
+// 参数全部原样——单条完整读取的语义就是「原文」。防 write 大参数灌爆上下文由
+// 调用方的 histSingleMax 预算 + from_char 续读兜底（分页可控，不需要在这里截）。
 func renderHistoryEntryFull(m *StoredMessage) string {
-	head, body := historyRowParts(m)
+	head, body := historyRowParts(m, true)
 	return head + body
 }
 
 // historyRowParts 把一条消息拆成「标识头 + 正文」：正文保留原始换行（历史查询看
-// 的就是原文格式）。思考原文完整保留；工具调用参数按 argKeepLimit 折叠并注明。
-func historyRowParts(m *StoredMessage) (head, body string) {
+// 的就是原文格式）。思考原文完整保留；工具调用参数按档位折叠：full=false（倒序
+// 翻页 / from_seq 窗口，字数预算场景）按 argKeepLimit 折叠并注明；full=true
+// （seq 单条完整读取）**参数原样**——压缩折叠视图承诺的「全文取
+// read_session_messages(seq=N)」必须兑现，否则被压缩的工具调用只剩前 500 字、
+// 且渲染文本已「显示完整」连续读入口都没有，原文就再也找不回来了（前端能显示
+// 的原文，模型就必须能读回；2026-11-19 修）。超长由调用方的预算与续读兜底。
+func historyRowParts(m *StoredMessage, full bool) (head, body string) {
 	head = fmt.Sprintf("[%d] %s：", m.Seq, m.Role)
 	var b strings.Builder
 	if m.Thinking != "" {
@@ -304,9 +311,11 @@ func historyRowParts(m *StoredMessage) (head, body string) {
 	for _, tc := range m.ToolCalls {
 		args := tc.Function.Arguments
 		note := ""
-		if r := []rune(args); len(r) > argKeepLimit {
-			args = string(r[:argKeepLimit])
-			note = fmt.Sprintf("…（参数共 %d 字，折叠显示前 %d 字）", len(r), argKeepLimit)
+		if !full {
+			if r := []rune(args); len(r) > argKeepLimit {
+				args = string(r[:argKeepLimit])
+				note = fmt.Sprintf("…（参数共 %d 字，折叠显示前 %d 字）", len(r), argKeepLimit)
+			}
 		}
 		b.WriteString("\n[调用 " + tc.Function.Name + " 参数=" + args + note + "]")
 	}

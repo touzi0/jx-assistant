@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"regexp"
 	"sort"
@@ -30,21 +29,21 @@ const argKeepLimit = 500
 // 每处裁剪都标注「（中间已裁 N 字 · 全文取 seq N）」——模型既能判断
 // 要不要回查，也知道回查入口。
 const (
-	argKeepLong  = 2000 // edit/write 参数原样保留上限（rune），超过才头尾保留
-	argKeepHead  = 1600 // 超限时的头部保留量
-	argKeepTail  = 400  // 超限时的尾部保留量
-	cmdKeepLimit = 500  // run_command 命令文本原样保留上限
-	cmdKeepHead  = 200  // 命令超限时的头部保留量
-	cmdKeepTail  = 100  // 命令超限时的尾部保留量
-	outHeadLines = 2    // 命令/脚本输出的头部保留行数
-	outTailLines = 6    // 尾部保留行数（成功）
-	outTailFail  = 10   // 尾部保留行数（失败——错误堆栈在尾部）
-	digestLimit  = 60   // 动作行「目标」字段的截断上限
-	intentLimit  = 40   // 动作行「意图」字段的截断上限
-	resLineLimit = 80   // 一行结论类结果的截断上限
-	lineKeepLimit = 300 // 输出单行的原样保留上限（无换行巨块/压缩 JSON 行）
-	lineKeepHead  = 150 // 行内超长时的首部保留量
-	lineKeepTail  = 50  // 行内超长时的尾部保留量
+	argKeepLong   = 2000 // edit/write 参数原样保留上限（rune），超过才头尾保留
+	argKeepHead   = 1600 // 超限时的头部保留量
+	argKeepTail   = 400  // 超限时的尾部保留量
+	cmdKeepLimit  = 500  // run_command 命令文本原样保留上限
+	cmdKeepHead   = 200  // 命令超限时的头部保留量
+	cmdKeepTail   = 100  // 命令超限时的尾部保留量
+	outHeadLines  = 2    // 命令/脚本输出的头部保留行数
+	outTailLines  = 6    // 尾部保留行数（成功）
+	outTailFail   = 10   // 尾部保留行数（失败——错误堆栈在尾部）
+	digestLimit   = 60   // 动作行「目标」字段的截断上限
+	intentLimit   = 40   // 动作行「意图」字段的截断上限
+	resLineLimit  = 80   // 一行结论类结果的截断上限
+	lineKeepLimit = 300  // 输出单行的原样保留上限（无换行巨块/压缩 JSON 行）
+	lineKeepHead  = 150  // 行内超长时的首部保留量
+	lineKeepTail  = 50   // 行内超长时的尾部保留量
 )
 
 // foldBoundaryNote 是折叠边界的提示标签：组装时注入在「已折叠区 → 原文区」
@@ -141,10 +140,34 @@ func activeSummaries(msgs []*StoredMessage) []*StoredMessage {
 // 或同 key 换值渲染为【移除】/【新增】变更清单，差分连续数达到阈值后完整
 // 重发一次校准（见 envUpdateMessage / envRowRender）——变化永远以新消息
 // 出现在尾部，系统提示词与历史前缀逐字节稳定，前缀缓存命中最大化。
-func (a *App) buildContext(sess *SessionMeta, sys string) []Message {
+// buildContextUpTo 与 buildContext 同一管线，唯一差别：upTo>0 时行循环在
+// upTo 处截止（Seq 超过的行整段跳过——消息与环境差分同步截止，组装出的
+// 消息序列与主循环请求逐字节同源）。doSummarize 的摘要请求用它取「压缩
+// 终点为止」的消息序列：前缀缓存直接命中整段压缩区间，摘要调用只有尾部
+// 压缩指令是新内容（DSH 社区同思路实测命中可到 99%+）。
+func (a *App) buildContextUpTo(sess *SessionMeta, sys string, upTo int64) []Message {
+	return a.buildContext(sess, sys, upTo)
+}
+
+func (a *App) buildContext(sess *SessionMeta, sys string, upTo int64) []Message {
 	raw, err := a.Store.RawMessagesAll(sess.ID)
 	if err != nil {
 		return []Message{TextMessage("system", sys)}
+	}
+	if upTo > 0 {
+		// 截止到 upTo（摘要请求的压缩终点）：对话行与环境差分行照裁——它们
+		// 在「upTo 时刻的主循环请求」里本来就只到 upTo 为止，裁完的序列与
+		// 那次请求逐字节同源，前缀缓存命中的正是那一段。摘要行豁免：它只是
+		// 落库位置靠后的元数据（covers_up_to 才是它的逻辑位置），主循环请求
+		// 里始终整段在前缀头部，裁掉反而与主循环分叉。
+		kept := make([]*StoredMessage, 0, len(raw))
+		for _, m := range raw {
+			if m.Seq > upTo && m.Kind != "summary" {
+				continue
+			}
+			kept = append(kept, m)
+		}
+		raw = kept
 	}
 	summaries := activeSummaries(raw)
 	boundary := int64(0)
@@ -158,8 +181,8 @@ func (a *App) buildContext(sess *SessionMeta, sys string) []Message {
 	for _, s := range summaries {
 		out = append(out, TextMessage("user", s.Text()))
 	}
-	prevEnv := ""    // 上一条可见快照；空 = 下一条整份呈现（首轮，或摘要折叠后的首条）
-	envUpdates := 0  // 自上一条整份/全量快照以来的连续差分数（自愈全量的计数）
+	prevEnv := ""     // 上一条可见快照；空 = 下一条整份呈现（首轮，或摘要折叠后的首条）
+	envUpdates := 0   // 自上一条整份/全量快照以来的连续差分数（自愈全量的计数）
 	foldSeen := false // 已见过折叠行：遇到首条未折叠可见行时在交界注入提示标签
 	for _, m := range raw {
 		if m.Seq <= boundary || m.Kind == "summary" || m.Kind == "prompt" || m.Kind == "inherit" || m.Kind == "request" || m.Kind == "audit" {
@@ -250,6 +273,7 @@ func (a *App) timeAfter(m *StoredMessage) []Message {
 //   - 无响应的 tool_call 从 assistant 上剔除；清空后若有正文保留为普通消息，
 //     纯调用且无正文则整条剔除；
 //   - 孤儿 tool 响应（无对应调用或缺少 id）整条丢弃。
+//
 // 不改落库数据，未配对的原文仍可经历史查询工具读到。
 func repairToolPairing(msgs []Message) []Message {
 	replies := map[string]Message{} // 调用 id → 响应（有响应才进表）
@@ -401,56 +425,143 @@ func envLineKey(l string) string {
 
 // ---------- 子对话的上下文继承（分支克隆） ----------
 
-// inheritMark 是继承标记行的正文（前端只需 count 来切分继承段与自有消息）。
+// inheritMark 是继承标记行的正文（前端据此切分继承段与自有消息，并按需懒加载
+// 更早的历史）。Title/From/Total 是 2026-11-16 新增的「承接锚点」：老会话的标记
+// 行只有 parent/count，前端缺字段时退回旧文案（不报错、不崩）。
 type inheritMark struct {
 	Parent string `json:"parent"`
-	Count  int    `json:"count"`
+	Count  int    `json:"count"`           // 已承接的行数（父会话里 From 起到末尾的可继承行）
+	Title  string `json:"title,omitempty"` // 父会话标题：折叠条显示「承接自 <标题>」
+	From   int64  `json:"from,omitempty"`  // 父会话里第一条被承接行的 seq（懒加载游标）
+	Total  int    `json:"total,omitempty"` // 父会话可继承行总数（From 之前还有 Total-Count 条）
 }
 
-// copyInheritedContext 把父会话的完整消息历史复制进子会话，作为子对话继承的上下文。
-// 复制的是**原始行**（含摘要与压缩标记，逐行保序、seq 重排），不是渲染成的一段文本——
-// 这样复制后子会话的「模型可见序列」与父会话此前的请求逐条一致（同一套摘要边界、
-// 同一套规则压缩视图），DeepSeek 的前缀缓存才能命中整段父上下文。
-// 首行写一条 kind=inherit 标记行（前端折叠显示、组装时跳过），返回复制的行数。
-func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
+// trimOpenToolGroup 剥掉尾部未闭合的工具调用组，返回可安全复制的前缀。
+//
+// 为什么只需要这一处截断：落库时机是「这一步结束」——模型正在流式输出的那一步
+// 根本不落库（被打断才写半截带中断标注），工具结果也只在工具跑完时落。但
+// **assistant 那一行（含 tool_calls）在模型这一步输出完就落库了**，工具随后才逐个
+// 执行、逐个落结果。于是从「模型输出完成」到「最后一个工具结果回来」之间，库里
+// 存在「有 tool_calls、对应 tool 结果还没齐」的半开组（实测：父会话 01:26:38 落了
+// 带 tool_call 的 assistant，它的结果 01:28:09 才落，中间 91 秒正是用户建子对话的
+// 时刻）。这种前缀发给模型不合法（每个 tool_call 必须紧跟自己的 tool 结果），
+// 所以整组剥掉、退到上一组为止；其余已落库的行原样保留。
+//
+// 不看运行状态：进程被强杀在工具中途时，空闲会话同样可能留下半开组。
+// 子对话继承（copyInheritedContext）与两处分支对话（handleFork）共用本函数。
+func trimOpenToolGroup(rows []*StoredMessage) []*StoredMessage {
+	for len(rows) > 0 {
+		ai := -1
+		for i := len(rows) - 1; i >= 0; i-- {
+			if rows[i].Role == "assistant" {
+				ai = i
+				break
+			}
+		}
+		if ai < 0 || len(rows[ai].ToolCalls) == 0 {
+			return rows // 尾巴没有未闭合的工具组
+		}
+		got := make(map[string]bool, len(rows)-ai)
+		for _, x := range rows[ai+1:] {
+			if x.Role == "tool" && x.ToolCallID != "" {
+				got[x.ToolCallID] = true
+			}
+		}
+		closed := true
+		for _, tc := range rows[ai].ToolCalls {
+			if !got[tc.ID] {
+				closed = false
+				break
+			}
+		}
+		if closed {
+			return rows
+		}
+		rows = rows[:ai] // 整组剥掉（那条 assistant 与它的部分结果），再看前一组
+	}
+	return rows
+}
+
+// prepareInheritedRows 读父会话历史，产出「可以整批灌进子会话」的行：首行 inherit
+// 标记（承接锚点）、seq 已重排、摘要覆盖边界已重映射。**不落库**——它和 sessions 行
+// 由 Store.CreateWithRows 在同一个事务里一次写完（2026-11-16：此前 sessions 行先落库、
+// 消息再逐行写，中间十几秒里列表上是个正文为空的半成品，用户在这个窗口归档/删除它，
+// 就得到一条「能对话但列表里没有」的会话；逐行提交还要 4000+ 次 fsync）。
+//
+// 承接什么（用户口径：真正需要复制的是「上一次发送的上下文」，也就是模型真正会收到
+// 的那一份）：
+//   - 生效的最后一条压缩摘要（模型头部摘要，边界之前的原文模型本来就看不到）；
+//   - 摘要边界之后的**原文行**（chat/aiuser/env/report，逐条保序）；
+//   - 不复制 request / audit（本会话诊断工件）、不复制 prompt（系统提示词/工具定义
+//     快照，纯前端展示行，buildContext 整类跳过，却占父历史体积的大头：87.8%）。
+//
+// 于是子会话组装出的模型消息序列与「父会话下一次请求」逐条一致：KV 前缀缓存照常
+// 命中，系统提示词与工具目录由子会话按自己的 mode 重建（本来就没复制过）。
+// 更早的历史留在父会话里，前端「承接自 …· 更早 N 条」按需经
+// GET /api/sessions/{id}/inherit 懒加载（锚点里的 from/total 就是它的游标）。
+func (a *App) prepareInheritedRows(parent *SessionMeta) ([]*StoredMessage, error) {
+	parentID := parent.ID
 	all, err := a.Store.RawMessagesAll(parentID)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	rows := make([]*StoredMessage, 0, len(all))
 	for _, x := range all {
-		if x.Kind == "request" || x.Kind == "audit" {
-			continue // 模型输入快照与审计行是本会话的诊断工件，不随上下文继承
+		switch x.Kind {
+		case "request", "audit", "prompt":
+			continue // 诊断工件与纯展示快照不随上下文继承
 		}
 		rows = append(rows, x)
 	}
-	if a.IsRunning(parentID) {
-		// 父会话正在执行：只复制到最后一条已完成答复，避免把悬空的工具调用带进来
-		// （与「分支对话」同一判定：最后一条带正文且无工具调用的助手消息）
-		last := -1
-		for i, x := range rows {
-			if x.Role == "assistant" && len(x.ToolCalls) == 0 && strings.TrimSpace(x.Text()) != "" {
-				last = i
-			}
+	// 落库即完成：库里有的都是「已完成的小步」（模型正在流式输出的那一步不落库），
+	// 所以整份复制即可，不判断"整轮"、也不区分父会话是否正在执行。唯一不能带走的
+	// 是尾部未闭合的工具调用组——见 trimOpenToolGroup。
+	rows = trimOpenToolGroup(rows)
+
+	// 承接点 = 生效摘要的覆盖边界（不是摘要行的 seq）：摘要行往往落在它覆盖的
+	// 边界之后（压缩完成时才追加），按行位置截会连带丢掉边界与摘要行之间那段
+	// **模型其实能看到**的原文（实测父会话少 275 行）。边界之前的原文已被摘要
+	// 替代（buildContext 直接跳过），复制过去只占体积。
+	sums := activeSummaries(rows)
+	boundary := int64(0)
+	for _, s := range sums {
+		if s.CoversUpTo > boundary {
+			boundary = s.CoversUpTo
 		}
-		if last < 0 {
-			return 0, nil // 一条完整答复都还没有，没什么可继承的
-		}
-		rows = rows[:last+1]
 	}
-	if len(rows) == 0 {
-		return 0, nil
+	total := len(rows)
+	kept := make([]*StoredMessage, 0, len(rows))
+	kept = append(kept, sums...) // 摘要排在前面（组装时它们就是头部摘要，逐条按序注入）
+	for _, x := range rows {
+		if x.Kind == "summary" || x.Seq <= boundary {
+			continue
+		}
+		kept = append(kept, x)
+	}
+	// 懒加载游标：父会话里第一条被承接行的 seq（更早的都留在父会话里，前端按需取）
+	var from int64
+	for _, x := range kept {
+		if from == 0 || x.Seq < from {
+			from = x.Seq
+		}
 	}
 
-	// 先算好整张新旧 seq 映射再落库：摘要的覆盖边界要按新 seq 重写，
+	mark, _ := json.Marshal(inheritMark{
+		Parent: parentID,
+		Count:  len(kept),
+		Title:  parent.Title,
+		From:   from,
+		Total:  total,
+	})
+	out := make([]*StoredMessage, 0, len(kept)+1)
+	out = append(out, &StoredMessage{
+		Message: TextMessage("user", string(mark)), Kind: inheritKind, CreatedAt: now(), Seq: 1,
+	})
+	// 先算好整张新旧 seq 映射再产出：摘要的覆盖边界要按新 seq 重写，
 	// 否则子会话的组装边界会对不上（摘要按旧 seq 覆盖、新行全是新 seq）。
-	last, err := a.Store.LastSeq(childID)
-	if err != nil {
-		return 0, err
-	}
-	newOfOld := make(map[int64]int64, len(rows))
-	seq := last + 1 // 标记行占一个 seq
-	for _, x := range rows {
+	newOfOld := make(map[int64]int64, len(kept))
+	seq := int64(1) // 标记行占一个 seq
+	for _, x := range kept {
 		seq++
 		newOfOld[x.Seq] = seq
 	}
@@ -458,25 +569,18 @@ func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
 	// 摘要的 covers_up_to 必定 ≤ 它自己的 seq（摘要只覆盖排在它之前的行），
 	// 因此被复制的摘要总能找到对应行。
 	remap := func(oldCover int64) int64 {
-		var out int64
-		for _, x := range rows {
+		var outSeq int64
+		for _, x := range kept {
 			if x.Seq > oldCover {
 				break
 			}
 			if n, ok := newOfOld[x.Seq]; ok {
-				out = n
+				outSeq = n
 			}
 		}
-		return out
+		return outSeq
 	}
-
-	mark, _ := json.Marshal(inheritMark{Parent: parentID, Count: len(rows)})
-	if err := a.Store.AppendRow(childID, &StoredMessage{
-		Message: TextMessage("user", string(mark)), Kind: inheritKind, CreatedAt: now(),
-	}); err != nil {
-		return 0, err
-	}
-	for _, x := range rows {
+	for _, x := range kept {
 		cp := &StoredMessage{
 			Message:    x.Message,
 			Kind:       x.Kind,
@@ -490,17 +594,13 @@ func (a *App) copyInheritedContext(parentID, childID string) (int, error) {
 		if x.Kind == "summary" {
 			cp.CoversUpTo = remap(x.CoversUpTo)
 		}
-		if err := a.Store.AppendRow(childID, cp); err != nil {
-			return 0, err
-		}
+		out = append(out, cp)
 	}
-	// 上传登记也随上下文继承（uid 原样保留）：继承来的注记里若引用了
-	// u 编号，子会话里的 deliver_result（upload 参数）仍能解析到原件路径。失败只记日志。
-	if err := a.Store.CopyUploadsOnBranch(parentID, childID); err != nil {
-		log.Printf("[上传] 继承 %s → %s 复制上传登记失败（子对话交付目标将不可解析）: %v", parentID, childID, err)
-	}
-	return len(rows), nil
+	return out, nil
 }
+
+// （上传登记现在由 Store.CreateWithRows 与历史行同事务写入，见 sessioncreate.go；
+// 旧的 copyInheritedUploads 已撤除——建完会话再补写会撞上并发删除、留下孤儿登记。）
 
 // estimateTokens 粗估一组消息的 token 量（中文为主的启发式）。
 func estimateTokens(msgs []Message) int {
@@ -579,8 +679,8 @@ func (a *App) contextStats(sess *SessionMeta) ctxStats {
 		for _, s := range summaries {
 			add("摘要", TextMessage("user", s.Text()))
 		}
-		prevEnv := ""   // 与 buildContext 同一套环境快照渲染口径（首条整份、后续差分）
-		envUpdates := 0 // 与 buildContext 同一差分计数口径（自愈全量）
+		prevEnv := ""     // 与 buildContext 同一套环境快照渲染口径（首条整份、后续差分）
+		envUpdates := 0   // 与 buildContext 同一差分计数口径（自愈全量）
 		foldSeen := false // 与 buildContext 同一折叠边界口径：交界处注入提示标签
 		for _, m := range raw {
 			if m.Seq <= boundary || m.Kind == "summary" || m.Kind == "prompt" || m.Kind == inheritKind || m.Kind == "request" || m.Kind == "audit" {
@@ -678,7 +778,7 @@ func (a *App) contextStats(sess *SessionMeta) ctxStats {
 
 // 规则压缩不随轮次自动跑（每轮改写历史前缀会持续打断 KV 缓存），只在两种
 // 时机执行：上下文估算达到阈值时（maybeAutoCompact）与手动压缩时
-//（handleCompact 的 upTo）。折叠语义分两级（见 compactRound）：一级保留用户
+// （handleCompact 的 upTo）。折叠语义分两级（见 compactRound）：一级保留用户
 // 输入与正文、调用名+参数（write/edit 写入类参数全文保留不截断，见
 // compactKeepArgs），丢弃思考/工具结果/环境快照，可反复叠加（每次只折
 // 新轮）；二级只留用户输入与模型最终输出，仅在压缩范围内已没有新轮可折时才
@@ -706,13 +806,14 @@ func visibleSize(m *StoredMessage) int {
 
 // keepStartSeq 按保留预算（KeepChars，字）算保留区的起点 seq：从最新一条往前
 // 累计模型可见字数，预算耗尽处（命中点）所在的轮**整轮保留**——起点扩到该轮
-// 的起始行。轮首不必是用户亲发的消息：数字助理转发消息（report/aiuser）同权
-// 开轮（见 splitRounds），主对话里大部分回合由转发消息开启，同样能作为保留区
-// 的边界——否则按用户消息数轮会把几十个回合算成一个超长轮，窗口形同虚设。
-// 巨轮例外：命中轮自身就超预算（单轮由几十次工具调用拼成时一轮可达百万字，
-// 整轮保等于压缩失效）时回退行级窗口——只折巨轮的前半段，保留最近一段原文；
-// 起点落在工具结果上时往前扩到该步的助手调用行，避免拆散调用/结果配对
-//（宁可略超预算，也不让窗口从一个孤立的 tool 结果开始）。
+// 的起始行，压缩边界永远落在轮与轮之间，绝不从一轮中间切（用户口径：命中点
+// 所在的那一整轮不进行压缩）。轮首不必是用户亲发的消息：数字助理转发消息
+// （report/aiuser）同权开轮（见 splitRounds），主对话里大部分回合由转发消息
+// 开启——早年轮次不认派发消息，几十个回合被算成一个超长轮，才有过「巨轮回退
+// 行级窗口」的例外；那个例外已砍掉（它会把一轮切成两半，压缩边界落在轮中间，
+// 实测普通任务轮也被判成巨轮）。正常任务轮不会超长；真遇到按预算压不动的
+// 超长轮，由溢出兜底（overflowCompact 按轮强压）处理——那是撞模型窗口的最后
+// 防线，不走这条预算路径。
 func (a *App) keepStartSeq(raw []*StoredMessage) int64 {
 	// 用户语义：保留预算 0 = 什么都不保留——连最后一轮也压（返回最后一条
 	// seq+1，让调用方的「折到保留起点-1」覆盖全部行）。与「命中轮整轮保留」
@@ -723,56 +824,37 @@ func (a *App) keepStartSeq(raw []*StoredMessage) int64 {
 		}
 		return raw[len(raw)-1].Seq + 1
 	}
-	idx := -1
 	total := 0
 	for i := len(raw) - 1; i >= 0; i-- {
-		s := visibleSize(raw[i])
-		if total+s > a.Cfg.KeepChars && idx >= 0 {
-			// 命中点：这一行装不下了。它所在的轮不超预算就整轮保留
-			if start, ok := a.hitRoundStart(raw, i); ok {
-				return start
-			}
-			break // 巨轮：回退行级窗口
+		total += visibleSize(raw[i])
+		if total > a.Cfg.KeepChars {
+			// 命中点：这一行装不下了——它所在的轮整轮保留（含本轮内更早的行）
+			return a.roundStartOf(raw, raw[i].Seq)
 		}
-		total += s
-		idx = i
 	}
-	if idx < 0 {
-		return 0
+	// 全部装得下：保留区从第一条起（不压缩）。调用方按「start <= 1 即无可压」
+	// 判断，返回首条 seq 与 0 等价，这里取可读性更好的首条 seq
+	if len(raw) > 0 {
+		return raw[0].Seq
 	}
-	// 不把窗口起点落在工具结果上：往前扩到调用行（同一 step 一起保留）
-	for idx > 0 && raw[idx].Role == "tool" {
-		idx--
-	}
-	return raw[idx].Seq
+	return 0
 }
 
-// hitRoundStart 返回 raw[i] 所在轮的起始 seq；该轮自身的可见字数超预算（巨轮，
-// 整轮保等于压缩失效）时 ok=false，调用方回退行级窗口。命中行总有尺寸、必在
-// 某轮内（零尺寸的归档行 summary/prompt/request/audit/inherit 不会成为命中行）。
-func (a *App) hitRoundStart(raw []*StoredMessage, i int) (int64, bool) {
-	seq := raw[i].Seq
+// roundStartOf 返回 seq 所在轮（见 splitRounds）的起始 seq。整轮保留是硬口径：
+// 压缩边界只在轮与轮之间，与这一轮多大无关。找不到所属轮时返回该行自身
+// （防御：正常不会走到——每行都归属于某个轮）。
+func (a *App) roundStartOf(raw []*StoredMessage, seq int64) int64 {
 	for _, r := range splitRounds(raw) {
-		if seq < r.startSeq || seq > r.endSeq {
-			continue
+		if seq >= r.startSeq && seq <= r.endSeq {
+			return r.startSeq
 		}
-		size := 0
-		for _, m := range raw {
-			if m.Seq >= r.startSeq && m.Seq <= r.endSeq {
-				size += visibleSize(m)
-			}
-		}
-		if size > a.Cfg.KeepChars {
-			return 0, false
-		}
-		return r.startSeq, true
 	}
-	return 0, false
+	return seq
 }
 
 // ruleCompactAuto 阈值触发/溢出兜底的自动入口：把保留窗口之外、尚未折叠的
 // 行折叠掉。keep<0 表示自动触发——按 KeepChars 字数预算保留最近的完整轮
-//（命中轮整轮保留，见 keepStartSeq；巨轮回退行级窗口）；keep=0 表示全部
+// （命中轮整轮保留、边界只在轮之间，见 keepStartSeq）；keep=0 表示全部
 // 折叠（溢出兜底）；keep>0 表示只留最近 keep 轮（溢出兜底的两级：先只留 1 轮，
 // 再全部折叠）。返回折叠的行数（0 = 没有可折叠的）。
 func (a *App) ruleCompactAuto(sess *SessionMeta, keep int) int {
@@ -848,8 +930,9 @@ func (a *App) ruleCompactTo(sess *SessionMeta, upTo int64) (int, error) {
 // 返回本次实际变化的轮数（新折轮数或升级轮数；0 = 无变化，重复点击报错用）。
 // 已折叠边界 = 带任意 compact 标记的行（含 omit 的工具结果与环境快照）的最大
 // seq——compactRound 对每轮至少标一行（用户输入也标），边界因此总能推进。
-// 升级二级要求整轮都在边界之内（r.endSeq ≤ 边界）：巨轮被行级折叠截过半时，
-// 只折了前半、后半还是原文，这种半折轮不能升级。
+// 升级二级要求整轮都在边界之内（r.endSeq ≤ 边界）：边界只在轮之间，整轮要么
+// 全在折叠区、要么全在保留区，这个条件正常恒成立——保留它作防御：旧库历史里
+// 可能留有早前行级回退口径切开的半轮，半折轮不能升级。
 func (a *App) foldRounds(sess *SessionMeta, raw []*StoredMessage, rounds []round, endSeq int64) int {
 	ruleSeq := int64(0)
 	for _, m := range raw {
@@ -913,11 +996,11 @@ func (a *App) foldRounds(sess *SessionMeta, raw []*StoredMessage, rounds []round
 }
 
 // foldUpTo 行级折叠：把 endSeq 及更早、尚未折叠的行按一级规则折叠掉（自动预算
-// 压缩用）。endSeq 由 keepStartSeq 决定：命中轮不超预算时边界对齐到轮首，这里
-// 折的实际是整轮整轮的历史；命中轮是巨轮时边界落在轮中间——只折它的前半段也能
-// 立刻把上下文降下来，最近约 KeepChars 字原文原样留给模型。
+// 压缩用）。endSeq 由 keepStartSeq 决定，边界永远对齐到命中轮的轮首-1——这里
+// 折的就是整轮整轮的历史，绝不从一轮中间切（命中轮整轮保留）。行级只是折叠
+// 的实施粒度（逐行 compactOne），不是边界口径。
 // 与 foldRounds 的差别只在粒度：行级更细，所以这里不做轮级那套「二级升级」
-//（也避免每次自动压缩改写旧折叠行、持续打断 KV 缓存）；反复触发仍压不动时由
+// （也避免每次自动压缩改写旧折叠行、持续打断 KV 缓存）；反复触发仍压不动时由
 // overflowCompact 的按轮全折兜底。
 // 返回新折叠的行数（0 = 没有可折叠的）。
 func (a *App) foldUpTo(sess *SessionMeta, raw []*StoredMessage, endSeq int64) int {
@@ -1122,7 +1205,7 @@ func outFail(s string) bool {
 
 // clipOutLines 输出三段式：先逐行做超长兜底（单行巨块如无换明输出/minified
 // JSON：行内 >300 字裁为首 150 + 标注 + 尾 50），再按行数三段裁切——头 2 行 +
-//（中间已裁 N 行 · 全文取 seq）+ 尾 6/10 行。
+// （中间已裁 N 行 · 全文取 seq）+ 尾 6/10 行。
 func clipOutLines(text string, fail bool, seq int64) string {
 	text = strings.TrimRight(text, "\r\n \t")
 	if text == "" {
@@ -1481,26 +1564,50 @@ func (a *App) resendEnvAfterCompact(sess *SessionMeta) {
 
 // ---------- 模型摘要压缩 ----------
 
-const summarizeInstruction = `请把下面这段对话历史压缩成一份结构化中文摘要，供同一对话的后续轮次作为上下文使用。
-要求：
-1. 输出以下小节（没有内容的写「无」）：主要请求与意图 / 关键概念与决定 / 涉及的文件与改动 / 错误与修复 / 未完成事项 / 当前进行中的工作 / 下一步。
-2. 保留精确的路径、命令、错误信息、数字与名称，不得改写。
-3. 只输出摘要本身，不要评论、不要提及压缩这件事。`
+// summarizeSections 通用会话的摘要小节要求（压缩指令的中段，2026-11-11 按
+// 六节拍板）。设计取舍：
+//   - 不设「下一步」节——保留窗口内的最近对话原文随请求原样保留，「接下来
+//     做什么」就活在原文里，摘要里再写一份只会过时（用户明确要求去掉）；
+//   - 「用户指令与约束摘录」独立成节且安全条款逐字保留（Claude Code 实践）：
+//     「不许做 XX」类禁令被压缩掉后模型可能再犯，原话引用保真；
+//   - 「关键决定」跨压缩保留（Codex/Cortex 实践）：合并旧摘要时仍成立的
+//     决定必须原样带入，防多代压缩后早期决策漂移；
+//   - 踩坑与成功经验单独点名：压缩最有长期价值的部分（用户口径：错误与
+//     教训 = 踩过的坑 + 验证过的成功做法）。
+const summarizeSections = `要求：
+1. 输出以下小节（没有内容的写「无」，不得删节）：已完成的任务与意图 / 关键决定 / 文件与改动 / 错误与教训 / 用户指令与约束摘录 / 进行中与未完成。
+2. 「已完成的任务与意图」写用户原始与演进的目标里已经落地的部分，关键表述逐字引用。
+3. 「关键决定」写方案与架构取舍及其理由——这些是跨压缩保留的核心：如果上面附有先前的自动摘要，仍成立的决定必须原样带入新摘要。
+4. 「文件与改动」写精确路径、为何重要、关键改动，代码片段只在必要时引用。
+5. 「错误与教训」重点写踩过的坑（失败的尝试及其原因、正确做法）与验证过的成功经验（哪个方案有效、关键参数与命令）。
+6. 「用户指令与约束摘录」逐条摘录用户的关键原话，含纠正与变更的意图；「不许做 XX」类约束与安全要求（敏感文件、禁做操作、凭据规则）必须逐字保留。
+7. 「进行中与未完成」写正在做什么与明确待办。摘要区间之后的最近对话原文会原样保留，不要在摘要中预告或规划下一步。
+8. 保留精确的路径、命令、错误信息、数字与名称，不得改写。
+9. 只输出摘要本身，不要评论、不要提及压缩这件事。`
 
 // doSummarize 把 [最后摘要边界, 压缩终点] 的区间压成一条摘要。
 // origin=auto 时合并旧自动摘要（DSH 式单一检查点）；origin=manual 时独立叠加、永不重压。
 // upTo>0（手动按钮）时压缩终点=upTo 所在轮（含），之后的轮保持原文；
 // 否则按保留窗口从尾部倒数——keepTail<0 表示自动触发，与规则压缩共用同一
-// 字数预算（keepStartSeq，行级不按轮）；keepTail=0 表示摘要覆盖全部历史（最近
-// 一轮自身超预算时兜底用到）；溢出兜底显式传 1（只留最近一轮）。
-func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo int64) (string, error) {
-	raw, err := a.Store.RawMessagesAll(sess.ID)
-	if err != nil {
-		return "", err
+// 字数预算（keepStartSeq：命中轮整轮保留，边界只在轮之间，绝不切轮）；
+// keepTail=0 表示摘要覆盖全部历史（溢出兜底用到）；溢出兜底显式传 1（只留最近一轮）。
+// summarizePlan 从原始历史算出本次模型摘要的覆盖终点：upTo 定位按钮所在轮，
+// keepTail 决定保留窗口（见 doSummarize 各分支）。抽成独立函数供两处使用：
+// doSummarize 本体，与手动压缩入口在把模型调用放去后台**之前**的同步校验
+// （点错位置、该区间已压过，立即把错误报给前端，不等后台模型调用失败才发现）。
+// summarizable 判断一行是否进入摘要的待压缩视图（doSummarize 的渲染过滤与
+// summarizePlan 的区间有效性判定共用同一口径：元数据行不参与渲染，也不算进
+// 压缩区间的有效内容）。
+func summarizable(m *StoredMessage) bool {
+	switch m.Kind {
+	case "summary", "env", "prompt", inheritKind, "request", "audit":
+		return false
 	}
+	return true
+}
+
+func (a *App) summarizePlan(raw []*StoredMessage, keepTail int, upTo int64) (segEnd, boundary int64, prevAuto *StoredMessage, err error) {
 	summaries := activeSummaries(raw)
-	boundary := int64(0)
-	var prevAuto *StoredMessage
 	for _, s := range summaries {
 		if s.CoversUpTo > boundary {
 			boundary = s.CoversUpTo
@@ -1510,7 +1617,6 @@ func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo i
 		}
 	}
 	rounds := splitRounds(raw)
-	var segEnd int64
 	switch {
 	case upTo > 0:
 		for _, r := range rounds {
@@ -1528,11 +1634,11 @@ func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo i
 			}
 		}
 		if segEnd == 0 {
-			return "", fmt.Errorf("第 %d 条之前没有可压缩的回合", upTo)
+			return 0, 0, nil, fmt.Errorf("第 %d 条之前没有可压缩的回合", upTo)
 		}
 	case keepTail < 0:
 		// 自动触发：与规则压缩同一口径——按 KeepChars 预算保留最近的完整轮
-		//（命中轮整轮保留，巨轮回退行级窗口），摘要覆盖到保留区起点之前那一条
+		//（命中轮整轮保留，边界只在轮之间），摘要覆盖到保留区起点之前那一条
 		if st := a.keepStartSeq(raw); st > 1 {
 			segEnd = st - 1
 		}
@@ -1545,29 +1651,45 @@ func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo i
 		segEnd = rounds[len(rounds)-keepTail].startSeq - 1
 	}
 	if segEnd <= boundary {
-		return "", fmt.Errorf("没有可压缩的区间（该范围之前的内容已压缩过）")
+		return 0, 0, nil, fmt.Errorf("没有可压缩的区间（该范围之前的内容已压缩过）")
 	}
-	var b strings.Builder
-	if origin == "auto" && prevAuto != nil {
-		b.WriteString("【先前的自动摘要（请合并进新摘要，保留仍成立的事实、丢弃过时的）】\n" + prevAuto.Text() + "\n\n")
-	}
-	b.WriteString("【待压缩的对话历史】\n")
+	// 轮的 endSeq 会把摘要/审计等元数据行并进轮尾（splitRounds 只按用户行
+	// 分轮）：真实对话内容已全部压过、区间里只剩元数据行时（典型：摘要行
+	// 落库后重复点同一位置，末轮 endSeq 被它自己撑大了一号），按「已压过」
+	// 报错——否则会再发起一次模型调用、落一条空的重复摘要。
+	content := 0
 	for _, m := range raw {
-		if m.Seq <= boundary || m.Seq > segEnd || m.Kind == "summary" || m.Kind == "env" || m.Kind == "prompt" || m.Kind == inheritKind || m.Kind == "request" || m.Kind == "audit" {
-			continue
+		if m.Seq > boundary && m.Seq <= segEnd && summarizable(m) {
+			content++
 		}
-		role := map[string]string{"user": "用户", "assistant": "助手", "tool": "工具结果"}[m.Role]
-		if role == "" {
-			role = m.Role
-		}
-		text := m.Text()
-		for _, tc := range m.ToolCalls {
-			text += "\n[调用 " + tc.Function.Name + " " + clipText(tc.Function.Arguments, argKeepLimit) + "]"
-		}
-		b.WriteString(fmt.Sprintf("%s：%s\n", role, clipText(strings.TrimSpace(text), 4000)))
 	}
+	if content == 0 {
+		return 0, 0, nil, fmt.Errorf("没有可压缩的区间（该范围之前的内容已压缩过）")
+	}
+	return segEnd, boundary, prevAuto, nil
+}
 
-	summary, err := a.ctxEngine().CallSummarizer(sess, summarizeInstructionFor(sess)+"\n\n"+b.String())
+func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo int64) (string, error) {
+	raw, err := a.Store.RawMessagesAll(sess.ID)
+	if err != nil {
+		return "", err
+	}
+	segEnd, boundary, prevAuto, err := a.summarizePlan(raw, keepTail, upTo)
+	if err != nil {
+		return "", err
+	}
+	// 摘要请求 = 与主循环同源的消息序列（截止到压缩终点）+ 尾部一条压缩指令。
+	// 系统提示词、工具目录、历史（含差分环境快照、时间提示词、折叠视图）与
+	// 主循环请求逐字节同源，前缀缓存直接命中整段已有内容——首次压缩命中
+	// 整个压缩区间，模型只需要为尾部的指令付增量 token。旧做法把区间渲染成
+	// 一段「用户：…/助手：…」转述文本另起炉灶全量重发：零命中、慢、且模型
+	// 读的是二手转写而非原生对话格式。
+	sys, _, tools := a.ctxEngine().materials(sess)
+	msgs := a.buildContextUpTo(sess, sys, segEnd)
+	msgs = inlineImagesForRequest(a, msgs, a.resolveTarget(sess))
+	msgs = append(msgs, TextMessage("user", a.summarizeDirective(sess, origin, boundary, segEnd, prevAuto)))
+
+	summary, err := a.ctxEngine().CallSummarizer(sess, msgs, toolDefsOf(tools))
 	if err != nil {
 		return "", err
 	}
@@ -1578,10 +1700,32 @@ func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo i
 	if origin == "auto" {
 		label = "自动"
 	}
-	content := fmt.Sprintf("【%s历史摘要（覆盖至第 %d 条，原文可用历史查询工具读取）】\n%s", label, segEnd, summary)
+	// 覆盖区间（增量式标注，2026-11-11 用户要求）：本次压的是 (boundary, segEnd]
+	// 这一段——seq 即数据库行号，写进摘要文本头与结构化字段，未来按区间检索
+	// 原文直接可用。auto 合并存**累计起点**（合并链头部：首压时 boundary+1，
+	// 之后继承 prevAuto 的累计起点；旧数据无起点字段时按 1=对话开始兜底）；
+	// manual 叠加天然增量，本次区间即全部覆盖。
+	coversFrom := boundary + 1
+	if origin == "auto" {
+		switch {
+		case prevAuto != nil && prevAuto.CoversFrom > 0:
+			coversFrom = prevAuto.CoversFrom
+		case prevAuto != nil:
+			coversFrom = 1
+		}
+	}
+	rangeNote := fmt.Sprintf("本次压缩第 %d 至 %d 条", boundary+1, segEnd)
+	if origin == "auto" && coversFrom != boundary+1 {
+		rangeNote += fmt.Sprintf("，合并先前摘要后累计覆盖第 %d 至 %d 条", coversFrom, segEnd)
+	}
+	// 落库正文头（DSH checkpoint preamble 同款作用）：既标记这是压缩检查点
+	//（含可检索的覆盖区间），也给模型行为指令——当作既定背景、直接从后续
+	// 原文继续，防止压缩后模型复述/确认摘要浪费一整个回合
+	content := fmt.Sprintf("【%s历史摘要（%s，原文可用历史查询工具按区间读取）——以下是既定背景，直接基于后续原文继续工作，不要复述或确认本摘要】\n%s",
+		label, rangeNote, summary)
 	_ = a.Store.AppendRow(sess.ID, &StoredMessage{
 		Message: TextMessage("system", content), Kind: kindSummary, // 上下文材料，非用户发言；发送时现场构造 user 视图
-		Origin: origin, CoversUpTo: segEnd, CreatedAt: now(),
+		Origin: origin, CoversUpTo: segEnd, CoversFrom: coversFrom, CreatedAt: now(),
 	})
 	// 通知前端：摘要行已落库，对话区在覆盖边界处翻新压缩卡片（reason=compact
 	// 同时作废前缀缓存——摘要行 append 在会话末尾、不改末条 seq，前缀复用
@@ -1592,30 +1736,55 @@ func (a *App) doSummarize(sess *SessionMeta, origin string, keepTail int, upTo i
 	return summary, nil
 }
 
-// summarizeInstructionAssistant 是数字助理主对话（mode=assistant）专属的摘要
-// 指令。设计意图（为什么要有这一份）：其他会话是一次任务一个对话，压掉过程
-// 细节无妨，按模型自己的压缩习惯就好；数字助理主对话不同——它是用户与常驻
-// 助理的长期对话，跨任务、跨天数，历史里沉淀着用户的偏好、习惯与定下的约定，
-// 这些一旦被摘要压掉，助理就「不认识这个用户」了。所以它的摘要侧重点要
-// 先记人再记事：小节里专门加了「用户偏好与习惯」「长期有效的约定」两栏，
-// 其余小节与其他会话一致。
-const summarizeInstructionAssistant = `请把「数字助理主对话」的这段历史压缩成一份结构化中文摘要，供同一对话的后续轮次作为上下文使用。这是用户与常驻数字助理的长期对话，跨任务、跨天数——摘要首先要让助理"还认识这个用户、还记得这些事"。
-要求：
-1. 输出以下小节（没有内容的写「无」）：用户偏好与习惯 / 长期有效的约定 / 任务与结果 / 关键事实与决定 / 涉及的文件与改动 / 错误与教训 / 进行中与未完成 / 下一步。
+// summarizeSectionsAssistant 是数字助理主对话（mode=assistant）专属的摘要
+// 小节要求。设计意图（为什么要有这一份）：其他会话是一次任务一个对话，压掉
+// 过程细节无妨，按模型自己的压缩习惯就好；数字助理主对话不同——它是用户
+// 与常驻助理的长期对话，跨任务、跨天数，历史里沉淀着用户的偏好、习惯与
+// 定下的约定，这些一旦被摘要压掉，助理就「不认识这个用户」了。所以它的
+// 摘要侧重点要先记人再记事：「用户偏好与习惯」「长期有效的约定」两节置顶
+// （后者即通用版「用户指令与约束摘录」的长期形态，不再重复设节），其余
+// 小节与通用版 summarizeSections 同构（含关键决定跨压缩保留、踩坑与成功
+// 经验点名、无「下一步」节——保留窗口原文盖住最近动向）。
+const summarizeSectionsAssistant = `要求：
+1. 输出以下小节（没有内容的写「无」，不得删节）：用户偏好与习惯 / 长期有效的约定 / 已完成的任务与结果 / 关键决定 / 涉及的文件与改动 / 错误与教训 / 进行中与未完成。
 2. 「用户偏好与习惯」写：称呼与身份、沟通偏好（详略/语言/格式）、常用工具与工作流、常用路径/设备/软件线索、明确表达过的喜欢与不喜欢。
 3. 「长期有效的约定」逐条保留用户定下的做事方式、禁忌与必须遵守的口径，保留原意、不概括掉。
-4. 只输出摘要本身，不要评论、不要提及压缩这件事。`
+4. 「已完成的任务与结果」写跨任务已完成的事与结果，关键表述逐字引用。
+5. 「关键决定」写方案取舍及其理由——跨压缩保留：上面附有先前的自动摘要时，仍成立的决定必须原样带入新摘要。
+6. 「涉及过的文件与改动」写精确路径、为何重要、关键改动。
+7. 「错误与教训」重点写踩过的坑（失败的尝试及其原因、正确做法）与验证过的成功经验（哪个方案有效、关键参数与命令）。
+8. 「进行中与未完成」写正在做什么与明确待办。摘要区间之后的最近对话原文会原样保留，不要在摘要中预告或规划下一步。
+9. 保留精确的路径、命令、错误信息、数字与名称，不得改写。
+10. 只输出摘要本身，不要评论、不要提及压缩这件事。
+这是用户与常驻数字助理的长期对话，跨任务、跨天数——摘要首先要让助理"还认识这个用户、还记得这些事"。`
 
-// summarizeInstructionFor 按会话模式选摘要指令——只是选「发给模型的提示词
-// 文字」，不改变压缩方式/路径/保留窗口（设置里的压缩模式照旧）：数字助理主
-// 对话用上面的专属指令，其余会话用通用指令 summarizeInstruction。自动摘要
-//（llm 模式）与手动压缩（消息级「压缩」按钮、设置页「压缩数字助理主对话」）
-// 的摘要调用都从这里取指令。
-func summarizeInstructionFor(sess *SessionMeta) string {
+// summarizeSectionsFor 按会话模式选摘要小节要求（指令中段）：数字助理主
+// 对话用上面的专属版，其余会话用通用版 summarizeSections。只选「发给模型
+// 的提示词文字」，不改变压缩方式/路径/保留窗口（设置里的压缩模式照旧）。
+func summarizeSectionsFor(sess *SessionMeta) string {
 	if sess != nil && sess.Mode == "assistant" {
-		return summarizeInstructionAssistant
+		return summarizeSectionsAssistant
 	}
-	return summarizeInstruction
+	return summarizeSections
+}
+
+// summarizeDirective 生成摘要请求尾部的压缩指令——整个请求里唯一的新内容
+// （前缀与主循环请求逐字节同源，见 doSummarize），所以任务说明、格式要求、
+// 禁工具令全部集中在这条消息里。任务说明用 seq 明确圈定压缩区间：模型看到
+// 的消息序列截止在 segEnd，「以上内容」就是待压缩区间，不存在转述歧义。
+func (a *App) summarizeDirective(sess *SessionMeta, origin string, boundary, segEnd int64, prevAuto *StoredMessage) string {
+	var b strings.Builder
+	if boundary > 0 {
+		fmt.Fprintf(&b, "【压缩任务】这是一次增量压缩：只总结第 %d 至 %d 条这段消息——即上一份压缩摘要（覆盖到第 %d 条）之后、到本条指令之前的全部内容。先前的摘要已涵盖更早的历史，不要重新总结它，只按「关键决定」的要求把仍成立的决定带入；本条指令之后没有别的消息。\n", boundary+1, segEnd, boundary)
+	} else {
+		fmt.Fprintf(&b, "【压缩任务】这是一次增量压缩：只总结第 1 至 %d 条这段消息——即从对话最开始、到本条指令之前的全部内容；本条指令之后没有别的消息。\n", segEnd)
+	}
+	if origin == "auto" && prevAuto != nil {
+		b.WriteString("\n【先前的自动摘要（请合并进新摘要，保留仍成立的事实、丢弃过时的）】\n" + prevAuto.Text() + "\n")
+	}
+	b.WriteString("\n" + summarizeSectionsFor(sess))
+	b.WriteString("\n\n这是一次性压缩任务：不允许调用任何工具。思考后直接输出摘要正文，不要输出其他任何内容。")
+	return b.String()
 }
 
 // callSummarizer 已并入上下文引擎（ContextEngine.CallSummarizer）：摘要调用
@@ -1627,7 +1796,7 @@ func summarizeInstructionFor(sess *SessionMeta) string {
 //     usage 真值差值，见 noteCompactUsage）。折出东西就交回调用方重查——
 //     压缩后增量归零，间隔天然节流，不需要冷却参数。
 //   - 估算 token ≥ 模型阈值（CompactLlmPct>0）→ 生成模型摘要兜底。规则关闭
-//    （0）、规则压不动（折无可折）、间隔未到，都自然落到这条通道——它是
+//     （0）、规则压不动（折无可折）、间隔未到，都自然落到这条通道——它是
 //     最后防线。
 //
 // 间隔与保留共用同一计量单位（CompactUnit：chars 默认 / tokens 真值），不

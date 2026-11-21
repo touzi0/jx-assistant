@@ -1,12 +1,17 @@
+# 全量行尾策略：入库规范化为 LF，检出也统一 LF（eol=lf，不依赖各机器
+# core.autocrlf 配置）；仅 .bat 强制 CRLF、Linux 发行物 LF、二进制组件原样。
+# gofmt / 多行编辑 / 文本工具不再被 CRLF 检出干扰。
+* text=auto eol=lf
 # 第三方 Python 包（内置组件/wmcppkg）保持安装原样（LF），不做行尾转换。
 # 不加这条：git 会把成千上万个 .py 全部转成 CRLF，产生海量警告、仓库变大，
 # 且每次 pip 重装都会出现整库虚假 diff。二进制（Cua 驱动）同理按原样存。
 内置组件/wmcppkg/** -text
 内置组件/cua-driver/** -text
-# 共享便携 Python 运行时与语音模型同理按原样存（本机 core.autocrlf=true，
-# 不加这条每次检出都会把 5000+ 个包文件改写成 CRLF，制造整库虚假 diff）
-技能/_runtime/** -text
-组件/voice/models/** -text
 # 批处理必须 CRLF：cmd 按 CRLF 语义解析行，裸 LF 会把命令拆行错乱
 # （powershell 拆出 'rshell'、'[失败]' 当命令执行）。检出时强制 CRLF。
 *.bat text eol=crlf
+# Linux 发行物必须 LF：install.sh 是 POSIX sh（CRLF 会让 dash/bash 直接语法错）、
+# systemd unit 与 README 同理按 LF 检出，避免 Windows autocrlf 污染。
+打包/linux/install.sh text eol=lf
+打包/linux/jx-assistant.service text eol=lf
+打包/linux/README-Linux.md text eol=lf

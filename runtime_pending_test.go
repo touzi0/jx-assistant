@@ -10,6 +10,7 @@ func newPendingTestApp() *App {
 	a.pendingSteer = map[string][]*PendingMsg{}
 	a.pendingQueue = map[string][]*PendingMsg{}
 	a.queuePaused = map[string]bool{}
+	a.pendVer = map[string]int64{}
 	a.subscribers = map[chan Event]bool{}
 	return a
 }

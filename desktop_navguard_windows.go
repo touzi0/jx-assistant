@@ -16,7 +16,8 @@ package main
 // 只挂 NavigationStarting（顶层导航的唯一入口），不接管 NewWindowRequested：
 // window.open 走 WebView2 默认弹窗、不顶主界面，本守卫目标之外的收益不值得
 // 再冒 vtbl 逆向风险（NWR args 布局与 NavigationStarting 不同，逐槽实证成本
-// 是整进程崩溃；右栏面板的 nwrArgsVtbl 潜伏错位问题另行修复）。
+// 是整进程崩溃；右栏面板的原生 NWR 处理器已于 2026-11-18 移除，改由文档创建
+// 脚本原地收敛——其 args vtbl 错位当日实测实锤为点 _blank 链接整进程闪退）。
 
 import (
 	"log"

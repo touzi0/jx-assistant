@@ -14,7 +14,7 @@
       （210 对单请求有 150s 上限，断开后 3s 重连；会话执行流的接回由应用既有
       「接回执行流」机制自动完成）
    4. FormData 上传自动改走 multipart 帧协议；window.JX_REMOTE 提供附件/下载的
-      blob 化助手（供 app-chat.js 的少量兜底调用）与小程序平台 iframe 代载
+      blob 化助手（供 app-chat.js 的少量兜底调用）与企业小程序 iframe 代载
       （loadSitesFrame，见文末——iframe 导航不经 fetch 劫持，须整体代载）
 
    加密：非安全上下文（http 网关）无 WebCrypto，内置纯 JS AES-256-GCM
@@ -304,10 +304,13 @@
 
   /* ---------- 隧道 fetch：白名单路径 → 加密中继，返回带流的 Response ---------- */
   // tunnelPath 走隧道的同源路径白名单：/api/ 常规接口；/sites（含 /sites-assets/）
-  // 与 /s/ 是小程序平台的页面/资源/数据——远程外壳形态由 loadSitesFrame 经隧道
-  // 代载并 hook 回本隧道（家侧白名单 remoteaccess.go 放行同一组前缀）。
+  // 与 /s/ 是企业小程序的页面/资源/数据——远程外壳形态由 loadSitesFrame 经隧道
+  // 代载并 hook 回本隧道（家侧白名单 remoteaccess.go 放行同一组前缀）；
+  // /attachments/ 是工具图片信封的附件库（app-chat.js toolRow 经
+  // JX_REMOTE.assetURL 在此取图 blob 化上屏），与家侧 relayPathAllowed 同口径。
   function tunnelPath(p) {
-    return p.indexOf('/api/') === 0 || p.indexOf('/sites') === 0 || p.indexOf('/s/') === 0;
+    return p.indexOf('/api/') === 0 || p.indexOf('/sites') === 0 || p.indexOf('/s/') === 0 ||
+      p.indexOf('/attachments/') === 0;
   }
   function tunnelFetch(input, init) {
     init = init || {};
@@ -747,7 +750,7 @@
     },
   };
 
-  /* ---------- 小程序平台（/sites）远程代载（2026-11-03） ----------
+  /* ---------- 企业小程序（/sites）远程代载（2026-11-03） ----------
      平台是 iframe 加载 '/sites'——浏览器导航不经过上面的 fetch 劫持，外壳形态
      下会打到网关源、打开网关（总服务器）自己的平台页（客户现场：本机正常、
      远程访问内容错）。改为：平台页 HTML 与 /sites-assets/* 资源经隧道密文拉回
@@ -813,14 +816,14 @@
         // 拼接用的闭合标签字面量必须拆成 '</scr' + 'ipt>'，否则内联脚本会在
         // 第一处闭合标签字面量被 HTML 解析器提前闭合，整段解析失败：fetch 劫持、
         // 隧道、组件加载、外壳自愈全部不存在，页面表面正常但所有 /api/ 打到网关源
-        // 404（服务离线 + 小程序平台加载失败，2026-11-04 手机端事故，已实测复现）。
+        // 404（服务离线 + 企业小程序加载失败，2026-11-04 手机端事故，已实测复现）。
         if (m && js) html = html.replace(m[0], '<scr' + 'ipt>\n' + js + '\n</scr' + 'ipt>');
         html = html.replace('<head>', '<head>\n<scr' + 'ipt>' + SITES_HOOK + '</scr' + 'ipt>');
         frame.src = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
       });
     }).catch(function (e) {
       frame.src = URL.createObjectURL(new Blob(
-        ['<meta charset="utf-8"><body style="font:14px/1.7 system-ui,sans-serif;padding:24px;color:#333">小程序平台加载失败（' + (e && e.message || e) + '）：请确认家端数字助理在线、市场服务器已配置。</body>'],
+        ['<meta charset="utf-8"><body style="font:14px/1.7 system-ui,sans-serif;padding:24px;color:#333">企业小程序加载失败（' + (e && e.message || e) + '）：请确认家端数字助理在线、市场服务器已配置。</body>'],
         { type: 'text/html' }));
     });
   };

@@ -3,22 +3,19 @@ config.json
 *.exe
 # jx-assistant.exe 是引擎编译产物，不再入库：发行走安装包，开发自行 go build
 !md-viewer/*.exe
-# 内置组件（Cua 驱动 / Windows-MCP 依赖）：与安装包同口径入库——「操作电脑」能力靠它，
-# 必须离线自包含、克隆即用（放在 *.exe 规则之后放行）
-!内置组件/**
 # 共享便携 Python 运行时入库（全部内置技能与语音组件共用，全新克隆零装配即用）：
-# 与软著版同口径——Python 本体与 site-packages 一起入库，克隆后跑「编译并启动」即可用，
-# 不再依赖 python.org/华为镜像 + PyPI 清华源那一路联网装配。
+# 放在 *.exe 规则之后放行运行时内全部文件（含 python.exe、Scripts\*.exe）
 !技能/_runtime/**
+# 共享运行时只放基线（内置技能/组件依赖），任务域依赖放各自工具目录——
+# 归属规范见 AGENT.md「运行时与依赖归属」。装错地方会直接出现在 git status，不做忽略遮丑。
+# bridge.go 运行期幂等维护的 run_python 工具桥（删了自动重建，属运行时状态非基线）
+技能/_runtime/**/site-packages/sitecustomize.py
+# 内置组件（Cua 驱动等外部二进制）：与运行时同口径入库——安装包必须离线自包含
+!内置组件/**
 技能/_runtime/**/__pycache__/
 技能/_runtime/**/*.pyc
+# pip 卸载半途的残渣目录（~ 包名-版本.dist-info），入库只会带来警告
 技能/_runtime/**/~*/
-# 语音识别 onnx 模型入库（X-ASR 中文流式 + silero VAD）：克隆即用，不再分头下载
-!组件/voice/models/**
-组件/voice/models/**/__pycache__/
-# GitHub 单文件 100MB 硬限制：X-ASR encoder（153MB）以 .onnx.partN 分片入库，
-# asr_worker.py 首次加载时拼回整体文件；整体文件本身不入库
-组件/voice/models/xasr/encoder-epoch-99-avg-1.int8.onnx
 *.exe~
 .zcode/
 node_modules/
@@ -43,11 +40,16 @@ android/app/debug.keystore
 android/runtime/*.tgz
 工作区/
 默认工作区/
+# 开发版（编译并启动开发版.bat）的隔离数据目录：开发配置/会话库/工作区/浏览器
+# profile 全在里面，含 API Key 等敏感字段，绝不入库
+开发环境/
 ppt合并/
 # 发布 APK 不入库（仓库惯例），android-poc 为早期 PoC（137MB 大头是 app/build，正式安卓工程在 android/）
 *.apk
 android-poc/
 技能/user/
+# 用户组件区（市场/发行渠道单个安装：可开关可删除，不进打包、不上 git、不热更新）
+组件/user/
 打包/清理清单.iss
 # 本地运行残留与构建/发布产物（不入库）：jx.db=实例运行数据库；*.exe.old/.new=静默更新换装接力残留
 jx.db
@@ -76,6 +78,8 @@ jx.db-shm
 jx.db-wal
 # 技能运行时状态戳与生成物：技能区版本（sk-…）/ 便携运行时版本（py3.…）/ comtypes 动态生成的包
 技能/.skills-version
+# 迁移账本（跟着技能目录走的一次性任务记账，属本机运行时状态；入 git/入包会让别处漏跑迁移）
+技能/.migrations.json
 技能/_runtime/.version
 技能/_runtime/**/comtypes/gen/
 # 技能草稿（会话中改造/试验中的技能副本，绝不入库；2026-10-30 用户明确要求）
@@ -83,6 +87,11 @@ jx.db-wal
 # 商业内部资料：政策申报文档与品牌设计源文件（2026-11-01 明确要求，绝不入库）
 政策申报/
 品牌素材/
+
+# Linux 发行包：源文件（install.sh/README/unit/打包脚本）入库，产物不入库
+打包/linux/*.tar.gz
+打包/linux/stage-linux/
+打包/linux/jx-assistant-linux-amd64
 
 # 语音输入法联动文件（运行期状态：热键/主题色，由主程序按当前设置生成）
 voicetype.json
@@ -97,3 +106,11 @@ voicetype.json
 组件/voice/voicetype/webview2-profile/
 组件/voice/voicetype/__pycache__/
 组件/voice/voicetype/models/
+
+# 组件开发实测产物（2026-11-13 充值组件端到端手册与截图，一次性输出不入库）
+/输出/
+
+# X-ASR 语音识别模型（encoder 153MB）：GitHub 单文件 100MB 硬限制，以
+# .onnx.partN 分片入库（asr_worker.py 首次加载时拼回整体文件）；拼回生成的
+# 整体文件不入库（本机运行期产物，别误提交）。
+组件/voice/models/xasr/encoder-epoch-99-avg-1.int8.onnx

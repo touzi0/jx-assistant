@@ -11,12 +11,14 @@
 //   - sync.go applyAnnounce 收到公告调 applyBrand（差异驱动）；
 //   - server.go 静态路由拦截 /logo.png：有本地缓存图优先服务，否则 embed 默认图；
 //   - GET /api/brand 供前端取文字（前端启动拉一次，brand 事件到达时刷新）；
+//   - GET /logo-default.png 关于页专用：只出内置默认图，永不跟随品牌；
 //   - 老服务端（公告无 brand 字段）不动本地现值。
 package main
 
 import (
 	"encoding/json"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -140,4 +142,20 @@ func (a *App) serveBrandLogo(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Cache-Control", "no-cache")
 	_, _ = w.Write(data)
 	return true
+}
+
+// handleDefaultLogo GET /logo-default.png：只返回内置默认 LOGO（embed 的
+// web/logo.png；-webdir 开发模式下即磁盘上的那张，与 /logo.png 的回退源同源），
+// 不看 data/brand/ 缓存。设置·关于页专用（2026-11-19 用户口径：关于页是软件
+// 自身的基础信息介绍，名称与 LOGO 都不随服务端品牌变化；/logo.png 的品牌
+// 换装行为保持原样，左上角/首页 hero 仍在用）。
+func (a *App) handleDefaultLogo(w http.ResponseWriter, r *http.Request) {
+	data, err := fs.ReadFile(a.static, "logo.png")
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
 }

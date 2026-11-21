@@ -17,8 +17,14 @@ go build -o jx-assistant.exe .
 go test -run TestXxx .             # 单测（只跑自己改动相关的，别全量——见「多 AI 并行开发」）
 ```
 
-首次使用：左下角「设置」中填入 API Key；`baseURL` 兼容 OpenAI chat-completions
-接口。`baseURL` 填 `mock` 可进入**离线演示模式**，无需 Key 即可体验完整链路。
+首次使用：**出厂不预置任何模型通道**（2026-11-13 用户口径：新装打开就该是彻底的
+空的，通道只来自公司接入或用户自己添加）——要么走「公司接入向导」（服务端
+`/provision` 下发通道），要么在 左下角「设置 · 模型」里添加提供方，填 API 地址 +
+Key；`baseURL` 兼容 OpenAI chat-completions 接口（渠道协议可选 Anthropic 原生 /
+OpenAI Responses，见「渠道协议」节）。地址填 `mock` 可进入**离线演示模式**，
+无需 Key 即可体验完整链路。旧版出厂会把 DeepSeek 官方地址 + `deepseek-chat`
+折成一个空 Key 通道挂在菜单里，`config.go` 的 `dropDefaultPlaceholderProvider`
+在加载时把这种出厂占位删掉（用户配过 Key / 改过地址 / 自己加过模型的通道不动）。
 
 ## 开发规矩（AI 开发前必读）
 
@@ -69,19 +75,9 @@ go test -run TestXxx .             # 单测（只跑自己改动相关的，别�
 指编译 + 实际效果，不要求自动化测试全过；只提交自己本次的文件，一次提交
 对应一件事。
 
-### 写代码前的 7 个问题
+### 写代码前的 7 个问题（在项目里的落法）
 
-思考一个新功能时，先问自己这 7 个问题，非常重要：
-
-1. Does this need to exist? → no: skip it (YAGNI)
-2. Already in this codebase? → reuse it, don't rewrite
-3. Stdlib does it? → use it
-4. Native platform feature? → use it
-5. Installed dependency? → use it
-6. One line? → one line
-7. Only then: the minimum that works
-
-放到本项目的语境里：
+7 个问题的中英对照见上文「核心工作原理」，此处不重复——直接落到本项目：
 
 - 动手新写之前，先搜一遍代码库：工具实现看 `tools.go` / `historytools.go`，
   上下文处理看 `context.go` / `contextengine.go`，扩展机制看 `components.go` /
@@ -93,6 +89,22 @@ go test -run TestXxx .             # 单测（只跑自己改动相关的，别�
   先自问前 3 条问不问得过去。
 - 前端是原生 JS、无框架、无构建链，这是有意的架构决策（软著全自主实现 +
   单文件交付）。"引入框架/打包器让代码好写一点"在本项目里默认是错误答案。
+
+### 运行时与依赖归属
+
+Python 依赖按「谁用谁带走」归位，禁止混装：
+
+1. **内置技能 / 内置组件依赖 → 共享运行时基线**（`技能/_runtime/python`，
+   随仓库分发）：pdf / ocr / office / com / 微信 / 语音组件等内置能力的依赖
+   （pdfplumber、rapidocr 全家、docx/pptx/openpyxl、pywin32/comtypes、
+   sherpa-onnx 等）。要加包走技能管理器（技能 manifest 声明）。
+2. **任务域专用依赖 → 该域自己的工具目录**：视频语音域在
+   `D:\智能体工作区\工作目录\video_tools\`（视频语音任务域专用工具目录，
+   ffmpeg / 模型 / venv311 自包含，faster-whisper、ctranslate2 与 GPU 的
+   CUDA 库全在此）。
+3. **用户技能依赖 → 跟技能自身走**（技能私有 deps），删技能连依赖一起删。
+4. **禁止直接往共享运行时 pip 装东西**——它服务全部内置技能，装错难回退；
+   任务域需求建独立工具目录 / venv。
 
 ### 开发流程：调研规划 → 执行 → 验证 → 提交
 
@@ -275,15 +287,22 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
   `-ldflags "-H=windowsgui -X main.desktopDefault=1"` 注入：GUI 子系统
   双击无 CMD 黑窗，无控制台时日志改落 data\desktop.log）用系统自带的
   WebView2
-  运行时开原生桌面窗口：标题「AI数字助理」（exe 文件名切换期：软件属性名/
-  窗口标题已是新名，文件名一周内仍为「坚祥数字助理GO.exe」，见
-  《exe名切换-AI数字助理-一周后操作清单.md》），窗口/任务栏图标取 exe
+  运行时开原生桌面窗口：标题「AI数字助理」（exe 文件名已于 2026-11-19 从
+  「坚祥数字助理GO.exe」切换为「AI数字助理.exe」：走静默更新的老机器由
+  程序内迁移 `20261119.exe-rename-ai-assistant`（exe_rename_windows.go）
+  在新版首次启动时补换名+迁移快捷方式/卸载项显示名；直接装新名安装包则由
+  iss 迁移段完成。入口不依赖安装形态：NewApp 每次启动后台跑
+  `ensureProductShortcuts`（同文件）自检自建桌面+开始菜单快捷方式——
+  2026-11-20 事故：迁移的入口脚本 CreateShortcut 文件名误用 exe 名（必须
+  .lnk 结尾，否则 COM 抛异常、错误被吞，安装目录机器被删旧建新失败后
+  什么都不剩），绿色目录机器则根本没有入口迁移；自愈对正式名 exe 幂等
+  补齐/修复，旧名死链入口顺手清，开发/隔离实例（env 闸门+exe 名）不碰
+  用户桌面），窗口/任务栏图标取 exe
   内嵌 LOGO 资源（`打包/make_icon.py` 由 web/logo.png 生成多尺寸 ico
   （打包/app.ico），go-winres 按 `go-winres.json` 嵌入为 RT_GROUP_ICON #1；
   `-browser` 参数可强制回浏览器形态）。
   开发期间想要桌面形态：`powershell -File 打包\开发桌面版.ps1` 在仓库根
-  产出 `坚祥数字助理GO.exe`（双击即窗口，数据照旧落仓库目录；切换期文件名
-  跟随当期发行名）。
+  产出 `AI数字助理.exe`（双击即窗口，数据照旧落仓库目录）。
 - 桌面模式行为：相对路径（config / data / 技能）锚到 exe 目录（开发目录
   有 go.mod 时不搬迁，避免扰动调试）；监听端口被占自动回退；命名互斥体
   单实例，二次启动唤起已有窗口；默认工作区不落在安装目录本身：改写为
@@ -313,9 +332,9 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
   ```sh
   winget install JRSoftware.InnoSetup      # 一次性装打包工具
   powershell -NoProfile -ExecutionPolicy Bypass -File 打包\打包安装包.ps1
-  # 产物：打包\输出\<exe基名>-安装包-<版本>.exe（当期基名默认 坚祥数字助理GO，
-  # 一周后切 AI数字助理：-ExeBaseName 参数或改脚本默认值，安装包.iss 经
-  # ISCC /D 自动跟随，且换名版自动清理旧名 exe/快捷方式）
+  # 产物：打包\输出\<exe基名>-安装包-<版本>.exe（基名默认 AI数字助理，
+  # 2026-11-19 完成换名；安装包.iss 经 ISCC /D 跟随，换名版自动清理旧名
+  # exe/快捷方式）
   ```
 
   安装到当前用户 `%LOCALAPPDATA%\Programs`（免管理员），中文向导、
@@ -339,16 +358,42 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
   卸载时 `/unregister` 还原（缺 exe 拒绝出包）。给打包脚本加新的暂存项时，
   同步更新本清单。
 
-  **发布到 Gitea**（远程 `origin`＝your-org/your-repo，工作分支 `go`）：tag/标题
+  **语音悬浮窗（独立输入法 `组件/voice/voicetype/`）的两条纪律**（2026-11-16）：
+  ① **本组件绝不注入 Alt**（`vtSendKeyEvent` 对 0xA4/0xA5/0x12 直接拒发），也
+  **绝不吞左 Alt**（`vtHookConsume` 对 `lalt` 一律放行、只当热键监听）——左 Alt
+  被按下过一次就可能因漏 up 卡住（键盘输入失灵、粘贴变成 Ctrl+Alt+V），用户要求
+  从根上不出现这个动作；② WebView2 建窗**不许上屏**（`go-webview2/webview.go`
+  补丁：WS_POPUP + 屏外 -32000 + SW_SHOWNOACTIVATE + 不 SetFocus），但窗口必须
+  仍然"显示"（只是屏外），否则 WebView2 合成表面不建立、胶囊以后一片空白。
+  细则与回归用例见 `组件/voice/voicetype/README.md`「纪律」一节。
+
+  **发布到 Gitea**（远程 `origin`＝admin/jxharness，工作分支 `go`）：tag/标题
   沿用「Vx.y.z（日期）桌面版」（v1.0.x 序号递增），说明按上一版格式写改动
   清单，安装包 exe 挂附件；API 用个人访问令牌，存
-  `C:\Users\54358\.gitea\jx-assistant.token`（网页 设置→应用 生成，权限
+  `C:\Users\54358\.gitea\jxharness.token`（网页 设置→应用 生成，权限
   write:repository），`curl -H "Authorization: token $(cat
-  ~/.gitea/jx-assistant.token)"` 调 `/api/v1/repos/your-org/your-repo/releases`
+  ~/.gitea/jxharness.token)"` 调 `/api/v1/repos/admin/jxharness/releases`
   （建发布 → `releases/{id}/assets?name=…` 传附件，文件名需 URL 编码）。
   `releases/latest` 是程序内更新检查的源，发布后线上客户端自动收到横幅。
   注意 git 推送凭据（凭据管理器的 OAuth）**不能**调 API——两套体系，别再
   临时登服务器开令牌。
+
+  **Linux 版发行与发版**（`打包/linux/`，2026-11-10 首版）：源文件入库的是
+  `install.sh`（POSIX sh，dash 兼容）、`README-Linux.md`、`jx-assistant.service`、
+  `打包-linux.ps1`；tar.gz 产物已 gitignore。出包在仓库根跑
+  `powershell -File 打包\linux\打包-linux.ps1`（交叉编译 linux/amd64 → 平铺打包
+  二进制+README+unit → 打印 sha256），产物 `jx-assistant-linux-amd64.tar.gz`
+  （约 18.6 MB）。**发版时必须把该 tar.gz 作为 Release 附件一并上传**——更新源是
+  jxai-server 的 `/updates/latest`（不是 Gitea：Gitea 仓库匿名不可见），附件经
+  `publish-update` 登记；⚠️ 当前 jxai-server 的 publish-update 只有
+  -engine/-component/-runtime/-skills/-installer 通道，**尚无通用附件参数**，
+  需在 jxaiserver 补 `-extra <文件>`（平铺进 files/ 并入 assets，不参与 blocks
+  快照语义）并部署后，发版命令才能带上 Linux 包。补齐前 Linux 用户用
+  `install.sh --file jx-assistant-linux-amd64.tar.gz` 离线装（脚本两条路都实测过）。
+  install.sh 从 `/updates/latest` 的 assets 里按文件名找 `jx-assistant-linux-amd64.tar.gz`，
+  服务端通道一补即自动可用，脚本无需改。Linux 版功能边界（无桌面壳/托盘/语音
+  输入法/DPAPI/静默自更新，升级=重跑 install.sh）见 `打包/linux/README-Linux.md`；
+  WSL 验证记录在同目录 `验证记录-*.md`。
 
   **安装期清理（防旧文件残留出错）**：升级安装对「随包分发」的目录**整目录
   先删后装**（`[InstallDelete]`）：`技能\_runtime`、内置技能、内置组件、
@@ -409,10 +454,11 @@ WebView2 内核渲染（浏览器组件已全部内嵌进 exe，整个程序就
 - 未装 WebView2 运行时自动降级用系统浏览器打开；详见 `md-viewer/使用说明.txt`。
 - **右栏也用同一套渲染**（`mdview.go`）：产品里的 md 不再显示原文，右栏打开
   的就是这份 `viewer-template.html`（`go:embed` 进 exe，灌标题/正文/副标题），
-  与独立窗口同一套 marked 与样式、同一个目录侧栏。所以改模板（样式、断点、
-  渲染行为）要改 `viewer-template.src.html` 再用 `node
-  md-viewer/tools/assemble-template.js` 重新生成 `viewer-template.html`——
-  两处（独立窗口与右栏）一次生效，别去右栏另写渲染器。
+  与独立窗口同一套 marked 与样式、同一个目录侧栏。模板里 marked 只有
+  `/*__MARKED__*/` 占位符：marked 本体全仓唯一一份在 `web/marked.lib.js`
+ （对话区 md() 渲染也用它），`mdview.go` 启动时注入主 exe、`md-viewer/build.ps1`
+  构建时注入独立查看器 exe。改模板（样式、断点、渲染行为）直接改
+  `viewer-template.html`——两处（独立窗口与右栏）一次生效，别去右栏另写渲染器。
 
 ## 权限与执行模型（移植 DSH 官方沙箱机制，本栈重写）
 
@@ -505,18 +551,35 @@ WebView2 内核渲染（浏览器组件已全部内嵌进 exe，整个程序就
   并经 `trap` 清理（历史版本曾按次泄漏 /tmp/jx-sbx-* 目录，已修复）。
 - **PS 5.1 编码注入（仅 PowerShell 5.1 路径）**：Windows PowerShell 5.1 的
   `$OutputEncoding` 默认 ASCII（PS→原生程序管道传中文丢字不可逆）、
-  `[Console]::OutputEncoding` 默认 OEM 代码页。三条命令构造点
+  `[Console]::OutputEncoding` 默认 OEM 代码页，且 **`Get-Content` /
+  `Select-String` / `Import-Csv` 读文件默认 ANSI(936)**——UTF-8 无 BOM 文件被
+  解成乱码，而乱码是合法 UTF-8 字符串，输出侧解码（`decodeCmdOutput` 的
+  GB18030 兜底）救不回来（2026-11-09 实际踩中）。三条命令构造点
   （`runUnconfinedLocal` / 沙箱 `buildShellCmdline` / 后台作业 `shellCmd`）
-  在解析为 PS 5.1（空 shell 缺省与显式 powershell）时统一前置
-  `try{$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{}; `
+  统一前置 `ps51Prologue(mode)`：UTF-8 模式设输出 UTF-8 + 三个
+  `$PSDefaultParameterValues[...]='utf8'`；**GBK 模式**（`sandboxRun.EncodingMode`）
+  设 `GetEncoding(936)` 输出 + 三个 `'Default'` 读面，输出成 GBK 字节正好被
+  `decodeCmdOutput` 接住。写面（`Out-File`/`Set-Content`）**故意不设默认值**：
+  5.1 的 `-Encoding utf8` 会写 BOM，落到 `.bat/.cmd/.ps1` 上就是命令失败。
   并注入 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`（`appendEnvUnique` 先摘后加，
-  环境块重复变量"先见为准"）。**cmd/pwsh/sh 分支与 Linux/安卓/SSH 远程零改动**
+  环境块重复变量"先见为准"）。
+  读面编码怎么定（`encoding.go`）：`detectEncodingMode` 从命令串里抓字面出现的
+  文件路径（`extractPathCandidates`）→ 读 64KB 头探测（BOM→严格 UTF-8→GBK/
+  GB18030 结构→UTF-16 启发→二进制）→ 全是 GB 族就整条切 GBK，混合按 UTF-8 并
+  给一句提示。**探测不到的（程序内部自己读文件）靠输出乱码检测兜底**：
+  `looksMojibake` 命中且 `isReadOnlyCommand` 且本地前台 → 换另一种编码
+  **重跑一次**，两次都脏如实报告；写/安装/提交/启服务/后台作业**绝不重跑**
+  （重跑=执行两遍），只附一句诊断。
+  **cmd/pwsh/sh 分支与 Linux/安卓/SSH 远程零改动**
   （pwsh 6+ 全平台默认 UTF-8；Linux 文件名是字节流、grep/sed 字节匹配，
-  locale 不影响中文；安卓 Termux 环境已有 LANG=en_US.UTF-8）。切回语义：
-  注入都是单条命令内可覆盖的机制，环境快照只写"引擎做了什么 + 怎么切回"
-  （`$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(936)`，
-  管出编码由 $OutputEncoding 决定，只改 [Console] 侧切不回去），不再写
-  "默认 XX"类陈述——模型自己知道默认，多余的默认描述只消耗注意力。
+  locale 不影响中文；安卓 Termux 环境已有 LANG=en_US.UTF-8）。
+- **write/edit/read 的编码语义**：`read` 探测解码后统一返回 UTF-8 文本（GBK/
+  UTF-16 不再显示成替换符），文末注记原编码；`write` 永远 UTF-8 无 BOM（覆盖
+  既有 GBK 文件会提示编码变化，想保留用 `edit`）；`edit` 按原编码解码匹配、
+  **按原编码写回**（GBK 仍 GBK、BOM 保留），原编码编不出的字符（emoji 写 GBK）
+  **直接报错、文件不动**，绝不静默替换成 `?`。入参永远是 Unicode 文本（JSON
+  字符串），因此只存在一次转换（Unicode↔原编码），不会出现"GBK 当 UTF-8 再
+  转 GBK"的叠加。
 - **write/edit 回读注记**：`snapshotWrite` 把写后回读（verified=真的从盘上/
   SFTP 读回来）交给工具成功文案拼注记（`readBackNote`）——write 带
   "回读一致，首行：<截 60 字符>"，edit 只报一致/不一致，不一致/多出 BOM
@@ -692,7 +755,8 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
   与从前一致。交付侧对应实现在 `deliver.go`（与门语义）：要搬运必须 `upload`
   （`findUpload` 认 uid / 原件路径 / 工作区副本路径）与 `filename` 成对显式
   提供，缺一在调用时立即报错；两者都不给＝只登记交付卡片不搬运（无自动反查）。
-  引用解析不到（浏览器、手机、粘贴上传登记不了原件路径，或编号写错）报可读
+  引用解析不到（浏览器、手机、Ctrl+V 原生粘贴登记不了原件路径——桌面壳右键
+  粘贴资源管理器复制的文件是路径型、能登记，或编号写错）报可读
   错误并列出可用编号，绝不猜一个目录去覆盖。
 - **输入框标记胶囊**（`app-chat.js` 的「输入框标记胶囊」节，HTML/CSS 在
   `index.html` 的 `composer-input-wrap` 与 `style.css`）：引用标记（“引用N”）与
@@ -736,11 +800,22 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
   **粘贴的剪贴板读取有平台分叉**：桌面壳里
   `navigator.clipboard.readText` 会永久挂起（WebView2 的剪贴板读权限停在
   prompt 且没有授权 UI，go-webview2 的 SetPermission 对它不生效——真机诊断
-  见 `gui-test/ctxmenu-clipboard-diag.mjs`），所以桌面壳直接读本机端点
-  `GET /api/clipboard`（`clipboard_windows.go` 读系统剪贴板：文本 +
-  截图常带的 PNG 注册格式，文本优先、PNG 入附件与 Ctrl+V 同口径；
-  剪贴板属敏感数据，loopbackOnly 仅回环可达）；网页模式 readText 行为正常
-  走标准 API。配套端点：`POST /api/open-url`（仅 http/https）、
+  见 `gui-test/ctxmenu-clipboard-diag.mjs`），`document.execCommand('paste')`
+  同样被拒（真机带用户激活实测一律返回 false 且不产生 paste 事件，判定见
+  `gui-test/ctxmenu-paste-diag.mjs`），所以右键「粘贴」读本机端点
+  `GET /api/clipboard`，返回 `{text, png, files}` 三样一次带全
+  （`clipboard_windows.go` 读系统剪贴板）：文本（CF_UNICODETEXT）、图片
+  （PNG 注册格式原样；没有时解 CF_DIBV5/CF_DIB 转 PNG，截图常只放 DIB）、
+  资源管理器复制的文件真实路径列表（CF_HDROP，DragQueryFileW）。前端
+  `pasteIntoTarget` 按 **Ctrl+V 的原生 paste 同口径分流：文件 > 图片 > 文本**
+  （真机对照证据同 diag 脚本）——文件是真实路径，走 `stagePaths`（与「文件
+  上传」选择框同一条路径型通路，登记原件路径，交付工具才能送回原处）；图片
+  无路径，转 File 走 `stageFiles`；纯文本 `execCommand('insertText')` 保撤销
+  栈；非对话输入框（设置页等）没有附件区，退回文本。四场景（单文件/多文件/
+  图片/纯文字）双链路一致性由 `gui-test/ctxmenu-paste-verify.mjs` 真机验收
+  （浏览器/手机模式不注册自定义菜单，右键走原生菜单本就全功能，
+  `ctxmenu-paste-webmode.mjs` 验证未被波及）；剪贴板属敏感数据，
+  loopbackOnly 仅回环可达。配套端点：`POST /api/open-url`（仅 http/https）、
   `POST /api/sessions/{id}/open-path|reveal-path` 与 delivery 的 open·reveal、
   `/api/browser/open-view`（预览）——全是**用户手势链路：一律直通**，无工作区
   校验、无确认弹窗（这些路由不在 call_api 目录里，AI 调不到；对用户自己的
@@ -765,7 +840,7 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
   完全访问），右列能力多选（允许工作区外执行命令 / 操作浏览器 / 操作电脑）。
   切到完全访问时三项能力联动勾选并置灰（不可单独关闭）。新建会话默认权限是
   修改工作区，因此**新建对话默认就勾着「操作浏览器」**（显式取消后不被覆盖；
-  从完全访问切回修改工作区时会自动补回）。**例外：数字经理主对话（新装机
+  从完全访问切回修改工作区时会自动补回）。**例外：长期助理主对话（新装机
   首启自动创建的 `mode=assistant` 会话）默认完全访问**——派发「只能同等或降权」，
   总控自己站最高档，派出去的任务才有完整档位空间（任务默认仍是修改工作区；
   见 `createSession` 的权限兜底）。已建主对话的权限存在会话库里，不追改。
@@ -800,9 +875,11 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
     三个动作是「修改（带反馈）/ 忽略计划 / 批准并开始执行」。
     **时间限制不一样**：普通提问与「进入计划模式」确认等 5 分钟（超时按「用户未回应」
     返回），**计划审批没有时限**——提交那一刻就落库，用户不处置它就一直在：哪怕关掉软件、
-    重启进程之后再打开，那张卡仍挂在对话里等审批（本轮被停止/中断也照样留着）。
-    「忽略计划」＝搁置：本轮对话就此停下（与点「停止」同一效果），计划本身不撤销，
-    之后随时能再批准或修改。
+    重启进程之后再打开，那张卡仍挂在对话里等审批。唯一主动作废的入口是**停止**：等待
+    审批的这轮被用户点「停止」（或数字助理代停）时，待审批计划随本轮一并作废（拒绝/
+    撤销语义，浮窗收起、不再挂回）——停止就是明确说「这轮不要了」。
+    「忽略计划」＝搁置：本轮对话就此停下，计划本身不撤销（与点「停止」的差别就在
+    这里——停止会把挂着的待审批一并作废），之后随时能再批准或修改。
   · **对话流里另有一条常显的计划卡**（条目类型 `plancard`，跟着提交它的那一轮、不折进
     过程段）：标题 + 首段 + 一行「点击这张卡看计划全文」，整张卡可点 → 打开右栏并**定位到
     这一份**（按提交序号）。审批卡批了 / 驳了 / 离场之后，它就是「再点开看这份计划」的
@@ -969,20 +1046,41 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
   （userstops.go）——后台作业优雅取消（与 job_kill 同路径）、前台子进程按进程树
   强杀（killSessionChildren 的单点版），停止后向该会话投【用户停止程序】report
   注记（不触发对话，AI 下轮自然看到「用户停止的，不是出错」）。
+  面板第三段「后台等待项」（`asyncask.go`）：挂出去等人的询问/审批/计划，每行
+  一句话摘要 + 已等时长，按钮是**「查看」**（不是停止）——点了把那条的卡弹到
+  输入框上方（与真实发起时同一张卡、同一个提交入口 `POST /api/questions/{id}`），
+  处理完这行自动消失。数据来自 `GET /api/sessions/{id}/progress` 的 `asks`。
 
 ## 子对话：上下文继承与一级限制
 
 子对话只有一级（无论 AI 派发还是人工新建，都不能再派发/再建子对话）；
 数字助理派发的工作任务是顶层会话，不占一级名额。
 
-- **人工新建＝分支克隆**：右栏「＋ 新建」建的子对话照抄父会话的模式、工作区、
-  远程配置、模型、权限与能力开关（因此**系统提示词、工具目录、历史全部一致**），
-  并把父会话消息逐行复制过去（含摘要与压缩标记，`covers_up_to` 按新 seq 重映射）
-  ——子会话下一次请求的前缀与父会话逐条相同，命中模型 KV 前缀缓存，成本很低。
-  计划/目标模式刻意重置，避免子对话替父会话自动续跑。老 `aux` 只读答疑会话原样保留。
-- **继承段折叠显示**：复制内容前有一条 `kind='inherit'` 标记行（组装上下文时跳过），
-  前端据此把整段历史折成一条「来自主对话 · N 条（含系统提示词）」折叠条，展开即
-  完整对话流；父对话的系统提示词快照行也在其中。
+- **人工新建＝分支克隆（2026-11-16 起只承接必要上下文）**：右栏「＋ 新建」建的
+  子对话照抄父会话的模式、工作区、远程配置、模型、权限与能力开关（因此**系统
+  提示词、工具目录一致**），上下文只承接「模型真正会收到的那一份」——生效的最后
+  一条压缩摘要 + 摘要覆盖边界之后的原文行（`kind='summary'` 与边界后
+  chat/aiuser/env/report），`covers_up_to` 按新 seq 重映射；**不再复制**
+  `prompt`（系统提示词/工具定义快照，纯前端展示行，占父历史体积 88%）、
+  `request`/`audit`（本会话诊断工件）。子会话下一次请求的消息序列与父会话逐条
+  相同（实测：1053 条消息逐字节一致，只差时间戳类环境快照），命中模型 KV 前缀
+  缓存。计划/目标模式刻意重置，避免子对话替父会话自动续跑。老 `aux` 只读答疑
+  会话原样保留。
+- **派生是一次事务写入**：`Store.CreateWithRows` 把会话行、承接的行、继承的
+  上传登记放在同一个提交里（此前 sessions 行先落库、消息逐行提交：列表上会出
+  现正文为空的半成品，用户在这个窗口归档/删除它就得到「能对话、列表里没有」
+  的会话；4400 行逐行 fsync 要 13.9s，整批只要 0.2s）。
+- **承接段折叠显示 + 更早历史懒加载**：承接内容前有一条 `kind='inherit'` 标记行
+  （组装上下文时跳过），正文是承接锚点 `{parent,count,title,from,total}`；前端据此
+  折成「承接自「父标题」· 最近 N 条」折叠条，更早的父会话历史点「更早 M 条」经
+  `GET /api/sessions/{id}/inherit?before_seq=&limit=` 按需取（只读、不落库、只在本页
+  内存里拼接）。老锚点（只有 parent/count）退回旧文案「来自主对话 · N 条」。
+- **归档口径：只排除「主对话本体」**：回收站、目录删除、搜索一律按
+  `mode='assistant' AND parent_id=''`（`searchableBaseSQL`）排除**数字助理主对话
+  本体**，而不是「所有 assistant 会话」——子对话会继承父会话的 mode，从长期助理
+  克隆出来的子对话 mode 也是 assistant，按 mode 一刀切会把它从下拉、回收站、搜索
+  里同时滤掉：归档之后彻底没有入口（2026-11-16 事故，4 条会话失踪）。右栏子对话
+  下拉底部固定一个「回收站 ›」入口，保证归档的子对话永远有去处。
 - **AI 派发按专家预设**：`dispatch_sub` 的模式选择只有一条路径——`expert=名称`。
   内置两条系统专家（常开、不可修改）：**标准子对话**（不传 expert 时的默认，
   只收到一段自足的 task）、**继承上下文子对话**（完整继承本会话聊天记录，
@@ -1019,8 +1117,8 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
 
 | 模式 | 说明 | 工具 |
 |---|---|---|
-| `task` | 任务会话，实际干活 | 读/写/编辑/glob/grep/shell（含后台作业 job_*）/web_fetch/**web_search（联网搜索，经服务端搜索网关，见 websearch.go；服务端半边是 jxaiserver 的 search.go，协议改动需双侧同步）** + ask_user_question / exit_plan_mode / progress_write + **dispatch_sub（派子对话）** + **call_api（与前端同接口的通用直调，见 callapi.go）** + **request_manager（找数字经理协调，见 requestmgr.go）** + 历史查询 |
-| `assistant` | 数字助理总控（左上角唯一入口，不占侧栏） | 编排：list_sessions / read_session_summary / **dispatch_task（派顶层工作任务）** / send_to_session（给已有会话发话：执行中＝**插话**注入当前轮、空闲＝直接开跑，可选 permission 只能同等或降权）/ stop_session（按用户指示分级停止：协作取消→3 秒未收口自动强制终结，与人工停止按钮同一停止函数、仅触发者不同）/ **call_api（与前端同接口的通用直调，见 callapi.go）** + deliver_result（把派发产出的成果文件登记为本对话的交付卡片，只展示不搬文件）+ **只读四件套 read/list_dir/glob/grep + web_fetch（答小问题：约十步内的查看自己看文件回答，大文件通读与批量分析仍派任务；写与执行类工具绝不给总控——纪律见 agent.go 的 assistantPrompt）**+ 历史查询 |
+| `task` | 任务会话，实际干活 | 读/写/编辑/glob/grep/shell（含后台作业 job_*）/web_fetch/**web_search（联网搜索，经服务端搜索网关，见 websearch.go；服务端半边是 jxaiserver 的 search.go，协议改动需双侧同步）** + ask_user_question / exit_plan_mode / progress_write + **dispatch_sub（派子对话）** + **call_api（与前端同接口的通用直调，见 callapi.go）** + **request_manager（找长期助理协调，见 requestmgr.go）** + 历史查询 |
+| `assistant` | 数字助理总控（左上角唯一入口，不占侧栏） | 编排：list_sessions / read_session_summary / **dispatch_task（派顶层工作任务）** / send_to_session（给已有会话发话：执行中＝**插话**注入当前轮、空闲＝直接开跑，可选 permission 只能同等或降权；2026-11-15 起两工具另有 thinking 思考档位与 unsandboxed/browser/computer 三个能力开关参数，见下文「派发关系」）/ stop_session（按用户指示分级停止：协作取消→3 秒未收口自动强制终结，与人工停止按钮同一停止函数、仅触发者不同）/ **call_api（与前端同接口的通用直调，见 callapi.go）** + deliver_result（把派发产出的成果文件登记为本对话的交付卡片，只展示不搬文件）+ **只读四件套 read/list_dir/glob/grep + web_fetch（答小问题：约十步内的查看自己看文件回答，大文件通读与批量分析仍派任务；写与执行类工具绝不给总控——纪律见 agent.go 的 assistantPrompt；2026-11-15 assistantPrompt 换为用户逐段审定的定稿：八节结构（只判断只转手 / 转达 / 派人 / 派发参数 / 求助与审批 / 汇报 / 沉淀 / 复盘改进 + 附提问分寸），原 managerCoordPrompt 协调段与 askTierPrompt 附注已并入正文，systemPrompt 对 assistant 不再重复拼接那两段）**+ 历史查询 |
 | `aux` | 辅助对话：早期的只读答疑小会话（右栏可见；新建子对话自 0007 起改为分支克隆，见下节） | 只读文件 + web_fetch/web_search + 历史查询 |
 | `skill-create` | 创建技能：把「怎么做」沉淀成给后续 AI 照做的 SKILL.md 教程——用户点按钮录演示让 AI 分析，或直接派活让 AI 探路总结；**默认完全访问**（演示记录与亲自验证都刚需电脑/浏览器）；提示词核心是「顿悟操作逻辑 + 写大致步骤不写死细节」（推荐/避免方式、快捷键、抗界面变化，见 agent.go `skillPrompt`） | task 全量工具 + **register_skill（注册/覆盖技能）**；演示录制归用户直控（界面按钮经 `/api/demo-record/*`，材料以【演示记录】通知进对话） |
 
@@ -1046,6 +1144,38 @@ interject mode=steer），目标空闲则直接作为
 成果时把文件登记成交付卡片展示在本对话——文件本身可能已被任务会话交付到位，总控只
 负责让用户在总控对话里看得见、拿得到，不重复搬运；路径填绝对值，登记失败多半是文件
 已被搬走，翻该会话的【交付结果】/【交付完成】注记找新位置）。
+
+**提示词改动（2026-11-15）**：① `assistantPrompt` 整体换为用户逐段审定的定稿
+（见上表 assistant 行，协调段与提问分寸并入正文）；② `officePrompt` 工作准则
+第 2 条由「动手优先：需要资料就检索文件与网页……」改为「**数据可靠**：数据与
+事实不凭空捏造，该算就用工具算（执行命令/脚本）；查不到、又算不出来的就如实
+说明，不要编造」——用户口径：从强调动手改成强调数据、不要凭空捏造就够了，
+之前它有点太爱去查东西（其余模式一字未动）。钉提示词文本的断言同步更新：
+`orchestration_test.go` 的 `TestAssistantLosesSubDispatchTools`（「建会话一律用
+dispatch_task」→「建会话只用 dispatch_task」）与 `TestAssistantReadOnlyTools`
+（纪律关键词换成定稿表述）。
+
+**派发新参数（2026-11-15，`dispatch_task` 与 `send_to_session` 各加四个，全部可选、
+不传时行为与之前逐字节一致——有单测钉死：`TestDispatchNewParamsAbsentKeepBehavior`）**：
+
+- `thinking`：思考档位，取值 `enabled/disabled/low/medium/high/max` 或空——与
+  PATCH `/api/sessions/{id}` 的白名单、设置里会话思考档位**同一套枚举**（单源
+  `validThinkingLevel`，sessioncreate.go）。dispatch_task 落进新会话的
+  `sessions.thinking`（开轮即生效）；send_to_session 写目标会话配置再投递——
+  对方空闲则开出的新轮即生效，正在执行的那一轮不中途切换（思考档位不在
+  `syncRunPerms` 的每步同步范围，与人工 PATCH 同款边界）、下一轮起生效。
+- `unsandboxed` / `browser` / `computer`：三个能力开关，**字段名照会话权限模型的
+  真实现**——就是 `SessionMeta.Tools`（sessions 表 tools 列）里的能力 id，与权限
+  芯片勾选、`hasCapability` 门控写同一个东西（存会话配置，非运行态；运行中的
+  会话每步经 `syncRunPerms` 从库同步 Permission/Tools，能力改动下一步即生效）。
+  语义**只能关、不能开**（`applyDispatchCaps`，assistant.go）：`false`＝强制关闭
+  （收窄永远安全）；`true`＝要求开启，先校验**派发方自己实际拥有**该能力
+  （完全访问档的捆绑视为拥有），没有即拒绝并报错——不借派发参数提权、不静默
+  钳制；不传＝不动（新会话按模式默认能力，已有会话保持现状）。目标为完全访问
+  档时三项是捆绑能力（`bundleFullAccessCaps`）：true 无实际变化、false 拒绝
+  （不可单独关闭，与权限面板联动一致）。注意接口语义是「布尔三态」：参数省略
+  ＝不动，显式 `false` 才是关——所以 Go 侧用 `*bool` 解析（`dispatchCaps` 以
+  **匿名字段**内嵌进参数结构，命名字段会让平铺的 `browser` 键解不进来）。
 
 ## 执行的生死与对话中途发消息
 
@@ -1122,10 +1252,38 @@ report_ready / done / stopped），前端常驻订阅：父对话里的子任务
 服务重启时未完成的执行会补
 【系统中断】记录，发「继续」即可接续（原始历史完整保留）。
 
+## 审批/提问的经理代理（mgrnotify.go）
+
+经理（长期助理主对话）投递开启的那一轮里，审批/提问卡（含计划审批）挂出
+`mgrNotifyAfterSec`（默认 30 秒，设置·常规 mgrNotify）仍无人处理时，自动给
+经理主对话投一条通知（含卡片 id 与 call_api 代批路径），决议随后回告并标注
+来源（用户在界面处理 / 长期助理代选 / 等待超时）。与「久等声光提醒用户」
+（askAlert，默认 4 分钟）并行各管各：一个叫醒用户、一个叫醒经理，互不替代。
+
+**经理代批是轮次级授权（mgrTurnGrant），不是会话级永久授权**：
+
+- 授予只发生在 dispatch_task / send_to_session 把需求注入会话、投递**开出的
+  那一轮**（`deliverSub` 返回的执行体指针即轮次身份，与 finishRunOf 的按身份
+  收口同一哲学）；插话（目标执行中）不授权——注入的是别人发起的那一轮，
+  也不动既有授权。
+- 撤销：该轮收口（正常完成/失败/停止，含看门狗硬终结——统一走 `closeRun`）、
+  用户亲发消息（`handleChat` / `handleInterject` / `handleRetry`＝用户接管）。
+  授权是 App 内存态，进程重启即清空：重启后没有任何一轮属于经理，恢复的
+  待审批计划归用户处理。
+- 窗口外（用户自己发起的轮、经理发过话之后用户接手的会话）的卡：到点**不
+  通知**经理（用户在场的轮用户自己看得见卡片）；经理经 call_api 翻清单主动
+  代决的，决议入口（`handleResolveApproval` / `handleResolveQuestion`）对非
+  窗口卡 403 拒绝——**绝不代决不属经理那一轮的卡片**。
+- 2026-11 踩坑：最初按「会话级永久标记」实现（dispatch_task 派生记
+  DispatchedBy、send_to_session 首次发话补 mgrlink 持久化标记），经理派发过
+  一次，之后用户在该会话自己发起的全部工作，审批卡仍报给经理代决——被用户
+  判为越权，遂改轮次级。mgrlink 持久化数据已无读取者（留库不生效）；
+  DispatchedBy 只走回报链，不再当代批依据。
+
 ## 任务找经理协调（request_manager / requestmgr.go）
 
 任务会话在「问自己看不到的情况」或「要一个同时只能一个人用的资源」时，可以
-主动找数字经理（数字助理主对话）——这是任务侧**唯一**能触到经理的通道，也是
+主动找长期助理（数字助理主对话）——这是任务侧**唯一**能触到经理的通道，也是
 经理跨会话视野真正被用起来的地方（典型案例：多个会话改同一仓库，谁都不知道
 现在合不合适跑测试）。
 
@@ -1148,8 +1306,9 @@ report_ready / done / stopped），前端常驻订阅：父对话里的子任务
   计划模式暂停；只带文本、不携带权限——经理后续动作仍受它自己的权限档与用户
   审批约束，这条通道不构成提权路径。
 - **提示词成对**：执行模式拿 agent.go 的 `managerAskPrompt`（什么时候找、找什么、
-  不用等），数字助理拿 `managerCoordPrompt`（它们不等你、你可以插话/派活/先不动、
-  排先后是你的事）；工具说明只留一句「这是求助用的，不要滥用」。
+  不用等），数字助理侧的对应口径在 `assistantPrompt` 定稿的第五节「任务来找你、
+  审批来找你」（2026-11-15 换版时由原独立拼接段 `managerCoordPrompt` 并入正文，
+  拼接段已删除）；工具说明只留一句「这是求助用的，不要滥用」。
 
 ## 上下文管理（核心特色）
 
@@ -1188,9 +1347,43 @@ report_ready / done / stopped），前端常驻订阅：父对话里的子任务
   模型最终输出，仅在压缩范围内已没有新轮可折时才升级（手动重复点同一位置
   即二级；一级压得动绝不跳二级）。
 - **模型摘要压缩**：估算 token 达模型阈值（CompactLlmPct）自动触发；也可在
-  任意助手消息上点「压缩」手动触发（按设置的默认行为选路）。手动摘要独立
-  叠加、永不重压；自动摘要按 DSH 式合并为单一检查点，摘要区间与规则压缩同一
+  任意助手消息上点「压缩」手动触发（按设置的默认行为选路）。**手动/提前自动
+  压缩的模型摘要在后台 goroutine 执行**（HTTP 立即 202 返回，完成与失败经
+  session_updated 广播 reason=compact / compact_failed；会话级互斥拦重复点火，
+  compactRunning）——绝不把一两分钟的摘要调用挂在请求上。手动摘要独立
+  叠加、永不重压（重复点同一位置被 summarizePlan 预检同步拦下；摘要/审计等
+  元数据行会把轮尾撑大一号，区间内只剩元数据行同样按「已压过」报错，不落
+  空摘要）；自动摘要按 DSH 式合并为单一检查点，摘要区间与规则压缩同一
   保留窗口口径。
+- **摘要请求吃前缀缓存**（doSummarize + CallSummarizer，2026-11-11 设计）：
+  摘要请求不再另起炉灶（专用系统提示词 + 渲染转述文本——零缓存命中、全量
+  miss 计费、prefill 慢），而是复用主对话的请求形态：消息序列 = buildContext
+  截止到压缩终点（buildContextUpTo，与主循环逐字节同源，摘要行豁免裁剪）+
+  尾部一条压缩指令（summarizeDirective：任务说明用 seq 圈区间、小节要求
+  含踩坑/成功经验、明令不许调用工具）；tools 与思考档位同主循环请求信封。
+  首次压缩命中整段压缩区间，增量只有指令几百字（DSH 社区同思路实测命中
+  11.8%→99.7%，DSH 官方 compaction-basic 已做同款改造）。模型若调用工具：
+  合成拒绝响应（每个调用一条，保配对）+ 重申指令再跳一次（前缀已全命中，
+  第二跳增量极小），连续两次仍调用即报错；审计行 scope=summarize 的
+  usage.hit/miss 直接可见缓存收益。
+- **摘要小节六节制**（2026-11-11 拍板，调研 DSH/Claude Code/Codex 后定制）：
+  已完成的任务与意图 / 关键决定（跨压缩保留——合并旧摘要时仍成立的决定
+  原样带入，防多代压缩后早期决策漂移）/ 文件与改动 / 错误与教训（踩坑 +
+  验证过的成功经验）/ 用户指令与约束摘录（原话逐条，安全条款逐字保留）/
+  进行中与未完成。**不设「下一步」节**——保留窗口的最近原文随请求原样
+  保留，「接下来做什么」活在原文里，摘要里写只会过时。空节写「无」不得
+  删节；助理主对话版在此结构上置顶「用户偏好与习惯 / 长期有效的约定」
+  两节。落库正文头是 checkpoint preamble（「以下是既定背景，直接基于后续
+  原文继续工作，不要复述或确认本摘要」——DSH 同款，防压缩后模型浪费一
+  个回合确认摘要）；摘要异常短（<50 字疑似截断）fail-closed 报错不落库。
+- **摘要增量区间标注**（2026-11-11）：指令明说「只总结第 X 至 Y 条——上一
+  份摘要之后、本条指令之前」，先前的摘要不重新总结、只按「关键决定」带
+  入。落库摘要行带结构化区间对 `covers_from`/`covers_up_to`（seq=数据库
+  行号，历史查询工具按区间检索原文直接可用）：manual 叠加存本次区间
+  起点；auto 合并存累计起点（继承合并链头部，旧数据无起点字段按 1 兜底），
+  文本头同写「本次压缩第 X 至 Y 条」（auto 合并时另注「累计覆盖第 Z 至
+  Y 条」）。规则压缩不涉及——它是行级折叠（每行自己的 Compact 标记与
+  seq），没有区间摘要体。
 - **压缩后环境快照完整重发**（`resendEnvAfterCompact`）：环境快照对模型是
   差分机制（首条整份、后续只发变化行），而折叠/摘要会把差分所依附的完整
   基线埋掉——之后模型手里只剩孤立差分行或缺掉整段环境。所以每次压缩成功
@@ -1418,7 +1611,7 @@ embeddable，约 11MB + 清华镜像装 wheel），此后离线可用；装配�
 
 **组件三形态与开发方针（硬规矩，详见《组件/README.md》）**：①纯浏览器半边
 （默认，新增组件一律优先）；②宿主半边·存量套皮（todo/git 面板/危险命令护栏/
-企业技能包市场/小程序平台——后端是深度耦合主程序状态的内置功能，认定不可
+企业技能包市场/企业小程序——后端是深度耦合主程序状态的内置功能，认定不可
 拆，仅维护不再新增；skill-market 与 sites-platform 是开源前从本体抽出的，
 后端 /api/market 与 /sites 代理保留、入口随组件开关）；③宿主
 半边·自包含 worker（目标形态，voice 是样板：worker+模型自包含于组件目录、
@@ -1437,11 +1630,84 @@ worker 的 stdin/stdout 升级为带 id 的帧协议（req/event/decision/host/h
 
 - **`组件/<名字>/`**：`manifest.json`（id/名称/版本/描述/资产）+ `client.js`
   （`client.css` 可选）——纯浏览器半边，没有宿主代码、没有转译。
-- **发现与开关**：启动扫描 `组件/*/manifest.json`（损坏即跳过告警）；
-  开关状态存 `data/components.json`（缺省启用）；接口 `GET/POST /api/components`、
-  资产 `GET /api/components/{id}/{file}`（仅启用时提供）。资产挂 `/api/` 下且
+- **两档归属，一个组件桥（用户定调，2026-11-08）**：组件按来源分内置与用户两
+  档，**两条路走同一个注册表、同一个组件桥（worker/钩子/端点/资产/热开关全
+  共用），差别只在目录与可删除性**：
+  - **内置组件**：`组件/<id>/`（随包分发、**不可删除只可开关**、随程序静默更新
+    的组件分块热更新）。市场不得覆盖同名内置组件（install 直接拒），市场卡片
+    对它们只显示「内置（随程序更新）」不给装/卸按钮。
+  - **用户组件**：`组件/user/<id>/`（市场或发行渠道单个安装、**可开关可删除**、
+    **不进打包、不上 git、不参与热更新**——版本与去留归用户）。与技能同一套
+    约定（`技能/user/`）：打包脚本 robocopy 排除该目录、升级清理清单跳过它、
+    `.gitignore` 记一条、静默更新拒绝把 `user` 当组件块发布。
+  - 归属经 `ComponentStatus.BuiltIn` 下发；设置页一级页叫「组件」，内部按
+    「内置组件 / 用户组件」两区（与「技能」页同款）；删除走
+    `POST /api/components/delete`（对内置返回 400 指路关开关）。同名 id 时内置
+    优先（用户那份被忽略并告警）。
+- **发现与开关**：启动扫一次 `组件/*/` 与 `组件/user/*/` 的 `manifest.json`
+  （损坏即跳过告警），之后**平时完全不自动扫**——清单接口是纯读；重扫只挂在
+  「打开设置页 → 组件页」这一次（`GET /api/components?rescan=1`，前端开机渲染
+  清单时带；不需要刷新按钮）。所以手工放进/删掉的组件目录**打开设置页即见，
+  不必重启服务**（桌面版单实例常驻，重开窗口不等于重启服务，这正是 user-memory
+  曾经「重启后仍不见」的原因），平时零扫描开销。开关状态存
+  `data/components.json`（缺省启用，删目录即清记录）。接口 `GET/POST /api/components`（带 `?s=`/`session` 走会话
+  级覆盖）、`POST /api/components/delete`（只删用户组件）、资产
+  `GET /api/components/{id}/{file}`（仅启用时提供，按组件自身目录解析）。
+  这两个接口与 `/api/plugins` 都登记进 call_api 可调目录（`apiMeta`），长期助理
+  能直接查询与开关组件/插件（含会话级覆盖）。资产挂 `/api/` 下且
   `web/cx.js` 统一用 fetch 拿文本注入（不插相对 src 标签）——远程中继模式下
   `/api/` 前缀被 remote-boot 的 fetch 劫持自动走隧道，组件在远程同样可用。
+- **按对话的组件/插件开关（会话级覆盖，2026-11-07）**：每个对话可以有自己的
+  生效集，**优先于全局开关、全局开关不动**——别的对话关的这里可以开、开的
+  这里可以关。入口在对话输入区加号菜单「本对话的组件与插件」：设置页同款
+  浮窗（`#cxsession`，复用 settings-card/set-nav/set-pane 全套类），一级页只有
+  「组件」「插件」，组件注册的独立设置页（如语音）排在它们之后。后端
+  `sessioncx.go`：覆盖存会话附属数据（`sessdata:cx-overrides:<会话id>`，
+  随会话删除清理；只记显式覆盖，拨回与全局一致即删记录）；`GET/POST
+  /api/components、/api/plugins` 带 `session`（或查询参数 `?s=`）即会话视图/会话
+  写入，响应带 `globalEnabled/override/sessionCustom`。前端 `cx.js` 记当前会话
+  （`session:open` → `CX.setSession`，回首页置空），清单与资产 URL 带 `?s=`，
+  `CX.toggle(id,on,session)` 与全局热开关同一条注入/卸载路径，切会话经
+  `refresh()` 对账热装配。worker 进程与语音端点的存活口径是「全局开着或还有
+  任何会话显式要它」（`cxoComponentLive`，请求不带会话——会话关掉的对话里组件
+  UI 已热卸载，不会来请求）；CC 插件的斜杠命令按会话生效集过滤
+  （`/api/cc-plugins/commands?s=` 与展开路径）。**模型工具目录仍按全局开关装配**
+  （toolsFor 不认会话；git_sync/todo 工具在会话里关掉组件后仍在目录里，调用时
+  按全局口径执行——完整会话化待 toolsFor 接收会话时再收口）。
+- **会话级组件配置（合并层，2026-11-08 定稿）**：同一个浮窗里，组件设置也能按
+  对话分开——「统一会话视角配置合并层」：覆盖从「组件开关（布尔）」扩成「任意
+  配置项 KV」，**在组件自己的存储读取通道上按「会话覆盖 > 全局值」合并**喂给
+  组件（`web/cx.js` 拦 `localStorage['cx:<组件id>:*']` 三个动词，组件零改动，
+  读到的永远是该会话视角的值）；**不搞 manifest 声明**（不注入对话的设置会话化
+  也无感知，机制自动覆盖全部组件的前端偏好）。全局值仍在组件自己那儿（独立
+  不动），覆盖统一存会话附属数据（`SessionOverrides.Cfg`，随会话删除清理）。
+  - 交互（定稿）：浮窗每行**两个开关**——上＝本对话启用/停用该组件（行级启停，
+    原有）；下＝该组件设置「会话独立 / 跟随全局」。浮窗底部**总开关**「本对话
+    使用独立的组件设置」＝一键切全场：开＝全场进入会话独立（缺省每行独立）；
+    **关＝整行完全回归全局**（配置覆盖 `Cfg`/`CfgFollow` 与行级启停覆盖
+    `Components` 一起清空）。恢复语义：行级切回「跟随全局」＝删该组件的配置
+    记录（`Cfg[id]` 消失）。全局设置页开着时读取通道走全局（`_cfgBypassNow`），
+    那里的改动就是全局值，两套视角不串。
+  - 接口：`GET /api/components/cfg?s=` 读视图（总开关 + 每组件覆盖），
+    `POST /api/components/cfg`（写/删一条键，`value` 缺省＝删），
+    `POST /api/components/cfg/mode`（行级 独立/跟随）、
+    `POST /api/components/cfg/scope`（总开关）；`GET /api/components?s=` 的响应
+    顺带带 `cfg` 字段，`web/cx.js` 装配前先就位（组件 init 第一口读即会话视角），
+    切会话时把已装组件全卸一遍按新会话配置重装。四条接口都登记进 call_api。
+  - 覆盖范围与边界：合并层管的是**组件前端偏好**（localStorage 命名空间
+    `cx:<id>:*`，语音的音色/听写模型等就是这类，新组件照这个命名空间存即自动
+    支持）；组件存在服务端的**数据**（用户记忆 md、待办清单、市场服务器地址这类
+    全局配置/资料）不随会话——那是数据与安装级配置，不是「组件设置」。
+- **内置组件与用户组件的本质区别**（2026-11-06 客户事故的规范沉淀 + 2026-11-08
+  两档目录约定）：内置组件（`组件/<id>/`）随热更新**必自动装上与更新**——清单
+  带块即补装/升级（update_blocks.go planComponentBlocks，保证在场，不受「本机
+  未装跳过」类保守规则拦截），用户只通过开关控制启用与否（开关可关、安装更新
+  必须自动）；用户组件（`组件/user/<id>/`）才由用户自行安装、自行删除，**不进
+  热更新**（清单里即使有同名块也跳过，不覆盖用户手上那版）。内置功能组件化后
+  尤其如此：入口靠组件注入，组件不到场入口就消失、连市场入口同失（想再装得先
+  有市场入口，死锁）。想彻底不要某内置组件用开关关闭（记账保持关、补装不翻
+  开关）；手动删目录只在两次组件发版之间有效（发新版清单带块即装回，与安装包
+  升级同款行为）。
 - **热开关（核心特性）**：内嵌运行时 `web/cx.js` 随页面加载，负责发现注入与
   运行期开关。组件脚本调用 `CX.register({id, init, dispose})` 注册：
   `init()` 建立界面与状态，`dispose()` 完整撤销（删节点、卸样式、清监听）。
@@ -1451,20 +1717,42 @@ worker 的 stdin/stdout 升级为带 id 的帧协议（req/event/decision/host/h
   设置交给运行时；`CX.unregisterSettings(id)` 可撤。注册/注销/热开关都会派发
   `window` 事件 `cx:change`，设置页收到后重挂。设置样式与偏好由组件自理
   （组件 CSS + `localStorage`）。呈现形态两种（`app-settings.js` 渲染，只渲染当前
-  激活的组件）：①缺省＝「内置组件」页清单下方的设置段；②注册时带
+  激活的组件）：①缺省＝「组件」页清单下方的设置段；②注册时带
   `pane: {label, icon}` ＝**独立设置页**——设置一级菜单出现专属入口（插在
-  「内置组件」之后）+ 专属分区页（`set-pane-component-<id>`，动态创建于
+  「组件」之后）+ 专属分区页（`set-pane-component-<id>`，动态创建于
   `.set-panes`），导航状态机按 data-pane 寻址与静态页同一条路径；组件停用时
   导航项与页面一并撤掉（正停在该页时退回常规页）。`voice` 组件用的是独立页
-  （设置 → 语音）。
-- **组件往界面加按钮＝独立挂载，禁止锚定其他按钮**：插入位置一律用「往自己的
-  挂载容器 append（或 prepend）」表达（侧栏入口 `.actions` 末尾、底部组件入口
-  格 `#foot-apps`（回收站上方的分区挂载点）等），不得按「插在某个按钮旁边」
+  （设置 → 语音）。**全局保存接入（2026-11-08）**：注册项可带
+  `save: async () => boolean`——设置页右下角「保存」（`saveSettings`）经
+  `CX.saveSettingsSections()` 逐个调激活组件的 save，任一返回 false/抛错即
+  短路、设置窗不关（就地修正）；组件设置区**不要再放自己的保存按钮**，改动
+  暂存在 mount 出的 DOM 草稿里、随全局保存统一落库（首个使用者：user-memory
+  的「AI 记忆与拟人化」页）。注意「本对话的组件与插件」浮窗（app-cxsession.js）
+  挂同一份 mount 但没有全局保存——那份挂载的草稿不会被收集，改动停留无害。
+- **界面插槽＝标准定位格式（组件只「申请格子」，排版归插槽）**：界面上一块有条目
+  的方寸（左侧栏底部入口格等）在宿主里是一个**插槽**，组件只交「图标 + 名字 +
+  序号 + 点击」，不拼条目 DOM、不写条目布局 CSS——骨架、排序、以及同一份条目在
+  **电脑与手机两套形态**下的排版全归插槽（`web/app-core.js` 的 `JX.slot` +
+  `web/style.css` 的插槽段），组件两套形态都不用管。
+  - 接口：`JX.slot('<插槽名>').add({ key, label, icon, order, title, onClick, id?, owner? })`
+    → `{ el, setActive(on), remove() }`；同 key 重挂先撤旧的（热开关/热重载安全）。
+    自检：控制台 `JX.slots()` 打印每个插槽里的条目（key / 序号 / 谁注册的 / 是否选中）。
+  - 序号方向：**order 小的在最下面（紧贴设置行），大的往上叠**；同序号先注册的更靠下。
+  - 现有插槽 `sidebar.foot`（容器 `#foot-apps`，`.foot-grid` 为 `display:contents`）：
+    电脑＝竖排整行；手机（≤499.98px）＝三列均分网格 `repeat(3, minmax(0,1fr))`，
+    3 个一行、4~6 个自动两行，每格高度固定、标签最多两行、超出裁掉（`minmax(0,…)`
+    不能写回 `1fr`：1fr 的下限是内容 min-content，长名会把第一列撑开、后两列被挤成
+    竖排——2026-11-06 用户报的现象）。内置「回收站」是第一位使用者（order 1，
+    `app-left.js` 注册），组件从 2 起往上叠（skill-market 2、sites-platform 3）。
+  - 加新插槽＝在 `app-core.js` 的 `SLOT_HOSTS` 登记容器与条目类名 + 在 `style.css`
+    写它的两套形态（右栏页签 `rpRegister` 是同一模式的既有实现，见 `app-right.js`）。
+- **组件往界面加东西＝独立挂载／走插槽，禁止锚定其他按钮**：插入位置一律用「向
+  插槽注册」或「往自己的挂载容器 append（或 prepend）」表达（侧栏入口 `.actions`
+  末尾、底部插槽 `JX.slot('sidebar.foot')` 等），不得按「插在某个按钮旁边」
   定位——锚定别人＝把自己的排序耦合进别人的 DOM，别人换位或下线时组件按钮
   被动搬家、掉进兜底路径（todo-scheduler 曾锚定数字助理入口，2026-11-05 入口
-  换位即暴露，已改 `.actions` 末尾独立挂载；市场/小程序平台组件也用分区
-  挂载点落在回收站上方，2026-11-05 用户试用反馈 append 到内置格会掉到回收站
-  之下）。
+  换位即暴露，已改 `.actions` 末尾独立挂载；市场/企业小程序组件 2026-11-06 起
+  改走底部插槽，不再各自拼按钮和排序）。
 - **宿主半边可以落在主程序里**：组件本身是纯浏览器半边，但它掌管的功能若需要
   后端（持久化、定时、接口、模型工具），就写在主程序对应文件里、按
   `Components.IsEnabled(<id>)` 自查开关——组件关掉时那部分功能一并停。
@@ -1473,7 +1761,31 @@ worker 的 stdin/stdout 升级为带 id 的帧协议（req/event/decision/host/h
   （字数统计）已删除，新建组件照「manifest.json + client.js（client.css 可选）」
   的最小结构手写即可。界面强调色（主题色）原为示例组件，现已并入主程序
   `web/app-settings.js`（常规 → 外观 → 主题色）。
-- 现成组件：`todo-scheduler`（待办与定时任务——侧栏入口 + 持久清单 + 定时调度，
+- **组件能力分发＝基础工具 `component_call`（方案 A，2026-11-09 用户定调）**：
+  **工具定义只装基础工具，组件的动态能力不进工具目录**——否则每加一个组件
+  能力就要改一次工具定义，请求前缀抖动、缓存与多模式目录都得跟着维护。
+  现在走两半：
+  - **声明**：组件 `manifest.json` 顶层 `capabilities` 数组（一条一个能力：
+    `name` 能力名、`description` 一句中文说明、`parameters` 参数 JSON Schema、
+    `modes` 可用模式白名单〔空＝全部模式〕、`writes` 是否写入型〔计划模式下
+    暂停〕）。**声明是白名单**：没声明的能力宿主不给调。
+  - **实现**：宿主注册表——组件自己的 .go 文件在 `init()` 里
+    `registerComponentCapability(组件id, 能力名, 函数)`（样板见 usermemory.go
+    的 `memory_query` / `memory_update`）。声明了但没有实现的照样不可调（报错
+    指路）。分发与门控都在 `componentcall.go`。
+  - **调用**：模型调 `component_call(component, capability, args)`——它作为
+    **基础工具全模式注册**（assistant/aux 也有，能不能调由声明的 modes 决定），
+    参数说明不在工具定义里，而在**环境快照的「组件能力」块**（`envPrompt` →
+    `componentCapabilityBlock`：逐个启用组件列出当前模式下可调的能力、参数
+    要点、是否写入型）。组成链路：组件存在 → 本会话启用（会话级覆盖优先）→
+    能力已声明 → 本模式可用 → 宿主已实现 → 执行。
+  - **开关只影响环境提示词块，工具定义恒定**：组件开关在快照尾部以差分送达
+    （前缀缓存不动）；`TestComponentCallToolCatalogStable` 钉住「开关前后
+    `toolsFor` 名称与 schema 逐字一致」。
+  - 新增组件能力的三步：①manifest `capabilities` 加一条声明 → ②宿主 `init()`
+    登记实现 → ③确认「组件能力」块出现。**不改 `toolsFor`、不改任何工具定义**。
+    格式与扩展方式详见《组件/README.md》。
+- **现成组件：`todo-scheduler`（待办与定时任务——侧栏入口 + 持久清单 + 定时调度，
   宿主半边在 `todo.go`，关掉后入口、`/api/todos` 接口与调度一起停）、
   `git-panel`（Git 面板——右栏「Git」页签：同屏双区（默认上下堆叠、可切左右分栏、
   分隔条可拖）——更改区为 VSCode 式清单（暂存/取消暂存/提交/AI 摘要/逐行 diff；已暂存与未暂存的文件可右键「移出跟踪」变未跟踪），
@@ -1552,7 +1864,38 @@ worker 的 stdin/stdout 升级为带 id 的帧协议（req/event/decision/host/h
   「恢复自动命名」按它显隐，组件关掉即不出）；改名落库广播 `title` 事件，
   前端侧栏/顶栏实时跟进（组件改名常在流结束数秒后晚到，不广播的话当面永远
   看不见）；轻量消息读取走
-  `GET /api/sessions/{id}/messages`）。
+  `GET /api/sessions/{id}/messages`）、`user-memory`（**AI 记忆与拟人化**——
+  用户称呼、身份与喜好、AI 助理名字与身份的长期记忆 + AI 对话气泡颜色。
+  全部内容存一个 md 文档 `data/user-memory.md`（组件自管，可手工编辑，
+  **完整保存不截断**）；宿主半边在 `usermemory.go`。**注入走环境提示词**
+  （envPrompt 的 userMemoryEnvBlock：组件开启且任一字段有内容才出现，变化经
+  快照差分送达全部会话，关闭即整块消失——不进系统提示词、不进工具定义；
+  注入侧对超长字段截断到 1000 字加尾注，防手工编辑的超长内容撑爆快照）。
+  **权限分级（方案 A 后：经 `component_call` 调两条能力，不占工具目录）**：
+  普通任务对话可调 `memory_query`（查询全部字段）与 `memory_update`（只更新
+  「用户身份与喜好」记忆段，其余字段只读——称呼与 AI 名字/身份是用户的自我
+  设定）；两条能力在组件 manifest 的 `capabilities` 里声明（`modes` ＝五个
+  执行模式，aux/assistant 不含），实现在 usermemory.go 的
+  `userMemoryCapabilityQuery/Update` 经 `registerComponentCapability` 登记；
+  长期助理（assistant 模式）的环境快照里告知**整个记忆文件可读可改**——call_api 调
+  `GET/POST /api/user-memory`（按字段保存，未给出的字段保持不变；文件在助手
+  数据目录内、受保护路径拦文件工具，接口是唯一通道）。**长度约束在写入入口**
+  （1000 字/字段，rune 计）：设置页前端超长红字告知、按截断版提交（浏览器
+  保留完整草稿，不回填）；模型侧（`memory_update` 与 call_api POST）超长整单报错、
+  不写入。设置页独立选项卡（设置 → AI 记忆与拟人化）由组件 client.js 注册；
+  气泡颜色是纯前端设置：`--ai-bubble` CSS 变量注入 `<html>`
+  （`web/style.css` 的 `.msg.user.ai` 气泡引用，缺省回退主题灰），保存后即时
+  生效、组件卸载即还原。组件发现：平时不扫，打开 设置 → 组件 时前端带
+  `rescan=1` 重扫一次，运行中放进/删掉组件目录打开设置页即见——不必重启服务；
+  之后开关即点即生效。**会话级记忆合并（2026-11-08）**：环境注入与模型侧
+  读写按**会话视角**——该会话开关覆盖关闭时整块不注入；「会话独立」（浮窗
+  总开关 CfgScope 开且未标跟随，见 sessioncx.go）时四字段+颜色逐项
+  「会话覆盖 > 全局值」（覆盖键=API 字段名，存会话附属数据），注入块与能力
+  回执标注「本对话独立记忆」；`GET/POST /api/user-memory` 带 `?s=<会话id>`
+  ＝会话读写（POST 在独立会话写覆盖、全局文档不动，与全局同值归一删记录），
+  不带 s＝全局（设置浮窗、经理 call_api）；`memory_query/memory_update` 按
+  所属会话的视角查写（component_call 分发时按会话开关核对）。envPrompt 每轮
+  现算，覆盖变化经环境快照差分自然送达该会话）。
 
 ## 插件与插件兼容层
 
@@ -1726,19 +2069,23 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 |---|---|
 | `main.go` | 启动入口：配置、HTTP 服务、自动开浏览器、-webdir 开发模式 |
 | `config.go` | 运行配置（含 providers 与压缩设置）的加载/保存/兼容折算 |
-| `models.go` | 多 provider 模型清单、调用目标解析、模型列表拉取 |
-| `config.go` 的 `companyQuota` | **公司通道额度快照**（服务端随 `/announce`、`/provision` 的 `quota` 字段下发，客户端只存不算）：`sync.go` 的 `applyAnnounce` 与 `wizard.go` 的 `applyProvisionPayload` 写进 `Cfg.CompanyQuota`（`quotaEqual` 判变化才落盘）；`/api/models` 带 `companyQuota`（模型菜单里**公司通道那个分组头**上显示「剩余 N 积分」，悬停看明细）、`/api/config` 的公司通道带 `quota`（设置页公司通道**卡片头**的额度 chip + 展开后的明细与「刷新额度」）；设置页「刷新额度」走 `POST /api/company-sync`——复用 `companySyncOnce` 重拉一轮公告，**不为额度另开查询接口**（new-api 的 AI 接口没有余额端点，额度只能由服务端代读并随公告下发） || `llm.go` | OpenAI 兼容流式客户端（SSE 解析、工具调用增量聚合）+ mock 演示模型 |
+| `models.go` | 多 provider 模型清单、调用目标解析、模型列表拉取（按渠道协议适配端点与鉴权头） |
+| `config.go` 的 `companyQuota` | **公司通道额度快照**（服务端随 `/announce`、`/provision` 的 `quota` 字段下发，客户端只存不算）：`sync.go` 的 `applyAnnounce` 与 `wizard.go` 的 `applyProvisionPayload` 写进 `Cfg.CompanyQuota`（`quotaEqual` 判变化才落盘）；`/api/models` 带 `companyQuota`（模型菜单里**公司通道那个分组头**上显示「剩余 N 积分」，悬停看明细）、`/api/config` 的公司通道带 `quota`（设置页公司通道**卡片头**的额度 chip + 展开后的明细与「刷新额度」）；设置页「刷新额度」走 `POST /api/company-sync`——复用 `companySyncOnce` 重拉一轮公告，**不为额度另开查询接口**（new-api 的 AI 接口没有余额端点，额度只能由服务端代读并随公告下发） || `llm.go` | OpenAI 兼容流式客户端（SSE 解析、工具调用增量聚合）+ mock 演示模型；`StreamChat` 是全部协议的统一入口（按 `LLMTarget.Protocol` 分发，主备地址故障转移/断开器登记/错误整理三协议共用） |
+| `llmproto.go` | **渠道协议扩展**：`llmProtocol`（端点路径+鉴权头+请求转换+SSE 解析）三个实现——OpenAI 兼容 chat/completions（原行为原样）、Anthropic 原生 /v1/messages、OpenAI Responses /v1/responses。统一 Message/ToolCall 与协议格式互转（system 提取、tool_use/tool_result、function_call/function_call_output、图片 data URL）、思考档位映射（Anthropic budget_tokens：low 2k/enabled·medium 6k/high 12k/max 24k，max_tokens 不足自动抬升；Responses effort：low/medium 原样、high·max→high、enabled/disabled 不干预）、usage 归一（Anthropic 的 cache_read/cache_creation 映入 Usage 缓存字段）。看护测试 llmproto_test.go（转换/SSE/工具往返/mock 网关端到端/既有渠道报文回归） |
 | `contextengine.go` | 上下文引擎：请求材料的唯一组装者 + 上下文事件总线。系统提示词（可被 `data/prompts/<mode>.md` 引用文件覆盖，引用文件附内容 hash 标记来源；版本号不进提示词——随发版变化会白白打断前缀缓存）、环境快照、工具目录、历史视图、视觉内联经 `Assemble` 成包（确定性：同一状态逐字节一致——前缀缓存命中的根基，有测试看护），token 估算与前缀指纹随包产出；每轮开轮的 prompt 展示快照行经 `OpenRound` 落库；需把上下文发给模型的侧路调用（模型摘要）由 `CallSummarizer` 拼装并发送（留痕 audit scope=summarize，不进请求环形缓存）；权限/模型/思考档位/计划目标/工作区/远程挂载等配置变更经 `Notify` 落时间线（audit type=ctx，含前后值）；技能增减由环境快照 diff 在尾部留痕，同一事实不重复记账 |
 | `agent.go` | 主循环：每步经上下文引擎取包 → 流式请求 → 执行工具 → 回填（只做编排，不亲手拼装——发给模型的内容一律来自引擎 Assembly）；`envPrompt` 生成运行环境快照（不含时间——时间走 context.go 的 timeAfter 派生通道） |
 | `perm.go` | 权限引擎：三档模式、授权凭证（签发/核销）、审批队列、受保护路径、危险命令拦截、沙箱内浏览器预拦（browserLaunchHit：非 full 档启动浏览器的命令执行前拦下并指路 browser_*，确定性失败路径的快速失败，不做组件开关） |
 | `plans.go` | 计划读取端点：从会话日志里取回 exit_plan_mode 的正文（右栏「计划」视图的数据源） |
 | `requestmgr.go` | 任务找经理协调（request_manager）：把求助整理成一条消息投进数字助理主对话（kind=aiuser、origin=help），**立即返回、不等答复**——经理空闲就落库并唤醒它跑一轮，忙则插话注入它正在执行的那一轮（AI 发话一律插话，与【派发回报】【待办任务派发】同一套投递）；经理侧**没有**专用回复工具，它用既有的 send_to_session / dispatch_task 处理。不建池、不加接口（消息本身即记录）；子对话调用被硬拦、计划模式暂停；启动自检 assertManagerChannel 看护「只有执行模式有」 |
-| `interact.go` | 模型↔用户交互工具（ask_user_question / enter·exit_plan_mode / update_goal）；ask 提问限时（timeout_sec 设秒数，默认 300、钳 30-600、显式 0=不限时；分档准则在系统提示词「提问的分寸」段，状态公告在环境快照「提问等待」行；界面倒计时、悬停/触碰/按钮停表转不限时，超时视为放行）；久等声光提醒（默认开、240 秒、设置·常规可调：MessageBeep 叮声 + ask_alert 全屏闪烁，浮窗上 15 秒倒计时走完才 TTS 朗读；悬停/触碰/停表、或从任何入口打开对应计划页/浮窗（holdQuestion 也受理无时限的计划审批）连提醒一并作废，见 askAlertDue）；计划审批无时限且提交即落库，重启后由 resolvePersistedPlan 收口批准/修改/忽略 |
+| `interact.go` | 模型↔用户交互工具（ask_user_question / enter·exit_plan_mode / update_goal）；**`background=true` 的异步分支见 `asyncask.go`**（不传＝本节这套同步语义，逐字节不变）；ask 提问限时（timeout_sec 设秒数，默认 300、钳 30-600、显式 0=不限时；分档准则在系统提示词「提问的分寸」段，状态公告在环境快照「提问等待」行；界面倒计时、悬停/触碰/按钮停表转不限时，超时视为放行）；久等声光提醒（默认开、240 秒、设置·常规可调：MessageBeep 叮声 + ask_alert 全屏闪烁，浮窗上 15 秒倒计时走完才 TTS 朗读；悬停/触碰/停表、或从任何入口打开对应计划页/浮窗（holdQuestion 也受理无时限的计划审批）连提醒一并作废，见 askAlertDue）；计划审批无时限且提交即落库，重启后由 resolvePersistedPlan 收口批准/修改/忽略 |
 | `interact_plan_test.go` | 计划审批的时限与持久化语义测试（跨重启挂待审批、批准/修改/忽略三分支、plan 无 TTL、ask 的 timeout_sec 与停表） |
+| `asyncask.go` | **后台询问**（非阻塞的提问 / 权限审批 / 计划审批）：三个交互工具带 `background=true` 时挂到会话附属数据（`sessdata:asyncasks:<会话id>`，重启不丢）、立刻返回编号 `aq-…`，模型继续干活；**挂出即广播 question_required 弹卡**（2026-11-18 起：与同步提问同一张卡直接弹在所属会话输入框上方、可折叠成一行，别的对话开着进角标堆；重连/重开由 `/api/questions`——pendingQuestions 纳入后台等待项——把卡找回，此前只躺在进度面板等「查看」）；用户处理 → 先落实真实效果（权限真提档、计划真标记；**计划拒绝/取消不碰会话的计划模式开关**，批准也只在原本就是计划模式时才退出），再把结果以**合成工具回执对**投回会话（2026-11-18 起：assistant(tool_calls)+tool 两行 origin=toolreport，函数名回显当初的原工具——`asyncReceiptPair` 组装、`asyncQueue` 800ms 合并 → `startToolReportRound`：忙则插话、闲则起轮；到期提示走 NoKick 不叫醒；落库收口 `landToolPair`，详见 runtime.go）。**没有默认定时**：模型不传超时＝一直挂着，传了到期只回一条「超时未处理」，不替它做业务决定。撤销＝`progress_write(action="cancel", id=…)`。接口：`POST /api/questions/{id}` 的 `aq-` 编号路由到 `resolveAsyncAsk`；`GET /api/sessions/{id}/progress` 的 `asks` 字段是面板数据源 |
+| `asyncask_test.go` | 后台询问语义测试（挂出不阻塞、重启仍在、三条回执文案与投递、提权真生效、计划不动计划模式、撤销后迟到处理失败、到期不叫醒、同步计划仍要求在计划模式） |
 | `remote.go` | SSH 远程工作区：连接池、TOFU 指纹库、远程 exec、SFTP 文件操作、连接测试 |
 | `remotelist.go` | 已登记远程工作区（工作目录面板的远程条目）：DPAPI 加密存储、凭据回填、清单/登记/忘记 API |
-| `tools.go` | 任务会话工具集（接入权限引擎与本地/远程执行环境抽象；含 web_fetch） |
-| `run_python.go` | run_python 工具：AI 交 Python 脚本全文，自动落盘 `.jxai/tmp/<会话id>/`（会话删除随 handleDeleteSession 回收、启动按天兜底清理）后用内置便携运行时执行；与 run_command 同一把权限锁/沙箱/编码注入（Shell 形态，不走绕过沙箱的 Argv 直跑）；提示词按「建议」引导 JSON/引号/多步场景优先用它（run_command 仍可用，无硬限制）；ensureSkillRuntime 缓存条件按 modules 核对（防裸运行时短路 office 依赖补装） |
+| `tools.go` | 任务会话工具集（接入权限引擎与本地/远程执行环境抽象；含 web_fetch）。`progress_write` 带 `action`：缺省/set=写清单（老行为，缺 progress 报错而不是静默清空），list=只读给出进度清单+运行中的程序+后台等待项，cancel=撤销一条 `aq-` 后台请求。`run_command` 的 `run_in_background` 跑完由 `reportCommandJob`（run_python.go）投【后台命令回报】并唤醒会话，与 run_python 同一口径 |
+| `run_python.go` | run_python 工具：AI 交 Python 脚本全文，自动落盘 `.jxai/tmp/<会话id>/`（会话删除随 handleDeleteSession 回收、启动按天兜底清理）后用内置便携运行时执行；与 run_command 同一把权限锁/沙箱/编码注入（Shell 形态，不走绕过沙箱的 Argv 直跑）；提示词按「建议」引导 JSON/引号/多步场景优先用它（run_command 仍可用，无硬限制）；ensureSkillRuntime 缓存条件按 modules 核对（防裸运行时短路 office 依赖补装）。**后台执行**：run_in_background=true 立即返回作业 id（不限时），跑完由 startJob 的 onDone 回调投【后台脚本回报】并唤醒本会话（reportPythonJob；2026-11-18 起与 reportCommandJob 一致，以 run_python 的合成工具回执对投递——`startToolReportRound`/被终止走 NoKick 不自动叫醒，对齐派发回报的叫停纪律） |
+| `bridge.go` | **run_python 工具桥**（编排原语，对齐 DSH PTC / ZCode workflow 的思路）：每次 run_python 在会话脚本目录生成 `jx.py`（含一次性 token），脚本内 `import jx` 即可 `jx.call(tool, args)` 调白名单工具（read/glob/grep/list_dir/write/edit/snapshot_file/run_command/web_fetch/web_search/read_skill）、`jx.dispatch(task)` 派子任务、`jx.wait(sid)` 等回报、`jx.sessions()` 看状态。链路：脚本 → POST 127.0.0.1:`listenPort`/api/bridge/tool（loopbackOnly 闸）→ 以该会话 toolContext 走既有工具管线（权限/沙箱照常）。安全三层：token 一次性（前台随 runChild 返回注销、后台随作业收尾注销）；白名单+剥审批参数（sandbox_permissions/justification/run_in_background/visible 一律剥——桥上无交互上下文，绝不弹卡）；限额（总量 200 次/并发 4/活跃子任务 4）。**回报路由**：桥派子任务的【派发回报】在 runtime.go 投递点被 bridgeInterceptReport 拦截存表（不投父会话、不起轮），由 jx.wait 取走（取走即清）；脚本退出时 bridgeRelease 注销 token、把未取走的回报转交常规投递（startReportRound），主对话只被打扰一次、回报不丢 |
 | `websearch.go` | 联网搜索工具 web_search 的客户端半边：调 jxai-server 的 /api/search 网关（服务端持上游 key，首版上游=智谱联网搜索 MCP）；服务端地址取 searchURL，空则市场同源；服务端走不通（未配置/不可达/网关报错）时错误文案附加改道指引，让模型转用「本机网络搜索」技能（内置技能 技能/web-search-local/，纯标准库 search.py 直调搜索 API：智谱/博查配 key 优先、Firecrawl 免 key 兜底）——指引仅在技能可用时附加（searchErrHint→skillAvailable，内置在位或用户技能形态存在且启用），技能不在场后指引自动消失，兜底能力不进工具定义、整体可插拔。设置入口在 设置·网络访问·「联网搜索」分区的「搜索服务」框（改 searchURL，即时生效、无需重启）：旁边原样显示后端算出的当前生效 base——`GET /api/config` 的 `searchURL`/`searchEndpoint`/`searchEndpointErr`（分别是配置值、此刻真要打的地址、算不出来的原因），让用户一眼看到搜索现在打哪儿；保存走既有单字段 `POST /api/config`，非法地址在保存时就 400（`searchURL 不合法`，与运行期同口径），留空即回到市场同源 |
 | `browser_ops.go` | browserTarget 操作面：browser_* 工具与面板端点的形态无关接口 |
 | `browser_host.go` | chromedp 浏览器宿主：有头独立窗口 + 网页形态的后台无头内嵌目标 |
@@ -1747,10 +2094,10 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `assistant.go` | 数字助理总控：编排工具 + 会话压缩摘要（建会话/模型选择走 sessioncreate.go 的 service） |
 | `callapi.go` | call_api 通用直通工具（仅 assistant 模式注入）：路由元数据注册表（server.go apiRoute 注册即元数据，AI 可调接口目录是注册的副产品）+ 进程内直调执行器（httptest Recorder 打到与前端同一 mux）+ 最低权限档标注与危险接口审批（调用时按会话档位校验）；完整目录渲染进 call_api 工具定义（含档位与 ⚠ 标记，进程内缓存） |
 | `sessioncreate.go` | 建会话/改权限的 service 单源：createSession（HTTP 人工建会话、dispatch_task、dispatch_sub 三入口共用：模式/权限默认、能力默认、分支克隆、历史继承（失败回滚）、skill-create 演示材料兜底）+ applyPermissionChange（权限档落装与能力联动，人工 PATCH 与 send_to_session 共用） |
-| `assistant_versions.go` | 数字经理主对话的「版本」：每一版就是一个 assistant 顶层会话（会话 id/标题/工作目录/权限/模型各自独立），版本号落 sessdata、当前版本指针落 globaldata（**唯一口径 currentAssistant()**——设置页压缩/清空、待办转交、request_manager、前端入口都认它，不再按「最近更新的那个」猜）；新建一版从零开始、老版本原样保留，切换只动指针 |
+| `assistant_versions.go` | 长期助理主对话的「版本」：每一版就是一个 assistant 顶层会话（会话 id/标题/工作目录/权限/模型各自独立），版本号落 sessdata、当前版本指针落 globaldata（**唯一口径 currentAssistant()**——设置页压缩/清空、待办转交、request_manager、前端入口都认它，不再按「最近更新的那个」猜）；新建一版从零开始、老版本原样保留，切换只动指针 |
 | `historytools.go` | 跨会话历史查询工具（search / read_session_messages） |
 | `context.go` | 上下文组装管线（环境快照**追加式**：首条整份、后续差分——纯新增发短补充、条目有减/换值发【移除】/【新增】中文标签变更清单（不用 +/- 记号：与条目行首 "- " 列表符撞车有歧义）、差分连续 5 条后完整重发一次校准（envRowRender 计数），已发送前缀绝不改写）+ 规则压缩 + 模型摘要 + 溢出兜底 + 压缩成功后无条件重发完整环境快照（resendEnvAfterCompact：基线被埋时保留区首条整份恢复，同文差分为空零冗余） |
-| `runtime.go` | 后台运行时：执行注册表、全局事件总线、派发执行体、中断恢复 |
+| `runtime.go` | 后台运行时：执行注册表、全局事件总线、派发执行体、中断恢复；待生效消息（插话/排队）与投递收口 `deliverToSession`/`NoKick`（用户侧消息）＋ `startToolReportRound`/`deliverToolReportNoKick`/`landToolPair`（**合成工具回执对**：后台回执以 assistant(tool_calls)+tool 两行 origin=toolreport 落库，函数名回显原工具；run_command/run_python 后台回报与后台询问/审批/计划回执共用，时机与派发回报同一套：忙则插话、流式中打断、闲则起轮/只落库。起轮的事件分发与用户消息轮同一套 `runEmitOf`——2026-11-19 修：只发订阅者不广播的话，后端拉起的轮（计划批准后续跑）在前端整段不可见、跑完才一次性出现；前端 exit_plan_mode 回执升格计划卡、其余按普通工具行折叠） |
 | `session.go` | 会话元信息与工具函数 |
 | `store.go` | SQLite 存储层与旧数据迁移 |
 | `adapters.go` | DSH 插件兼容层实现：扫描、开关联查、资产清单、Go 半边注册点 |
@@ -1758,19 +2105,64 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `adapter_dsh_speech.go` | dsh-speech 的 Go 半边：润色端点（复用已配置模型）+ 听写提示词段 |
 | `components.go` | 组件管理：扫描、开关状态、组件资产服务、`Rescan`（市场装卸后重扫） |
 | `update.go` | 更新检查：定期拉发布源（updateURL，Gitea releases/latest 或 jxai-server 的 /updates/latest，两者同格式），tag_name 比当前新就经事件流推横幅；versionCompare 双体系（日期+V序号 恒新于 旧点分号） |
-| `update_blocks.go` | 分块静默更新：release 附件带 blocks.json（快照式清单=每块当前应是什么版本）就走静默路——engine 块趁旧进程活着原地换 exe（改名交换，重启生效，`POST /api/update/restart` 用 PowerShell 助手逃逸 Job 接力重启）、组件块杀 worker 后整目录替换热生效；落后多版一步对齐每块最新，没有 blocks.json 的旧源回退整包横幅；`config.updateMode`（auto/manual） |
-| `update_restart_windows.go` | 立即重启助手：经 WMI 托管一条纯 cmd 内联接力命令（不落地脚本文件——2026-10-15 实测部分机器拦 WMI 派生进程执行 .ps1 与 cmd→powershell 链；WMI 派生进程工作目录在 System32、不认裸名 powershell，一切路径必须绝对）到 Job 外，等约 5 秒拉起新 exe 并留痕 restart.log，ShowWindow=0 不闪窗；WMI 失败回退 CREATE_BREAKAWAY_FROM_JOB |
+| `update_blocks.go` | 分块静默更新：release 附件带 blocks.json（快照式清单=每块当前应是什么版本）就走静默路——engine 块趁旧进程活着原地换 exe（改名交换，重启生效，`POST /api/update/restart` 用 PowerShell 助手逃逸 Job 接力重启）；组件块「改名挪开旧目录→新目录落位」整目录替换热生效，**挪不动（运行中的 worker / 语音输入法占着文件）就绝不硬来**：包下载暂存到 `data/updates/pending/<id>`、旧版与旧进程原样继续服务，下次启动时由 `ApplyPendingComponentBlocks`（NewApp 里 InitComponents 之后、Bridge/输入法起来之前调用）一次落地——不打断用户正在用的听写/输入法（2026-11-16 用户口径「先等着，重启跟着更新」，此前「杀 worker 再删」会把目录删成半残，2026-11-14 的 voice 事故）；暂存同 sha 不重复下载，失败原因中文化进 `componentsPending` 状态；落后多版一步对齐每块最新，没有 blocks.json 的旧源回退整包横幅；`config.updateMode`（auto/manual） |
+| `update_restart_windows.go` | 立即重启助手：经 WMI 托管一条纯 cmd 内联接力命令（不落地脚本文件——2026-10-15 实测部分机器拦 WMI 派生进程执行 .ps1 与 cmd→powershell 链；WMI 派生进程工作目录在 System32、不认裸名 powershell，一切路径必须绝对）到 Job 外，等约 8 秒拉起新 exe 并连试 3 次、间隔约 8 秒（单实例互斥体保证重复拉起无害；2026-11-20 事故前只拉一次，旧进程退得慢的机器新实例被互斥体顶掉后再无人拉起），留痕 restart.log，ShowWindow=0 不闪窗；WMI 失败回退 CREATE_BREAKAWAY_FROM_JOB |
 | `wizard.go` | 公司接入向导后端：POST /api/wizard/discover（UDP 广播找同公司服务端——浏览器发不了 UDP 故在 Go 侧做，255.255.255.255+子网定向广播、公司名=口令、registryURL 查询兜底）+ POST /api/wizard/connect（验证 healthz → POST /provision → 内部提供方 company-internal 置顶即默认、marketURL/updateURL/wizardDone 一键落位；重跑替换不堆积）；config 增 wizardDone/registryURL |
 | `market.go` | 市场客户端半边：拉 jxai-server 清单（60s 缓存）、下载 zip+sha256 校验、三类型安装路由（技能→addUserSkill / 组件→组件目录+Rescan / 插件→ccInstallFromPath 落 `jx-market`）、装卸记账 `data/market_installed.json`、`GET /api/market` + `/install` + `/uninstall`；地址在 `config.marketURL`（设置·网络访问，环境快照尾部有「企业技能市场」一行：地址+自签 HTTPS 需 curl -k 的提示）。对服务端的请求一律带 `X-Jxai-User` 头（值=发布者姓名，没设不带）——服务端记条目归属 owner 与下载/安装明细；安装成功后上报 `POST /api/market/report-install` |
-| `brand_sync.go` / `brand_sync_test.go` | 品牌下发客户端半边（服务端 jxaiserver brand.go → /announce.brand）：LOGO 与界面文字（侧栏/首页 hero/关于页/title）由服务端管理页统一配置，**客户端无配置入口**只消费；缓存于 `data/brand/`（brand.json + logo.png），渲染全程读本地（`/logo.png` 路由优先本地缓存图、`GET /api/brand` 出文字、前端 brand 事件刷新）；**LOGO 按 logoHash 比对只在该换时下载一次**（流量硬口径），nil（老服务端）不动本地，hash 空回退内置默认 |
-| `migrations.go` / `migrations_test.go` | 迁移机制（Flyway 式）：版本化一次性任务 + 执行账本 `data/migrations.json`（id→执行时刻）。一次性动作（清理误发文件、目录搬家……）往 `appMigrations` 清单**尾部**追加条目，NewApp 启动时跑：执行过记账永不再跑，失败记日志不记账下次重试，不阻断启动。id 规范「日期.短名」；任务体尽力而为（小失败内部消化、返回 nil 即记账；SkillsDir 等基础设施错误才返回 error）。首个收编条目：泄漏技能清理与内置技能搬家（此前是「每次启动全量扫描、靠自身幂等」的散装自愈）。数据库 schema 迁移另有一套（store.go 的 migration，管 SQLite），两者各管各的域 |
-| `market_publish.go` / `market_publish_test.go` / `market_publish_meta_test.go` | 市场·技能发布（**先装后传**）：只能发布已装到 `技能/user/` 的技能——后端从安装目录现场打 zip、走 inspectSkillZip/rewriteSkillZip 校验链（恰好一处 SKILL.md、内容体检、结构规整）、元信息按回退链补全（id 候选含中文→英文词表 `skillIDFromChinese`，词表只在 Go 一份），流式转发服务端用户端点 `/api/market/publish`；`GET /api/market/publish-meta` 给弹层预填；下架走 `/api/market/unpublish`——**归属校验与「挪进服务端回收站」都在服务端**，客户端只发消息（本地姓名比对只是按钮显隐的 UX） |
-| `todo.go` / `todotools.go` | 待办与定时任务（组件 `todo-scheduler` 的宿主半边）：清单、调度、两类执行（AI 任务可选执行目标：数字经理/新工作任务，后者走 `createSession` 单源建会话）/ 模型工具 |
+| `brand_sync.go` / `brand_sync_test.go` | 品牌下发客户端半边（服务端 jxaiserver brand.go → /announce.brand）：LOGO 与界面文字（侧栏/首页 hero/title）由服务端管理页统一配置，**客户端无配置入口**只消费；缓存于 `data/brand/`（brand.json + logo.png），渲染全程读本地（`/logo.png` 路由优先本地缓存图、`GET /api/brand` 出文字、前端 brand 事件刷新）；**LOGO 按 logoHash 比对只在该换时下载一次**（流量硬口径），nil（老服务端）不动本地，hash 空回退内置默认。**设置·关于页不参与品牌**（2026-11-19 用户口径：关于页是软件自身基础信息，名称写死软件正式名「坚祥数字助理」（exe/包名「AI数字助理」是打包名、互不跟随）、LOGO 走 `GET /logo-default.png` 只出内置默认图，applyBrandTexts 不覆盖） |
+| `migrations.go` / `migrations_test.go` | 迁移机制（Flyway 式）：版本化一次性任务 + 执行账本 `技能/.migrations.json`（id→执行时刻）。一次性动作（清理误发文件、目录搬家……）往 `appMigrations` 清单**尾部**追加条目，NewApp 启动时跑：执行过记账永不再跑，失败记日志不记账下次重试，不阻断启动。id 规范「日期.短名」；任务体尽力而为（小失败内部消化、返回 nil 即记账；SkillsDir 等基础设施错误才返回 error）。**账本必须与清理对象同域**：技能目录是程序目录域（开发版/隔离实例各有 dataDir 却共用一个技能目录），账本放数据目录会让每个新实例首跑重炒一遍（2026-11-09 事故：隔离实例重跑清理，删了市场正式安装的 4 个技能）；旧位置 `data/migrations.json` 只读合并、升级首跑自动搬进新账本。首个收编条目：泄漏技能清理与内置技能搬家（此前是「每次启动全量扫描、靠自身幂等」的散装自愈）。数据库 schema 迁移另有一套（store.go 的 migration，管 SQLite），两者各管各的域。**开发实例兜底闸 `JX_SKIP_MIGRATIONS`**：环境变量非空即整体跳过迁移（不读不写账本、不碰技能目录），开发启动脚本（并行/录屏演示/rebuild-engine/Electron）默认注入 =1，正式版不设、行为不变。**旧二进制归档警告（2026-11-14）**：曾存在于仓库根的 `jx-assistant.exe`（2026-11-05 12:45 版）与 `坚祥数字助理GO.exe.prev`（10-31 版）是**不含账本同域修复的旧逻辑二进制**，已归档至 `D:\智能体工作区\数字助理GO\obsolete\`，**禁止再启动**——被配临时 dataDir 拉起会在技能目录重跑三条迁移并删技能（2026-11-12 promo 实证；启动脚本均已加二进制防旧自检） |
+| `market_publish.go` / `market_publish_test.go` / `market_publish_meta_test.go` / `market_publish_ref_test.go` | 市场·发布（**先装后传**，技能/组件/插件三类）：发布已装到本机的东西——技能（`技能/user/`）沿用 inspectSkillZip/rewriteSkillZip 校验链与元信息回退链（id 候选含中文→英文词表 `skillIDFromChinese`，词表只在 Go 一份），id/版本可表单改写；组件（仅用户组件，内置拒收）与 Claude 插件（claude-plugins 缓存根）的 id/版本锁定为包内清单值（manifest.json / plugin.json——市场条目 id 与安装键、已装判定全锚它们）且与市场在架同版本时拒收（内容有变化必须升号），打包剔除运行时产物/用户数据（`publishSkip*`：webview2-profile、node_modules、`__pycache__`、history、config.json 凭据、日志等，剔除清单回显前端）；流式转发服务端用户端点 `/api/market/publish`，服务端开审核时的 pending+message 原样透传（弹「等待管理员审核」）；`GET /api/market/publish-meta?type=…` 给弹层预填；下架走 `/api/market/unpublish`——**归属校验与「挪进服务端回收站」都在服务端**，客户端只发消息（本地姓名比对只是按钮显隐的 UX） |
+| `todo.go` / `todotools.go` | 待办与定时任务（组件 `todo-scheduler` 的宿主半边）：清单、调度、两类执行（AI 任务可选执行目标：长期助理/新工作任务，后者走 `createSession` 单源建会话）/ 模型工具 |
 | `gitpanel.go`（+`gitpanel_windows.go`/`_other.go`） | Git 面板（组件 `git-panel` 的宿主半边）：仓库扫描、porcelain/图谱/分支解析、暂存/提交（白名单 argv 直调 git，永不过 shell） |
 | `gittools.go` | git_sync 模型工具（组件 `git-panel`）：与面板共用 gitSync 执行缝的宿主通道远程同步，绕开沙箱内远程 git 必败的限制（背景与实测见《Git远程同步工具-改动说明.md》） |
 | `server.go` | 路由、聊天 SSE、全局事件流、压缩接口、插件注入、内嵌前端 |
 | `web/` | 前端：工作区分组侧栏、子对话抽屉、子任务卡片、模型选择器、设置页、市场页（`app-market.js`：左侧栏底部入口、主区整页视图 body.market-mode、三 tab+搜索+一键装卸；组件装卸后 `CX.refresh()` 热生效） |
 > **服务端已独立成仓库**（`D:\智能体工作区\jxaiserver`，module jxai-server）：远程访问中继 + 技能/组件/插件市场（含 /admin 管理页）+ 更新分发（日期+V序号版本体系）+ 公司接入（登记/UDP 发现/按人发 new-api 令牌/每月额度）。本仓库只保留客户端半边（market.go 市场客户端、wizard.go 接入向导、update.go 更新检查——与服务端的协议契约见各自文件头注释）；其部署与用法见该仓库 README/部署。开发完全分开，两边接口变更需双侧同步。
+
+## 渠道协议（provider protocol）
+
+同一套 agent（主循环/上下文/工具）支持三种渠道协议，按**渠道类型**而非全局选择：
+
+- **选型入口**：设置 → 模型 → 渠道卡片 →「协议类型」下拉。三选一：
+  `OpenAI 兼容 · chat/completions`（默认，存量配置不受影响）、
+  `Anthropic 原生 · /v1/messages`、`OpenAI Responses · /v1/responses`。
+  预置的「Anthropic」提供方固定走原生协议、「OpenAI（Responses 协议）」
+  固定走 Responses（同 BaseURL 同 Key，两种端点并存）；自定义渠道自由切换。
+- **实现**：`ProviderCfg.Protocol`（空串=OpenAI 兼容）→ `LLMTarget.Protocol` →
+  `StreamChat` 按 `llmProtocol`（llmproto.go）分发；mock 演示、主备地址故障
+  转移、停止断开器、错误整理三协议共用；agent/上下文/工具循环零感知，
+  消息仍是统一 Message/ToolCall 形态，转换只在发出前最后一步。
+- **baseURL 约定**：三种协议一致——填到版本前缀（如
+  `https://api.anthropic.com/v1`），端点路径由协议实现拼
+  （/chat/completions、/messages、/responses）；「拉取模型」「测试连通」
+  也按协议选端点与鉴权头（Anthropic 用 x-api-key + anthropic-version，
+  其余 Bearer）。
+- **思考档位对照表**：档位清单由 `guessReasoningLevels(protocol, modelID)`
+  按协议+模型 ID 推断（/models 拉不到能力信息，同一模型在不同协议下档位
+  不同）；`effectiveReasoningLevels` 用同一口径把存量配置里的旧推断档位
+  （子集）自动刷新到当前版本——菜单档位没有手工编辑入口，全靠它跟随升级。
+  UI 文案 THINK_LABELS（开/关/低/中/高/最大）。
+
+  | 协议 | 适用模型 | 菜单档位 | 请求报文 |
+  |---|---|---|---|
+  | Anthropic 原生 | claude-* | 开/关/低/中/高/**最大** | `thinking{type:enabled,budget_tokens}`：low=2048、medium=6144、high=12288、max=24576、enabled=6144；disabled 与空串省略 thinking 即不思考。max_tokens 必须大于预算（不足自动抬升），思考时不发 temperature |
+  | OpenAI Responses | gpt-5* / o3 / o4 | 关/低/中/高（无 max） | `reasoning.effort`：low/medium/high 原样；disabled 与空串省略 reasoning（gpt-5 服务端默认 medium）；推理模型思考关不掉，「关」=不发参数；max 归 high（兼容映射） |
+  | OpenAI 兼容 | deepseek-* | 开/关/低/高/**最大** | `thinking{type}` 开关 + `reasoning_effort` low/high/max 原样透传 |
+  | OpenAI 兼容 | gpt-5* / o3 / o4 | 低/中/高 | `reasoning_effort`（官方 chat/completions 也支持，无关闭档） |
+  | OpenAI 兼容 | claude-*（走网关） | 开/关/低/中/高 | 维持既有口径（thinking{type}/reasoning_effort 各自透传；不给 max——多数网关不认，选了不生效不如不列） |
+
+  会话级档位 PATCH 白名单（server.go）= 枚举全集
+  `enabled/disabled/low/medium/high/max` + 空串，**不分协议**——渠道协议
+  切换后档位串由协议层各自映射，校验只挡非法值。
+- **usage 归一**：Anthropic 的 `cache_read_input_tokens` /
+  `cache_creation_input_tokens` 映入 Usage 的 CacheReadTokens /
+  CacheCreationTokens（写入量不计入命中）；Responses 的
+  `input_tokens_details.cached_tokens` 走 OpenAI 标准口径。取数一律走
+  `CacheHit()/CacheMiss()/ReportsCache()`。
+- **工具往返**：Anthropic 用 tool_use/tool_result block（连续 tool 消息
+  合并进同一条 user 消息；assistant 的 reasoning_content 不回传）；Responses
+  用 function_call/function_call_output 顶层 item；OpenAI 兼容照旧
+  tool_calls/tool_call_id。三协议对上层暴露完全相同的 ToolCall。
 
 ## 前后端接口
 
@@ -1789,8 +2181,9 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `POST /api/sessions/{id}/retry` | 失败后重试：不重复落库用户消息，带着当前上下文再跑一轮（SSE 流式返回，同 /chat） |
 | `POST /api/sessions/{id}/interject` | 执行中发消息：`{content, mode}`，`steer`=插话（模型调用中立即打断当前流、下一步带着插话重调；工具执行中等下一步调用模型前注入）、`queue`=排队（本轮结束后作为独立一轮发送）；未在执行时按排队处理并顺手拉起执行 |
 | `POST /api/sessions/{id}/pending` | 排队坞操作：`{id, action:'remove'\|'steer'}`（移出队列 / 提前为插话）、`{id, action:'move', before:锚点id\|空=队尾}`（拖拽排序，只动排队队列顺序）、`{action:'pause'\|'resume'}`（队列级暂停/继续，不需要 id；恢复时空闲且有排队消息顺手拉起执行）；前端「编辑排队/插话消息」＝ `remove` 后把原文回填输入框草稿，复用 remove，无新 action |
-| `POST /api/sessions/{id}/compact` | 手动压缩为一条摘要 |
-| `GET /api/assistant/versions` | 数字经理主对话的版本清单（`{current, versions:[{sessionId,version,messages,updatedAt,running,current}]}`；当前版本指针存库，前端入口与设置页都按它走，见 assistant_versions.go） |
+| `POST /api/sessions/{id}/compact` | 手动压缩：rule 模式同步折叠即回；llm 模式同步预检后转后台摘要（202 `{async:true}`，完成/失败经 session_updated 广播，重复点火 409） |
+| `POST /api/sessions/{id}/autocompact` | 提前自动压缩：通道选路同阈值触发（rule 同步折叠 / llm 后台摘要，同上） |
+| `GET /api/assistant/versions` | 长期助理主对话的版本清单（`{current, versions:[{sessionId,version,messages,updatedAt,running,current}]}`；当前版本指针存库，前端入口与设置页都按它走，见 assistant_versions.go） |
 | `POST /api/assistant/versions/new` | 新建一版数字助理主对话（从零开始聊，沿用当前版本的工作目录/权限/模型等设置；老版本历史、快照、交付原样保留） |
 | `POST /api/assistant/versions/switch` | 切换当前版本（`{sessionId}`）：只动指针，两边数据都不碰；切完主对话区显示那一版的历史 |
 | `POST /api/assistant/compact` `/clear` | 对**当前这一版**压缩 / 清空历史（clear 已不在设置页露出——那里换成了「新建一版」，接口保留给彻底重置本版历史用） |
@@ -1798,7 +2191,7 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `GET /api/approvals` | 待决定的越权审批清单（轮询兜底） |
 | `GET /api/questions` | 待回答的助手提问 / 计划审批清单（轮询兜底） |
 | `POST /api/questions/{id}` | 回答提问；计划批准传 `__approve__`，修改传反馈文本，**忽略（搁置：本轮停下、计划仍留着）传 `__ignore__`**；内存里没有等待者的（重启后遗留的待审批计划）走 resolvePersistedPlan |
-| `GET /api/sessions/{id}/progress` | 会话进度清单（progress_write 的持久化结果） |
+| `GET /api/sessions/{id}/progress` | 会话进度清单（progress_write 的持久化结果）+ 本会话「运行中的程序」（running）+ 本会话「后台等待项」（asks，asyncask.go） |
 | `POST /api/sessions/{id}/stop-child` | 停止会话的一个运行中程序（进度面板停止按钮；body: id=job-*/child-*，userstops.go） |
 | `GET /api/sessions/{id}/plans` | 会话历史里提交过的计划（exit_plan_mode 的正文 + 出处，右栏「计划」视图的数据源；plans.go） |
 | `POST /api/sessions/{id}/plans/export` | 把某份计划写成工作区里的 `计划-<时间>-<标题>.md`（`{seq}` 缺省最新一份；同名不覆盖、顺延 -2/-3） |
@@ -1815,8 +2208,8 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `GET /api/components/{id}/{file}` | 组件浏览器半边资产（仅启用时提供；挂 `/api/` 下让中继隧道覆盖，cx.js fetch 文本注入） |
 | `GET /api/market` | 市场清单视图（jxai-server 清单 + 本机安装态；`?refresh=1` 绕过 60s 缓存；未配置时给建议地址） |
 | `POST /api/market/install` `/uninstall` | 一键安装/更新/卸载 `{type: skill\|component\|plugin, id}`（下载 zip+sha256 校验后路由到三套体系；组件装卸后前端 `CX.refresh()` 热生效；安装成功后台异步上报服务端记 install 明细） |
-| `GET /api/market/publish-meta` | 已装技能的发布元信息推导 `?skill=<id>`（弹层预填：id/显示名/版本/描述/标签 + 词表建议标注） |
-| `POST /api/market/publish` | 发布**已安装**的用户技能 `{skillId, id, name, version, description, tags}`（后端从 `技能/user/` 打包转发市场服务器，身份=X-Jxai-User 头；先装后传） |
+| `GET /api/market/publish-meta` | 已装条目的发布元信息推导 `?skill=<id>` / `?type=component&id=` / `?type=plugin&key=`（弹层预填：id/显示名/版本/描述/标签 + 词表建议标注 + 打包剔除清单） |
+| `POST /api/market/publish` | 发布**已安装**的技能/组件/插件 `{type, skillId\|componentId\|pluginKey, id, name, version, description, tags}`（后端从安装目录打包转发市场服务器，身份=X-Jxai-User 头；先装后传；组件/插件 id/版本锁定为包内清单值，同版本重传 400 要求升号） |
 | `POST /api/market/unpublish` | 下架自己发布的条目 `{type, id}`（服务端判归属后挪进回收站，403 文案透传） |
 | `POST /api/skills/install-files` | 技能文件夹拖拽安装（multipart files+paths，公共顶层目录=技能文件夹名；散文件/路径穿越拒收，走同一条 addUserSkill） |
 | `GET/POST /api/todos` | 待办/定时任务清单 / 新建（组件 `todo-scheduler`；未启用时 404。**跨会话的全局清单，与会话内 `progress_write` 的进度清单是两回事**） |

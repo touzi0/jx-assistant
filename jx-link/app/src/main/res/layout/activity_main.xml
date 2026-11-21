@@ -13,6 +13,44 @@
         android:paddingEnd="16dp"
         android:paddingTop="14dp">
 
+        <!-- 更新横幅：检测到新版本时出现；点文字打开下载/安装流程，点 ✕ 本版本不再提醒 -->
+        <LinearLayout
+            android:id="@+id/update_banner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/bg_update_banner"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingStart="14dp"
+            android:paddingEnd="6dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="10dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/update_banner_text"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textColor="@color/accent"
+                android:textSize="13sp"
+                android:maxLines="2"
+                android:lineSpacingExtra="2dp"
+                android:text="发现新版本，点击更新" />
+
+            <TextView
+                android:id="@+id/update_banner_close"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:minWidth="36dp"
+                android:minHeight="36dp"
+                android:text="✕"
+                android:textColor="@color/text2"
+                android:textSize="14sp" />
+        </LinearLayout>
+
         <TextView
             android:id="@+id/home_title"
             android:layout_width="wrap_content"

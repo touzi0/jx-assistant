@@ -255,10 +255,10 @@ func TestStopSessionToolSchemaAndPrompt(t *testing.T) {
 			t.Fatalf("工具描述缺要点 %q：\n%s", want, desc)
 		}
 	}
-	// 系统提示词：工具清单加一条 + 一条使用规则（仅按用户指示停；停完告知用户）
+	// 系统提示词：定稿第三节写明 stop_session 的使用规则（仅按用户指示停；停完回一句已停止）
 	sys := a.systemPrompt(&SessionMeta{Mode: "assistant"})
-	if !strings.Contains(sys, "- stop_session：") {
-		t.Fatalf("数字助理提示词的工具清单里应有 stop_session：\n%s", sys)
+	if !strings.Contains(sys, "stop_session") {
+		t.Fatalf("数字助理提示词应提到 stop_session：\n%s", sys)
 	}
 	if !strings.Contains(sys, "只在用户明确要求时停") {
 		t.Fatalf("数字助理提示词应写明「只在用户明确要求时停」：\n%s", sys)

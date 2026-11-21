@@ -74,7 +74,7 @@ class ShareActivity : Activity() {
         val checked = devs.indexOfFirst { it.id == last }.let { if (it >= 0) it else 0 }
         AlertDialog.Builder(this)
             .setTitle("分享送到哪台电脑？")
-            .setSingleChoiceItems(devs.map { it.name }.toTypedArray(), checked) { _, _ -> }
+            .setSingleChoiceItems(devs.map { it.displayName() }.toTypedArray(), checked) { _, _ -> }
             .setPositiveButton("送入") { d, _ ->
                 val lv = (d as? AlertDialog)?.listView?.checkedItemPosition ?: checked
                 copyAndGo(devs[if (lv in devs.indices) lv else checked], streams, text)

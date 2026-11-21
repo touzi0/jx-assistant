@@ -20,7 +20,8 @@
   const KEY_NAMES = {
     ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift', meta: 'Win', space: '空格', enter: 'Enter',
     arrowup: '↑ 上', arrowdown: '↓ 下', arrowleft: '← 左', arrowright: '→ 右',
-    'mouse-side': '鼠标侧键', 'mouse-left': '鼠标左键', 'mouse-right': '鼠标右键',
+    'mouse-side': '鼠标侧键', 'mouse-side-1': '鼠标侧键1', 'mouse-side-2': '鼠标侧键2',
+    'mouse-left': '鼠标左键', 'mouse-right': '鼠标右键',
   };
   const MOD_ORDER = { ctrl: 0, alt: 1, shift: 2, meta: 3 };
   const isModKey = (k) => k === 'ctrl' || k === 'alt' || k === 'shift' || k === 'meta';
@@ -45,7 +46,10 @@
     return null;
   }
   function normMouse(e) {
-    return { 0: 'mouse-left', 2: 'mouse-right', 3: 'mouse-side', 4: 'mouse-side' }[e.button] || null;
+    // button 3=XBUTTON1（侧键1·后退位）4=XBUTTON2（侧键2·前进位）：
+    // 录制器录出具体键名，用户才能"只绑某一枚侧键"；旧配置的 'mouse-side'
+    // （两枚都算）仍由各引擎自行兼容
+    return { 0: 'mouse-left', 2: 'mouse-right', 3: 'mouse-side-1', 4: 'mouse-side-2' }[e.button] || null;
   }
   // 组合的规范形：修饰键在前（固定序）+ 其余字典序，加号连接——引擎匹配与冲突
   // 查重都用它比较
@@ -603,7 +607,7 @@
   /* ---------- ↑↓：按「此刻」左侧列表切对话 ----------
      列表是活的（新建 / 归档 / 分组折叠 / 回收视图都会变），DOM 就是唯一真相——
      按键瞬间读 #session-list 里可见的 .session-item 顺序，找当前项上下移动；
-     到头不环绕。当前对话不在列表里（如数字经理对话）时：向下进第一项、向上不动。 */
+     到头不环绕。当前对话不在列表里（如长期助理对话）时：向下进第一项、向上不动。 */
   function switchConversation(dir) {
     const box = $('session-list');
     if (!box) return;

@@ -81,9 +81,12 @@ android/
     结果 POST `/api/device/result`；本机可 `curl /api/device/selftest`
     一键诊断全链（截屏/界面树/ADB 连接/shell/截屏 PNG）。
 - 交付出口：`deliver_result` 在手机端把成品落到
-  `/sdcard/Download/坚祥数字助理/`（targetSdk 28 legacy storage，运行时申请
-  WRITE_EXTERNAL_STORAGE 即可；未授权时报错自带引导文案）。
-- API Key：首启引擎以 mock 模式跑，用户在设置页录入后落盘（0600，应用私有目录）。
+  `/sdcard/Download/AI数字助理/`（targetSdk 28 legacy storage，运行时申请
+  WRITE_EXTERNAL_STORAGE 即可；未授权时报错自带引导文案；目录名随
+  2026-11-19 产品改名从「坚祥数字助理」改为「AI数字助理」）。
+- API Key：首启引擎**不预置任何模型通道**（与桌面/网页版一致，2026-11-13 起），
+  壳里打开就是空的——用户在向导里接入公司通道，或到设置·模型添加提供方后落盘
+  （0600，应用私有目录）；想离线演示就把某家提供方的 API 地址填成 `mock`。
 
 ## 构建
 

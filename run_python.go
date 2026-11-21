@@ -33,6 +33,28 @@ import (
 // 分隔符，杜绝 ../ 与扩展名技巧）。不合法的 name 一律忽略、改用时间戳名。
 var pyNameOK = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
+// flexBool 宽容布尔：隐藏参数 com 的取值解析。布尔 true 是正路（JSON
+// function calling 形态的模型直出）；但 com 刻意不进 schema，宿主层对
+// schema 外的参数无从知道类型——XML 参数形态（Claude 协议）的工具调用
+// 里参数值一律是字符串，com=true 到引擎手里已是 "true"，json 直解 bool
+// 字段会报 cannot unmarshal string 而整次调用失败。这里同时接受布尔与
+// "true"/"false" 字符串（大小写不敏感、容引号），null/空串视为未带；
+// 其余值报错（不静默当 false——拼错参数名之外的值拼错，宁可让模型看见）。
+type flexBool bool
+
+func (b *flexBool) UnmarshalJSON(v []byte) error {
+	s := strings.Trim(strings.ToLower(strings.TrimSpace(string(v))), `"'`)
+	switch s {
+	case "true", "1":
+		*b = true
+	case "false", "0", "null", "":
+		*b = false
+	default:
+		return fmt.Errorf("com 参数无法解析为布尔（只接受 true/false 及其字符串形态），收到: %s", string(v))
+	}
+	return nil
+}
+
 // pySessionDir 本会话的脚本目录：工作区 .jxai/tmp/<会话id>/。按会话分目录
 // 让多会话并行互不覆盖，删除会话时也能整目录回收。
 func pySessionDir(t *toolContext) string {
@@ -54,12 +76,21 @@ func runPythonTool() Tool {
 				"单一工具链调用（go build / git status 等）直接 run_command 即可。"+
 				"只用标准库与运行时已内置的包（office/pdf/ocr 技能的库也可用）；"+
 				"首次使用自动联网装配便携运行时（几分钟），之后离线可用；不要去找系统的 python/py。"+
-				"沙箱与升级机制同 run_command：被拒后可带 sandbox_permissions 与 justification 重试一次。",
+				"沙箱与升级机制同 run_command：被拒后可带 sandbox_permissions 与 justification 重试一次。"+
+				"——工具桥（编排原语）：脚本里 import jx 可直接调本会话工具（jx.call(\"read\", {...}) 等，"+
+				"白名单：read/glob/grep/list_dir/write/edit/snapshot_file/run_command/web_fetch/web_search/read_skill），"+
+				"把「N 步碎 tool call」合成一个脚本回合：循环、汇总、中间筛选都在脚本里做，"+
+				"只有最终结论进上下文；需要弹审批的操作（如沙箱升级）桥上会被拒，回前台做。"+
+				"还能 jx.dispatch(task) 派后台子任务（自足描述）+ jx.wait(session_id) 等回报——"+
+				"一个脚本并行编排多个子代理并汇总。"+
+				"——后台执行：run_in_background=true 时立即返回作业 id、脚本不限时继续跑，"+
+				"跑完系统自动给你【后台脚本回报】并唤醒你继续（长任务/并行推进用它，timeout_sec 后台忽略）。",
 			objSchema(map[string]any{
 				"code":                strProp("Python 脚本全文（与 path 二选一）"),
 				"name":                strProp("脚本文件名，可选：字母数字与 -_（如 http_test）；缺省按时间戳命名"),
 				"path":                strProp("重跑本会话已落盘的脚本（.jxai/tmp/<会话id>/ 下的相对或绝对路径；与 code 二选一）"),
-				"timeout_sec":         intProp("超时秒数，默认 60，上限 600"),
+				"timeout_sec":         intProp("超时秒数，默认 60，上限 600；后台作业忽略"),
+				"run_in_background":   boolProp("true 时后台执行并立即返回作业 id（仅本地）：不限时、可继续做别的事，结束后自动收到【后台脚本回报】并被唤醒继续；可 job_output 中途查看、job_kill 终止"),
 				"sandbox_permissions": strProp("仅用于被沙箱拒绝后的同轮重试：请求的更宽档位（workspace-write 或 danger-full-access），必须搭配 justification"),
 				"justification":       strProp("与 sandbox_permissions 搭配：一句话向用户解释为什么需要更宽权限"),
 			})),
@@ -69,13 +100,14 @@ func runPythonTool() Tool {
 
 func runPython(t *toolContext, args json.RawMessage) (string, error) {
 	var p struct {
-		Code               string `json:"code"`
-		Name               string `json:"name"`
-		Path               string `json:"path"`
-		TimeoutSec         int    `json:"timeout_sec"`
-		SandboxPermissions string `json:"sandbox_permissions"`
-		Justification      string `json:"justification"`
-		Com                bool   `json:"com"` // 隐藏参数：不进 schema，COM 专用（见 runPython 内通道注释）
+		Code               string   `json:"code"`
+		Name               string   `json:"name"`
+		Path               string   `json:"path"`
+		TimeoutSec         int      `json:"timeout_sec"`
+		RunInBackground    bool     `json:"run_in_background"`
+		SandboxPermissions string   `json:"sandbox_permissions"`
+		Justification      string   `json:"justification"`
+		Com                flexBool `json:"com"` // 隐藏参数：不进 schema，COM 专用（见 runPython 内通道注释；flexBool 容 XML 参数形态的字符串化 "true"）
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -146,12 +178,19 @@ func runPython(t *toolContext, args json.RawMessage) (string, error) {
 	// 与 run_command 同一把权限锁（exec：先按会话档执行，拒绝驱动升级）。
 	// 命令按平台构造：Windows 走 powershell -Command，`"exe" "script"` 在其
 	// 语法里是两个相邻字符串（非法），必须用调用操作符 & 引导；sh 形态无此问题。
+	// PYTHONPATH 指向会话脚本目录：Python 3.14 起不再把脚本目录自动加入
+	// sys.path，且便携运行时是 ._pth 隔离形态（PYTHONPATH 会被忽略）——所以
+	// 实际注入走 sitecustomize（bridge.go 已写进 site-packages），这里设置
+	// 的 JXPY_SESSION_DIR 是它读的环境变量。在命令内设置（$env: 前缀 /
+	// 前置 VAR=），不依赖沙箱环境白名单传递。
 	// 授权分叉：com=true 走隐藏的宿主直跑通道（full 凭证，见上方通道注释），
 	// 其余命令照旧 authorize 进沙箱。
 	quote := func(s string) string { return `"` + s + `"` }
 	display := quote(py.Exe) + " " + quote(scriptPath)
 	if isWindowsRuntime {
-		display = "& " + display
+		display = "$env:JXPY_SESSION_DIR=" + quote(dir) + "; & " + display
+	} else {
+		display = "JXPY_SESSION_DIR=" + quote(dir) + " " + display
 	}
 	label := "run_python"
 	var grant *Grant
@@ -172,6 +211,27 @@ func runPython(t *toolContext, args json.RawMessage) (string, error) {
 		return "", err
 	}
 
+	// 工具桥装配（前台与后台共用）：生成 jx.py（含一次性 token）+ 确保运行时
+	// sitecustomize 就位，脚本内 import jx 即可调白名单工具/派子任务。装配放
+	// 在权限确认之后——被拒不白装配。
+	bridgeKey, bridgeDone, berr := t.app.bridgePrepare(t, py.Exe)
+	if berr != nil {
+		return "", fmt.Errorf("工具桥装配失败（脚本仍可跑，只是没有 jx 模块）：%w", berr)
+	}
+
+	// 后台作业：立即返回，不限时；跑完由 onDone 投【后台脚本回报】并唤醒本会话。
+	if p.RunInBackground {
+		j, jerr := t.app.startJob(t, display, "", t.workspace(), grant.Policy,
+			"python:"+scriptPath, func(j *jobRun) { t.app.reportPythonJob(t, j, scriptPath, bridgeKey, bridgeDone) })
+		if jerr != nil {
+			bridgeDone()
+			return "", sandboxErrHint(jerr)
+		}
+		return fmt.Sprintf("后台脚本已启动：%s（沙箱 %s，不限时）。脚本：%s\n"+
+			"- 跑完系统自动给你【后台脚本回报】并唤醒你继续（脚本内 jx.dispatch 派的子任务回报会一并带上来）\n"+
+			"- job_output 可中途查看输出；job_kill 终止\n现在可以继续做别的事。", j.ID, grant.Policy, scriptPath), nil
+	}
+
 	timeout := time.Duration(60) * time.Second
 	if p.TimeoutSec > 0 {
 		timeout = time.Duration(min(p.TimeoutSec, 600)) * time.Second
@@ -181,10 +241,66 @@ func runPython(t *toolContext, args json.RawMessage) (string, error) {
 		Timeout: timeout, Policy: grant.Policy, Workspace: t.workspace(),
 		Remote: t.sess, Label: label, Model: true,
 	})
+	bridgeDone() // 前台脚本结束：注销桥 token；未取走的子任务回报转交常规投递
 	if err != nil {
 		return "", sandboxErrHint(err)
 	}
 	return "脚本：" + scriptPath + "\n" + out, nil
+}
+
+// reportPythonJob 是后台脚本作业的收尾回调（jobs.go startJob 的 onDone）：
+// 先释放工具桥（脚本没 wait 的子任务回报转交常规投递，不丢），再给本会话投
+// 【后台脚本回报】。用户/系统终止的作业改走 NoKick 投递（对齐派发回报的叫停
+// 纪律：用户刚停的东西不被自动叫醒）。回执以合成工具回执对（run_python 的
+// 后续结果）形态落库，前端按工具行折叠。
+func (a *App) reportPythonJob(t *toolContext, j *jobRun, scriptPath, bridgeKey string, bridgeDone func()) {
+	bridgeDone()
+	out := j.buf.String()
+	if len(out) > jobBufMax {
+		out = out[:jobBufMax]
+	}
+	text := fmt.Sprintf("【后台脚本回报】作业 %s 已结束（%s，运行 %s）。\n脚本：%s\n\n输出：\n%s\n"+
+		"（run_python 后台启动；job_output 可再查。脚本若派了 jx.dispatch 子任务，它们的回报在上面输出里或已单独转交。）",
+		j.ID, j.Status(), time.Since(j.startedAt).Round(time.Second), scriptPath, out)
+	args, _ := json.Marshal(map[string]any{"path": scriptPath, "run_in_background": true})
+	pm := toolReportPair("run_python", string(args), text)
+	m := t.sess
+	if strings.Contains(j.Status(), "被终止") {
+		a.deliverToolReportNoKick(m, pm)
+		return
+	}
+	a.startToolReportRound(m, pm)
+}
+
+// reportCommandJob 是后台命令作业的收尾回调（jobs.go startJob 的 onDone）：
+// 与 reportPythonJob 同一套口径——给本会话投【后台命令回报】并唤醒它继续；
+// 用户/系统终止的作业走 NoKick（用户刚停的东西不被自动叫醒）。两者的差别
+// 只在标题文案（命令 / 脚本），机制一致，别再让后台命令"跑完没人知道"。
+// 回执同样以合成工具回执对（run_command 的后续结果）形态落库。
+func (a *App) reportCommandJob(t *toolContext, j *jobRun, command, cwd string) {
+	out := j.buf.String()
+	if len(out) > jobBufMax {
+		out = out[len(out)-jobBufMax:] // 命令输出取末尾：报错与结论都在尾部
+	}
+	text := fmt.Sprintf("【后台命令回报】作业 %s 已结束（%s，运行 %s）。\n命令：%s\n工作目录：%s\n\n输出%s：\n%s\n"+
+		"（run_command 后台启动；job_output 可再查，job_list 看全部作业。）",
+		j.ID, j.Status(), time.Since(j.startedAt).Round(time.Second),
+		truncateRunes(command, 200), cwd, tailNote(len(j.buf.String()), jobBufMax), out)
+	args, _ := json.Marshal(map[string]any{"command": truncateRunes(command, 200), "cwd": cwd, "run_in_background": true})
+	pm := toolReportPair("run_command", string(args), text)
+	if strings.Contains(j.Status(), "被终止") {
+		a.deliverToolReportNoKick(t.sess, pm)
+		return
+	}
+	a.startToolReportRound(t.sess, pm)
+}
+
+// tailNote 说明输出是否被截断（只保留末尾）。
+func tailNote(total, max int) string {
+	if total <= max {
+		return ""
+	}
+	return fmt.Sprintf("（共 %d 字，只保留末尾 %d 字）", total, max)
 }
 
 // startupPySessionCleanup 启动期异步清理各工作区 .jxai/tmp 下超龄的会话

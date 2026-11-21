@@ -113,7 +113,7 @@ func runReadSummary(t *toolContext, args json.RawMessage) (string, error) {
 
 func dispatchTaskTool() Tool {
 	return Tool{
-		Spec: toolSpec("dispatch_task", "新建一个工作任务会话并把需求交给它后台执行（它拥有读写文件与执行命令的全部工具）。本工具立即返回，任务完成后你会自动收到【派发回报】（含它的最终答复全文、轮数/步数、与实际落盘核对过的改动文件清单）。工作任务与我们的聊天记录完全隔离——你就像用户一样只给它发一段自足的消息：说清目标与已知背景（涉及的文件/目录给绝对路径）即可；怎么干、怎么验证交给它自己判断，不要替它列步骤清单和验收矩阵。可选参数与人工在界面新建工作任务一致：mode 选工作模式、plan_mode 让它以计划模式启动、attachments 给它带上现成文件、model 指定模型（providerId/modelId 完整格式）、permission 调它的权限档（只能同等或降权，绝不允许增权）。",
+		Spec: toolSpec("dispatch_task", "新建一个工作任务会话并把需求交给它后台执行（它拥有读写文件与执行命令的全部工具）。本工具立即返回，任务完成后你会自动收到【派发回报】（含它的最终答复全文、轮数/步数、与实际落盘核对过的改动文件清单）。工作任务与我们的聊天记录完全隔离——你就像用户一样只给它发一段自足的消息：说清目标与已知背景（涉及的文件/目录给绝对路径）即可；怎么干、怎么验证交给它自己判断，不要替它列步骤清单和验收矩阵。可选参数与人工在界面新建工作任务一致：mode 选工作模式、plan_mode 让它以计划模式启动、attachments 给它带上现成文件、model 指定模型（providerId/modelId 完整格式）、permission 调它的权限档（只能同等或降权，绝不允许增权）、thinking 指定思考档位（enabled/disabled/low/medium/high/max，不传＝服务端默认）；unsandboxed / browser / computer 三个能力开关（允许工作区外执行命令 / 操作浏览器 / 操作电脑，字段名与权限芯片同一套）只能关、不能开：false＝强制关闭，true＝要求开启（前提是本会话自己实际开启了该能力，否则拒绝并报错，不能借派发参数提权），不传＝按模式默认能力。",
 			objSchema(map[string]any{
 				"task":        strProp("自足的任务描述：目标与已知背景（涉及的文件/目录给绝对路径）——工作任务看不到本对话的任何记录；不要替它列步骤清单和验收矩阵"),
 				"title":       strProp("给新任务起的标题，可省略"),
@@ -124,6 +124,10 @@ func dispatchTaskTool() Tool {
 				"plan_mode":   boolProp("可选：true＝让新任务以计划模式启动（与人工建会话勾选「计划模式」一致）：它先只读调研、提交计划等用户批准后才动手；适合改动面大、跨多文件、有风险的任务"),
 				"attachments": arrayProp("可选：附件文件路径列表（本机绝对路径，如 D:\\资料\\需求.docx）。文件会复制进新任务的工作区并登记为上传（交付时可在 deliver_result 的文件项填 upload 交回用户原处），与人工建会话上传附件完全一致；路径不存在、是目录，或新任务是远程工作区时，整个派发被拒绝并报错", strProp("本机文件绝对路径，如 D:\\资料\\需求.docx")),
 				"permission":  strProp("可选：新任务的权限档，取值 read-only（全电脑只读）/ workspace-write（修改工作区）/ full（完全访问），与权限面板同一套档位。只能**同等或降权**——不得高于本会话（数字助理）当前权限（见环境快照的「权限模式」行），超出即拒绝并报错（不静默钳制）。不填＝修改工作区（本会话权限更窄时取本会话权限）。要改文件、跑命令的任务别降档；全电脑只读调研/查看可降为 read-only"),
+				"thinking":    strProp("可选：新任务的思考档位，取值 "+thinkingLevelsDoc+"（与设置里会话思考档位、PATCH 改会话设置的白名单同一套枚举）；不传＝服务端默认，与不引入本参数时的行为一致"),
+				"unsandboxed": boolProp("可选：能力开关「允许工作区外执行命令」。只能关、不能开：false＝强制关闭；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错（不能借派发参数提权）；不传＝不动（按模式默认能力）。完全访问档下它与 browser/computer 同为捆绑能力，不可单独关闭"),
+				"browser":     boolProp("可选：能力开关「操作浏览器」（browser_* 工具族）。只能关、不能开：false＝强制关闭（如把执行模式默认开启的浏览器操作收掉）；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错；不传＝不动（修改工作区档的执行模式默认开启它）"),
+				"computer":    boolProp("可选：能力开关「操作电脑」（cua / windows-mcp 桌面操控）。只能关、不能开：false＝强制关闭；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错；不传＝不动（默认不开启）"),
 			}, "task")),
 		Run: runDispatchTask,
 	}
@@ -135,17 +139,19 @@ func dispatchTaskTool() Tool {
 // dispatch_task / dispatch_sub 派发的是新会话、必然空闲；send_to_session 对已有
 // 会话中途发话，插话正是它的语义。落库身份是 kind=aiuser（AI 发出的用户消息）：
 // 系统按用户消息同等对待（开新回合、组装时后面跟一条时间提示词），前端是
-// 右对齐偏白的「AI 用户」气泡。
-func (t *toolContext) deliverSub(sub *SessionMeta, text, note string) string {
+// 右对齐偏白的「AI 用户」气泡。第二个返回值是投递开出的那一轮执行体（插话
+// 时为 nil）——dispatch_task / send_to_session 拿它授予经理代批资格（轮次级
+// 授权，mgrnotify.go 的 grantManagerTurn）。
+func (t *toolContext) deliverSub(sub *SessionMeta, text, note string) (string, *sessionRun) {
 	d := t.app.deliverToSession(sub, text, kindAiUser, "task")
 	if !d.Started {
-		return subQueueNote(sub, note)
+		return subQueueNote(sub, note), nil
 	}
 	// 当前主对话的 SSE 若还连着，先给它推一条派发确认
 	t.emit(Event{Type: "sub_start", SessionID: sub.ID, Title: sub.Title})
 	go t.app.runSubAgent(t.sess, sub, d.Run)
 	return fmt.Sprintf("已派发后台执行：会话 %s「%s」。%s本工具立即返回，不要等待；"+
-		"被派发的会话完成后系统会自动收到【派发回报】并触发你处理回报。现在可以先回用户一句「已经安排」。", sub.ID, sub.Title, note)
+		"被派发的会话完成后系统会自动收到【派发回报】并触发你处理回报。现在可以先回用户一句「已经安排」。", sub.ID, sub.Title, note), d.Run
 }
 
 // dispatchModelChoice 解析派发工具的模型参数：先经 resolveDispatchModel 校验
@@ -305,6 +311,102 @@ func (t *toolContext) dispatchPermission(req string) (string, error) {
 	return req, nil
 }
 
+// dispatchCaps 是派发工具（dispatch_task / send_to_session）的三个能力开关
+// 参数。字段名照会话权限模型的真实现——SessionMeta.Tools 里的能力开关 id：
+// unsandboxed＝允许工作区外执行命令、browser＝操作浏览器、computer＝操作电脑
+//（见 perm.go 的 capUnsandboxed / capBrowser / capComputer 与权限芯片勾选，
+// 两者写的是同一个字段）。三态指针：nil＝不传不动；false＝强制关闭；true＝
+// 要求开启（先校验派发方自己实际拥有，见 applyDispatchCaps）。
+type dispatchCaps struct {
+	Unsandboxed *bool `json:"unsandboxed"`
+	Browser     *bool `json:"browser"`
+	Computer    *bool `json:"computer"`
+}
+
+// anySet 报告三个能力参数是否至少传了一个（都没传时派发路径完全走旧默认）。
+func (c dispatchCaps) anySet() bool {
+	return c.Unsandboxed != nil || c.Browser != nil || c.Computer != nil
+}
+
+// applyDispatchCaps 把三个能力开关参数套到 tools 上（tools 是目标会话在 perm
+// 档位下的能力清单：dispatch_task 传模式默认能力，send_to_session 传该会话
+// 现有 Tools）。语义「只能关、不能开」：
+//   - false＝关掉该能力：收窄永远安全，无条件允许；
+//   - true＝保持/要求开启，但前提是**派发方（本会话）自己实际拥有**该能力
+//    （hasCapability：完全访问档的捆绑视为拥有）——没有就是借派发参数打开
+//    自己没有的能力，属提权，拒绝并报错，不静默钳制；
+//   - 目标为完全访问档时三项是捆绑能力（bundleFullAccessCaps 强制点亮、
+//    权限面板不可单独关闭）：true 不产生变化（本来就在），false 拒绝并提示
+//    改用降档——与人工面板同一套联动。
+//
+// 返回调整后的清单与给派发结果 note 用的人话变更列表；三个参数都没传时
+// 原样返回（tools、changes 均为零值）。
+func (t *toolContext) applyDispatchCaps(tools []string, perm string, c dispatchCaps) ([]string, []string, error) {
+	if !c.anySet() {
+		return tools, nil, nil
+	}
+	out := append([]string(nil), tools...)
+	changes := []string{}
+	items := []struct {
+		id    string
+		on    *bool
+		label string
+	}{
+		{capUnsandboxed, c.Unsandboxed, "允许工作区外执行命令"},
+		{capBrowser, c.Browser, "操作浏览器"},
+		{capComputer, c.Computer, "操作电脑"},
+	}
+	for _, it := range items {
+		if it.on == nil {
+			continue
+		}
+		if *it.on {
+			if !hasCapability(t.sess, it.id) {
+				return nil, nil, fmt.Errorf("%s=true 超出本会话的实际能力：本会话（数字助理）未开启「%s」（%s），不能借派发参数打开自己没有的能力（提权被拒，不做静默钳制）。请去掉该参数重试；确需该能力时先请用户在本会话的权限芯片里开启",
+					it.id, it.label, it.id)
+			}
+			if perm == permFull {
+				changes = append(changes, "完全访问档下「"+it.label+"」为捆绑能力，本就开启")
+				continue
+			}
+			if !hasCapability(&SessionMeta{Permission: perm, Tools: out}, it.id) {
+				out = append(out, it.id)
+			}
+			changes = append(changes, "开启「"+it.label+"」")
+			continue
+		}
+		if perm == permFull {
+			return nil, nil, fmt.Errorf("%s=false 无效：目标会话为完全访问档时「%s」（%s）是捆绑能力（权限面板强制点亮、不可单独关闭）。请把 permission 降为 workspace-write 等档位后再关，或不传该参数",
+				it.id, it.label, it.id)
+		}
+		if hasCapability(&SessionMeta{Permission: perm, Tools: out}, it.id) {
+			kept := out[:0]
+			for _, x := range out {
+				if x != it.id {
+					kept = append(kept, x)
+				}
+			}
+			out = kept
+			changes = append(changes, "关闭「"+it.label+"」")
+		} else {
+			changes = append(changes, "「"+it.label+"」本就未开启")
+		}
+	}
+	return out, changes, nil
+}
+
+// resolveDispatchThinking 校验派发工具的 thinking 参数（dispatch_task /
+// send_to_session 共用）：合法值与 PATCH 改会话设置、人工建会话同一套枚举
+//（validThinkingLevel 单源，即设置里思考档位那几个值），空串＝不干预（与
+// 不传本参数时逐字节同行为）。非法值给人话报错并列出可选档位。
+func resolveDispatchThinking(req string) (string, error) {
+	t := strings.TrimSpace(req)
+	if !validThinkingLevel(t) {
+		return "", fmt.Errorf("thinking=%q 不是有效档位：只能是 %s 或空（不传＝沿用默认，行为与现在一致）", t, thinkingLevelsDoc)
+	}
+	return t, nil
+}
+
 // normalizeDispatchAttachments 归一化 dispatch_task 的 attachments 参数：去掉
 // 空白项与重复项（同一次派发里同一个文件只登记一次）。只做形态归一——路径
 // 是否存在、是不是文件、能不能复制，由 registerUploadPath 在建会话时按桌面端
@@ -327,9 +429,9 @@ func normalizeDispatchAttachments(in []string) []string {
 }
 
 // dispatchTaskNote 组织这次派发回给数字助理的一句补充说明（模式、计划模式、
-// 附件、权限档——只讲与默认不同的点）。工具结果里带上它，模型才知道这次派发
-// 实际按什么档跑起来的；都取默认值时返回空串，不啰嗦。
-func dispatchTaskNote(mode, perm, reqPerm string, planMode bool, attached int, remoteDisplay string) string {
+// 附件、权限档、思考档位、能力开关——只讲与默认不同的点）。工具结果里带上它，
+// 模型才知道这次派发实际按什么档跑起来的；都取默认值时返回空串，不啰嗦。
+func dispatchTaskNote(mode, perm, reqPerm string, planMode bool, attached int, remoteDisplay, thinking string, capChanges []string) string {
 	var parts []string
 	if m := chatModeByValue(mode); m != nil {
 		parts = append(parts, "模式：「"+m.Label+"」（"+mode+"）")
@@ -344,6 +446,12 @@ func dispatchTaskNote(mode, perm, reqPerm string, planMode bool, attached int, r
 		parts = append(parts, "权限档：「"+permModeLabel(perm)+"」（"+perm+"）")
 	} else if perm != permWorkspace {
 		parts = append(parts, "权限档：「"+permModeLabel(perm)+"」（"+perm+"，随本会话权限，只降不升）")
+	}
+	if strings.TrimSpace(thinking) != "" {
+		parts = append(parts, "思考档位："+strings.TrimSpace(thinking))
+	}
+	if len(capChanges) > 0 {
+		parts = append(parts, "能力开关："+strings.Join(capChanges, "、"))
 	}
 	if remoteDisplay != "" {
 		parts = append(parts, "在 SSH 远程工作区 "+remoteDisplay+" 中工作（文件走 SFTP、命令经 SSH）")
@@ -492,7 +600,8 @@ func runDispatchSub(t *toolContext, args json.RawMessage) (string, error) {
 	if len(hints) > 0 {
 		note = "（" + strings.Join(hints, "；") + "）"
 	}
-	return t.deliverSub(sub, "【派发子对话】\n\n"+p.Task, note), nil
+	n, _ := t.deliverSub(sub, "【派发子对话】\n\n"+p.Task, note) // 子对话不是经理派发（任何会话都能 dispatch_sub），无经理代批资格
+	return n, nil
 }
 func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 	var p struct {
@@ -505,6 +614,10 @@ func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 		PlanMode    bool     `json:"plan_mode"`
 		Attachments []string `json:"attachments"`
 		Permission  string   `json:"permission"`
+		Thinking    string   `json:"thinking"`
+		// 能力开关三参数：嵌入（匿名字段）让 dispatchCaps 的 json 字段平铺到
+		// 本层——命名字段会让 "browser" 等键解不进来
+		dispatchCaps
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -525,8 +638,8 @@ func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// 可选参数先全部解析校验（快速失败）：模式 / 权限 / 模型 / 附件都可能被拒，
-	// 拒绝必须发生在建出半个会话之前
+	// 可选参数先全部解析校验（快速失败）：模式 / 权限 / 思考档位 / 能力开关 /
+	// 模型 / 附件都可能被拒，拒绝必须发生在建出半个会话之前
 	mode, err := resolveDispatchMode(p.Mode)
 	if err != nil {
 		return "", err
@@ -534,6 +647,20 @@ func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 	perm, err := t.dispatchPermission(p.Permission)
 	if err != nil {
 		return "", err
+	}
+	thinking, err := resolveDispatchThinking(p.Thinking)
+	if err != nil {
+		return "", err
+	}
+	// 能力开关：以模式默认能力为基准应用三个参数（只能关不能开，提权拒绝）。
+	// 都没传时 caps 保持 nil——createSession 走既有默认策略，行为与改动前一致
+	var caps []string
+	var capChanges []string
+	if p.dispatchCaps.anySet() {
+		caps, capChanges, err = t.applyDispatchCaps(capDefaultsForMode(mode, perm), perm, p.dispatchCaps)
+		if err != nil {
+			return "", err
+		}
 	}
 	provider, mdl, err := t.dispatchModelChoice(p.Model)
 	if err != nil {
@@ -563,6 +690,8 @@ func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 		Title:        title, Workspace: ws,
 		Permission:   perm,       // 只能同等或降权，绝不允许增权（dispatchPermission）
 		PlanMode:     p.PlanMode, // 与人工建会话勾选「计划模式」一致
+		Thinking:     thinking,   // 思考档位（resolveDispatchThinking；空＝服务端默认）
+		Tools:        caps,       // 能力开关（没传时为 nil＝走模式默认能力）
 		DispatchedBy: t.sess.ID,  // 派发的是顶层工作任务（左侧列表可见）；回报链走 dispatched_by，不走 parent_id
 		Provider:     provider, Model: mdl,
 	}
@@ -605,15 +734,23 @@ func runDispatchTask(t *toolContext, args json.RawMessage) (string, error) {
 	if len(attNotes) > 0 {
 		taskMsg = ATTACH_HEAD + "\n" + strings.Join(attNotes, "\n") + "\n\n" + taskMsg
 	}
-	return t.deliverSub(sub, taskMsg, dispatchTaskNote(mode, perm, p.Permission, p.PlanMode, attached, remoteDisp)), nil
+	note, run := t.deliverSub(sub, taskMsg, dispatchTaskNote(mode, perm, p.Permission, p.PlanMode, attached, remoteDisp, thinking, capChanges))
+	// 经理代批＝轮次级授权（mgrnotify.go）：投递开出的这一轮才可代决，轮收口
+	// 或用户亲发消息即撤销——之后用户在这个会话自己干活的卡不再报给经理。
+	t.app.grantManagerTurn(sub.ID, run)
+	return note, nil
 }
 func sendToSessionTool() Tool {
 	return Tool{
-		Spec: toolSpec("send_to_session", "把话发给一个已有会话（新需求与该会话明显相关时优先用它，上下文连续效率最高）：对方**正在执行**时作为**插话**注入它当前这一轮——它下一次调用模型就能看到，当场生效（纠偏、答疑、补要求都直接发）；对方**空闲**时作为新需求直接开跑。本工具立即返回，它这一轮完成后你会自动收到【派发回报】；想等它干完当前活再派下一个任务的，就等回报来了再发，不要提前占位。可选 permission 指定这条需求用哪个权限档跑，只能同等或降权（绝不高于本会话权限，也不能给已有会话提权）。",
+		Spec: toolSpec("send_to_session", "把话发给一个已有会话（新需求与该会话明显相关时优先用它，上下文连续效率最高）：对方**正在执行**时作为**插话**注入它当前这一轮——它下一次调用模型就能看到，当场生效（纠偏、答疑、补要求都直接发）；对方**空闲**时作为新需求直接开跑。本工具立即返回，它这一轮完成后你会自动收到【派发回报】；想等它干完当前活再派下一个任务的，就等回报来了再发，不要提前占位。可选 permission 指定这条需求用哪个权限档跑，只能同等或降权（绝不高于本会话权限，也不能给已有会话提权）。可选 thinking 换它的思考档位（enabled/disabled/low/medium/high/max；对方空闲则开出的新轮即按新档位跑，正在执行的那一轮不中途切换、下一轮起生效）。unsandboxed / browser / computer 三个能力开关（允许工作区外执行命令 / 操作浏览器 / 操作电脑，字段名与权限芯片同一套）只能关、不能开：false＝强制关闭，true＝要求开启（前提是本会话自己实际开启了该能力，否则拒绝并报错，不能借派发参数提权），不传＝不动该会话的现有能力。",
 			objSchema(map[string]any{
 				"session_id": strProp("目标会话 id，来自 list_sessions"),
 				"task":       strProp("完整、自足的一段需求"),
 				"permission": strProp("可选：这条新需求使用的权限档，取值 read-only（全电脑只读）/ workspace-write（修改工作区）/ full（完全访问）。只能**同等或降权**——不得高于本会话（数字助理）当前权限，也不得高于该会话自己的当前权限（既有会话的档位不能被这条需求抬高），超出即拒绝并报错（不静默钳制）。不填＝沿用该会话当前的权限档，不做任何改动"),
+				"thinking":   strProp("可选：把该会话的思考档位设为指定值，取值 "+thinkingLevelsDoc+"（与设置里会话思考档位、PATCH 改会话设置的白名单同一套枚举）；不传＝不动。写进会话配置并落库：对方空闲则投递开出的新轮即生效，正在执行的那一轮不中途切换（与人工改设置同款边界）"),
+				"unsandboxed": boolProp("可选：能力开关「允许工作区外执行命令」。只能关、不能开：false＝强制关闭；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错（不能借派发参数提权）；不传＝不动该会话现有能力。完全访问档的会话该项为捆绑能力，不可单独关闭"),
+				"browser":     boolProp("可选：能力开关「操作浏览器」（browser_* 工具族）。只能关、不能开：false＝强制关闭；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错；不传＝不动该会话现有能力"),
+				"computer":    boolProp("可选：能力开关「操作电脑」（cua / windows-mcp 桌面操控）。只能关、不能开：false＝强制关闭；true＝要求开启，前提是本会话自己实际开启了该能力，否则拒绝并报错；不传＝不动该会话现有能力"),
 			}, "session_id", "task")),
 		Run: runSendToSession,
 	}
@@ -625,11 +762,22 @@ func sendToSessionTool() Tool {
 // 同一套规则（只能同等或降权）。此处比派发工具多挡一道——已有会话**自己的**权限
 // 也不能被这条需求抬高（那个会话可能本就比本会话更窄，比如只读调研会话）。不传
 // permission 时原样沿用该会话的档位，不改动任何配置。
+//
+// thinking 与三个能力开关（unsandboxed/browser/computer，dispatchCaps）同样
+// 写进该会话配置再投递：能力（Permission/Tools）由运行指针每步从库同步
+//（syncRunPerms），对方正在执行时下一步即生效；思考档位不同步运行指针——正在
+// 执行的那一轮不中途切换、下一轮起生效（与人工 PATCH 改设置同款边界）。三个
+// 能力开关只能关不能开（applyDispatchCaps）：true 要先过「本会话自己拥有」
+// 这道校验，没有就拒绝，绝不静默钳制。
 func runSendToSession(t *toolContext, args json.RawMessage) (string, error) {
 	var p struct {
 		SessionID  string `json:"session_id"`
 		Task       string `json:"task"`
 		Permission string `json:"permission"`
+		Thinking   string `json:"thinking"`
+		// 能力开关三参数：嵌入（匿名字段）让 dispatchCaps 的 json 字段平铺到
+		// 本层——命名字段会让 "browser" 等键解不进来
+		dispatchCaps
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -648,7 +796,10 @@ func runSendToSession(t *toolContext, args json.RawMessage) (string, error) {
 	if m.Mode == "assistant" {
 		return "", fmt.Errorf("目标会话是另一个总控会话，不能作为派发目标")
 	}
-	note := ""
+	// 可选参数先全部解析并把变更攒在内存副本上（校验失败在落库之前返回，
+	// 不留半截改动），全部通过后一次 SaveMeta
+	var hints []string
+	metaDirty := false
 	if strings.TrimSpace(p.Permission) != "" {
 		perm, perr := t.dispatchPermission(p.Permission)
 		if perr != nil {
@@ -664,16 +815,49 @@ func runSendToSession(t *toolContext, args json.RawMessage) (string, error) {
 			// 面板同一套）：降到完全访问以下时取消捆绑能力、补回默认——人工改档
 			// 是什么效果，AI 传 permission 就是什么效果。
 			applyPermissionChange(m, perm, false)
-			if err := t.app.Store.SaveMeta(m); err != nil {
-				return "", fmt.Errorf("保存会话 %s 的权限档失败：%w", m.ID, err)
-			}
+			metaDirty = true
 		}
-		note = "（权限档：「" + permModeLabel(perm) + "」（" + perm + "，只能同等或降权））"
+		hints = append(hints, "权限档：「"+permModeLabel(perm)+"」（"+perm+"，只能同等或降权）")
+	}
+	if strings.TrimSpace(p.Thinking) != "" {
+		thinking, terr := resolveDispatchThinking(p.Thinking)
+		if terr != nil {
+			return "", terr
+		}
+		if m.Thinking != thinking {
+			m.Thinking = thinking
+			metaDirty = true
+		}
+		hints = append(hints, "思考档位："+thinking+"（正在执行的那一轮不中途切换，下一轮起生效）")
+	}
+	if p.dispatchCaps.anySet() {
+		tools, changes, cerr := t.applyDispatchCaps(m.Tools, permModeOf(m), p.dispatchCaps)
+		if cerr != nil {
+			return "", cerr
+		}
+		if fmt.Sprint(tools) != fmt.Sprint(m.Tools) {
+			m.Tools = tools
+			metaDirty = true
+		}
+		hints = append(hints, "能力开关："+strings.Join(changes, "、"))
+	}
+	if metaDirty {
+		if err := t.app.Store.SaveMeta(m); err != nil {
+			return "", fmt.Errorf("保存会话 %s 的设置（权限/思考档位/能力开关）失败：%w", m.ID, err)
+		}
+	}
+	note := ""
+	if len(hints) > 0 {
+		note = "（" + strings.Join(hints, "；") + "）"
 	}
 	// 需求正文（【数字助理转达】+ task）由 deliverSub 走统一投递落库：投递一律
 	// 插话——目标执行中就注入它当前这一轮（下一次调用模型前生效），空闲则直接
 	// 落库开跑（两种情况都立即生效，不排队占位）
-	return t.deliverSub(m, "【数字助理转达】\n"+p.Task, note), nil
+	// 经理代批＝轮次级授权（mgrnotify.go）：目标空闲、投递开出新轮才授权；目标
+	// 执行中是插话（run=nil）——那一轮不是经理发起的，不授权也不动既有授权。
+	note, run := t.deliverSub(m, "【数字助理转达】\n"+p.Task, note)
+	t.app.grantManagerTurn(m.ID, run)
+	return note, nil
 }
 
 func stopSessionTool() Tool {

@@ -1,8 +1,8 @@
 ﻿; 安装包脚本（Inno Setup 6.4+，需配合简中语言包 ChineseSimplified.isl）
-; exe 文件名切换期（坚祥数字助理GO → AI数字助理，约一周后）：
+; exe 文件名已切换（2026-11-19：坚祥数字助理GO → AI数字助理）：
 ;   MyAppName / MyAppExeName 由 打包安装包.ps1 经 ISCC /D 覆盖（源头是它的
-;   -ExeBaseName 参数，默认旧名）；单独手工编译时走下方 #ifndef 默认值。
-;   切到新名后自动追加旧名清理（[InstallDelete] 的 #if 段）：删旧 exe、
+;   -ExeBaseName 参数，默认新名）；单独手工编译时走下方 #ifndef 默认值。
+;   新名版自动追加旧名清理（[InstallDelete] 的 #if 段）：删旧 exe、
 ;   旧开始菜单组、旧桌面快捷方式——一次升级完成迁移，AppId 不变即同一安装身份。
 ; 由 打包安装包.ps1 组装 stage/ 后调用 ISCC 编译；也可手工：
 ;   ISCC.exe /DMyAppVersion=1.0.0 安装包.iss
@@ -12,10 +12,10 @@
 #endif
 
 #ifndef MyAppName
-#define MyAppName "坚祥数字助理GO"
+#define MyAppName "AI数字助理"
 #endif
 #ifndef MyAppExeName
-#define MyAppExeName "坚祥数字助理GO.exe"
+#define MyAppExeName "AI数字助理.exe"
 #endif
 // 文件版本号必须是纯数字四段（每段 0-65535）：日期版本 20261013-1（旧写法 20261012V1）转为 2026.10.13.1；
 // 传统语义版本（如 1.0.3）沿用原行为补 .0 → 1.0.3.0
@@ -40,6 +40,10 @@ AppId={{BE7768E7-93C5-49D6-9778-BC133A39A797}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=坚祥
+; 许可协议页：安装向导第二步显示协议全文，选中「我同意」才能继续安装
+; （文件为 UTF-8 带 BOM——Inno 按带 BOM 才正确显示中文；协议同时写明
+; 「安装即表示同意」，与静默更新场景的同意口径一致）
+LicenseFile=法律文档\最终用户许可协议（含隐私与数据处理说明）.txt
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
@@ -68,7 +72,7 @@ Source: "stage\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; 地址、部署命令）会跟着装到客户机器上。口径与静默更新块一致（发布静默更新.ps1 白名单）。
 Source: "stage\技能\*"; DestDir: "{app}\技能"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "user\*,user"
 ; 内置组件必须随包（打包清单纪律 ③）：危险命令护栏 / 待办与定时任务 / Git 面板 /
-; 语音（朗读与听写）/ 企业技能包市场（skill-market）/ 小程序平台（sites-platform）。
+; 语音（朗读与听写）/ 企业技能包市场（skill-market）/ 企业小程序（sites-platform）。
 ; 程序按 {app}\组件\*/manifest.json 发现组件，装不进就没有
 ; 默认组件（危险命令护栏会一并失效）；打包脚本已强校验 stage\组件 存在且非空。
 Source: "stage\组件\*"; DestDir: "{app}\组件"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -83,10 +87,11 @@ Source: "stage\使用说明.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "stage\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [InstallDelete]
-; exe 文件名切换的迁移清理：只在装「AI数字助理.exe」时启用（旧名版自装自不触发）。
-; 旧 exe 直接删（新版已带全功能）；旧开始菜单组与桌面快捷方式指向已删的 exe，
-; 不清就是死链。热更新（engine 原地交换）不改文件名，老用户先经热更新升到新版、
-; 再装一次新名安装包即完成文件名迁移。
+; exe 文件名切换的迁移清理：装「AI数字助理.exe」（2026-11-19 起的发行名）时
+; 启用（若有旧名版自装自不触发，条件恒真只是防御性保留）。旧 exe 直接删
+; （新版已带全功能）；旧开始菜单组与桌面快捷方式指向已删的 exe，
+; 不清就是死链。走静默更新的老用户由程序内迁移（exe_rename_windows.go）
+; 补齐换名；直接装新名安装包同样完成迁移。
 #if MyAppExeName != "坚祥数字助理GO.exe"
 Type: files; Name: "{app}\坚祥数字助理GO.exe"
 Type: files; Name: "{app}\坚祥数字助理GO-右键菜单版.exe"

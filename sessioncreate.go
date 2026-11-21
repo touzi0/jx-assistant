@@ -14,6 +14,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"strings"
 )
 
@@ -38,9 +39,25 @@ func createSessionErrCode(err error) int {
 	return 500
 }
 
+// thinkingLevelsDoc 是思考档位的人话枚举（报错文案共用，与 PATCH /api/sessions/{id}
+// 的白名单、设置里会话思考档位同一套）。
+const thinkingLevelsDoc = "enabled/disabled/low/medium/high/max"
+
+// validThinkingLevel 判断思考档位是否合法（空串＝服务端默认，合法；max 是
+// deepseek/Anthropic 的档位）。单源：PATCH 改会话设置、dispatch_task /
+// send_to_session 的 thinking 参数、人工建会话三处共用同一枚举，避免各写一份
+// 漂移（各协议渠道对档位的映射见 llm.go / llmproto.go，这里只管合法值）。
+func validThinkingLevel(t string) bool {
+	switch t {
+	case "", "enabled", "disabled", "low", "medium", "high", "max":
+		return true
+	}
+	return false
+}
+
 // createSessionParams 三入口共用的建会话参数。权限/模式是**入口校验后的最终
 // 值**（service 只兜底默认：模式未知退 task、权限空按「workspace-write +
-// 创建技能/数字经理主对话 full」补——与人工口径一致；派发入口总是显式传值，
+// 创建技能/长期助理主对话 full」补——与人工口径一致；派发入口总是显式传值，
 // 不走默认）。
 type createSessionParams struct {
 	Mode       string
@@ -79,7 +96,7 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 		if mode == "skill-create" {
 			perm = permFull
 		}
-		// 数字经理主对话（新装机首启自动创建的那个）默认完全访问：派发
+		// 长期助理主对话（新装机首启自动创建的那个）默认完全访问：派发
 		// 「只能同等或降权」，总控自己先站到最高档，派出去的任务才有完整的
 		// 档位空间（任务默认仍是修改工作区）；入口显式传权限则尊重。已建
 		// 主对话的权限存在会话库里，不受这个默认影响。
@@ -167,20 +184,40 @@ func (a *App) createSession(p createSessionParams) (*SessionMeta, error) {
 	if m.GoalMode {
 		m.GoalStatus = "active" // 创建即带目标模式：状态从 active 起步
 	}
-	if err := a.Store.Create(m); err != nil {
+	// 建会话与继承历史：有历史要继承时**一个事务写完**（先在内存里备齐行再落库），
+	// 列表里不会出现「正文为空的半成品」，也就没有「创建中被归档/删除」这个撞车
+	// 窗口（2026-11-16 事故根因）；没有历史要继承就还是普通的一次 INSERT。
+	if p.CopyHistory {
+		rows, rerr := a.prepareInheritedRows(parent)
+		if rerr != nil {
+			return nil, createSessionErr(500, "继承父对话上下文失败: %v", rerr)
+		}
+		// 上传登记也随分支继承（uid 原样保留）：继承来的注记里若引用了 u 编号，
+		// 子会话里的 deliver_result（upload 参数）仍能解析到原件路径。与历史行
+		// 同事务落库——否则「建好会话 → 复制登记」之间被删除插队就留下孤儿登记。
+		// 读失败只记日志（附件登记丢了不该让整条子对话建不出来）。
+		var uploads []*Upload
+		if ups, uerr := a.Store.UploadsFor(parent.ID); uerr != nil {
+			log.Printf("[上传] 读 %s 的上传登记失败（子对话交付目标将不可解析）: %v", parent.ID, uerr)
+		} else {
+			for _, u := range ups {
+				nu := *u
+				nu.ID, nu.SessionID = 0, m.ID
+				uploads = append(uploads, &nu)
+			}
+		}
+		if err := a.Store.CreateWithRows(m, rows, uploads); err != nil {
+			return nil, createSessionErr(500, "继承父对话上下文失败: %v", err)
+		}
+	} else if err := a.Store.Create(m); err != nil {
 		return nil, err
 	}
 	// 选定工作目录后即建 .jxai/tmp：模型临时文件的约定去处（见系统提示词）
 	if m.Remote == nil {
 		(&toolContext{app: a, sess: m}).ensureJxAI()
 	}
-	if p.CopyHistory {
-		if _, err := a.copyInheritedContext(parent.ID, m.ID); err != nil {
-			// 上下文没复制成功就退回：留着半截继承的子对话比没有更糟
-			_ = a.Store.Delete(m.ID)
-			return nil, createSessionErr(500, "继承父对话上下文失败: %v", err)
-		}
-	}
+	// 历史行与上传登记在 CreateWithRows 的同一个事务里已经写完，这里不再复制
+	// （重复复制会让子会话的 u 编号翻倍，deliver_result 的 upload 解析会指向错行）。
 	// 首页「先录后聊」的兜底入口：建创建技能会话时工作区若已有演示材料，
 	// 注入一条【演示记录】清单通知（同文件上传通知机制），模型开轮即知道
 	// 有哪些现成记录可分析——人工建的与 dispatch 派出的 skill-create 会话

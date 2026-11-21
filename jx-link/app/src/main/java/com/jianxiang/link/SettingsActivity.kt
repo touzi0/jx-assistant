@@ -5,16 +5,21 @@ import android.app.AlertDialog
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.TextView
 import android.widget.Toast
 import java.util.concurrent.Executors
 
 /**
- * 设置（单页两区域）：
- * 1. 清空应用缓存 —— 所有电脑的独立 Profile + 默认域（HTTP 缓存/localStorage）+ 应用缓存
- * 2. 反馈意见 —— 标题+正文，封 multipart 帧经加密中继发 POST /api/feedback；
+ * 设置（单页四区域）：
+ * 1. 检查更新 —— 当前/最新版本、手动检查；有更新时出现「下载并安装」（下载进度 →
+ *    sha256 校验 → 系统安装器；Android 不能静默自装，见 Update.kt）
+ * 2. 清空应用缓存 —— 所有电脑的独立 Profile + 默认域（HTTP 缓存/localStorage）+ 应用缓存
+ * 3. 反馈意见 —— 标题+正文，封 multipart 帧经加密中继发 POST /api/feedback；
  *    依次尝试（上次所在电脑优先），第一台成功的为准
+ * 4. 更新源 —— 清单地址可改（内测指向别的源），可恢复默认
  */
 class SettingsActivity : Activity() {
 
@@ -25,13 +30,90 @@ class SettingsActivity : Activity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
 
+        findViewById<TextView>(R.id.upd_current).text = "当前版本：${Update.currentVersion(this)}"
+        findViewById<TextView>(R.id.upd_status).text = "还没有检查过更新"
+        findViewById<Button>(R.id.btn_check_update).setOnClickListener { checkUpdate() }
+        findViewById<Button>(R.id.btn_download_update).setOnClickListener {
+            Update.lastFound(this)?.let { Update.showFlow(this, it) }
+        }
+        findViewById<EditText>(R.id.upd_source).setText(Update.source(this))
+        findViewById<Button>(R.id.btn_source_save).setOnClickListener { saveSource() }
+        findViewById<Button>(R.id.btn_source_reset).setOnClickListener {
+            Update.setSource(this, null)
+            findViewById<EditText>(R.id.upd_source).setText(Update.DEFAULT_BASE)
+            Toast.makeText(this, "已恢复默认更新源", Toast.LENGTH_SHORT).show()
+        }
+
         findViewById<Button>(R.id.btn_clear_cache).setOnClickListener { confirmClear() }
         findViewById<Button>(R.id.btn_feedback).setOnClickListener { sendFeedback() }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 从系统安装器回来可能已经装上了新版本，回来刷新一下口径
+        findViewById<TextView>(R.id.upd_current).text = "当前版本：${Update.currentVersion(this)}"
     }
 
     override fun onDestroy() {
         super.onDestroy()
         io.shutdown()
+    }
+
+    /* ---------- 检查更新与更新源 ---------- */
+
+    private fun checkUpdate() {
+        val btn = findViewById<Button>(R.id.btn_check_update)
+        val status = findViewById<TextView>(R.id.upd_status)
+        val dl = findViewById<Button>(R.id.btn_download_update)
+        btn.isEnabled = false
+        btn.text = "检查中…"
+        status.text = "正在检查更新…"
+        dl.visibility = View.GONE
+        io.execute {
+            val r = Update.check(this)
+            main.post {
+                if (isDestroyed) return@post
+                btn.isEnabled = true
+                btn.text = "检查更新"
+                when (r) {
+                    is Update.Check.Ok -> if (r.newer) {
+                        val i = r.info
+                        status.text = buildString {
+                            append("发现新版本 ").append(i.version)
+                            if (i.publishedAt.isNotBlank()) append("（发布于 ").append(i.publishedAt.take(16)).append("）")
+                            append("\n大小：").append(i.sizeText())
+                            if (i.note.isNotBlank()) append("\n").append(i.note)
+                        }
+                        dl.visibility = View.VISIBLE
+                    } else {
+                        status.text = "已是最新版本（${r.info.version}）"
+                    }
+                    is Update.Check.Err -> status.text = "检查失败：${r.msg}"
+                }
+            }
+        }
+    }
+
+    private fun saveSource() {
+        val raw = findViewById<EditText>(R.id.upd_source).text.toString().trim()
+        if (raw.isEmpty()) {
+            Update.setSource(this, null)
+            Toast.makeText(this, "已清空自定义，用默认更新源", Toast.LENGTH_SHORT).show()
+            return
+        }
+        // 只认基地址：误贴的 /updates/... 路径与尾斜杠自动收敛掉
+        val base = Update.normalizeBase(raw)
+            ?: run {
+                Toast.makeText(this, "地址要以 http:// 或 https:// 开头", Toast.LENGTH_SHORT).show()
+                return
+            }
+        Update.setSource(this, base)
+        findViewById<EditText>(R.id.upd_source).setText(base) // 回填收敛后的值
+        Toast.makeText(
+            this,
+            if (base == raw) "已保存更新源" else "已保存：$base（后缀路径会自动补上）",
+            Toast.LENGTH_LONG,
+        ).show()
     }
 
     private fun confirmClear() {

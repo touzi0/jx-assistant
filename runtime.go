@@ -36,6 +36,8 @@ type sessionRun struct {
 	cleanEnd bool   // 本轮是否正常收尾（没出错、没被停止）：收口时据此决定要不要兜底续发队列
 
 	modelAbort *modelAbortEntry // 模型调用进行中的步级打断句柄（插话立即打断用）。只在主循环调模型的窗口内非 nil——工具执行段为 nil，插话此刻到达就不打断、照旧等下一步调用模型前注入
+
+	sess *SessionMeta // 本轮真正持有的会话对象（后台审批提权要落到它身上，见 executeRun）
 }
 
 // PendingMsg 是执行中的一条待生效用户消息：插话（下一步调用模型前注入）
@@ -43,23 +45,33 @@ type sessionRun struct {
 // Kind/Origin 是它落库时的类型与来源（空 = chat，即用户自己发的）；
 // 数字助理派发注入的需求带 report/task——排队或插话后排到落库，
 // 界面照旧按「数字助理说的」渲染成左对齐通知，不会变成用户气泡。
+// ToolName 非空 = 这是一条**合成工具回执对**（后台作业/后台询问等的异步
+// 结果）：Content 是回执正文（落库为 tool 行），ToolName/ToolArgs 是回显的
+// 调用名与参数（落库为 assistant+tool_calls 行），落库收口在 landToolPair。
+// 语义＝「当初那次调用的后续结果晚到了」，走与真实工具调用完全相同的
+// 消息路径（详见《消息类型规范.md》origin=toolreport）。
 type PendingMsg struct {
 	ID        string `json:"id"`
 	Content   string `json:"content"`
 	CreatedAt string `json:"createdAt"`
 	Kind      string `json:"kind,omitempty"`
 	Origin    string `json:"origin,omitempty"`
+	ToolName  string `json:"toolName,omitempty"`
+	ToolArgs  string `json:"toolArgs,omitempty"`
 }
 
 // PendingState 是某个会话当前的待生效消息快照（随会话详情与事件下发）。
 type PendingState struct {
 	Steer  []*PendingMsg `json:"steer"`
 	Queue  []*PendingMsg `json:"queue"`
-	Paused bool          `json:"paused"` // 队列暂停：本轮结束后排队消息保留不自动发送
+	Paused bool          `json:"paused"`        // 队列暂停：本轮结束后排队消息保留不自动发送
+	Ver    int64         `json:"ver,omitempty"` // 队列变更版本号（每次增删/排水/暂停都递增）：快照的取值时刻标记，前端只接受比已应用更新的快照——取值早、投递晚的旧快照回放会把已排水的插话重新画成「插话中」虚线框
 }
 
 func (a *App) initRuntime() {
 	a.runners = map[string]*sessionRun{}
+	a.mgrTurns = map[string]mgrTurnGrant{}
+	a.mgrTurnGen = map[string]int64{}
 	a.subscribers = map[chan Event]bool{}
 	a.grants = map[string]*Grant{}
 	a.approvals = map[string]*Approval{}
@@ -68,6 +80,7 @@ func (a *App) initRuntime() {
 	a.pendingSteer = map[string][]*PendingMsg{}
 	a.pendingQueue = map[string][]*PendingMsg{}
 	a.queuePaused = map[string]bool{}
+	a.pendVer = map[string]int64{}
 	a.runErrors = map[string]string{}
 	a.stopWatchdog = stopWatchdogDefault // 停止看门狗：协作取消后 3 秒仍未收口就强制终结（测试可缩短）
 	a.streamKills = map[string]func(){}  // 在跑模型流的强断句柄登记（llm.go 注册，硬终结时调用）
@@ -103,6 +116,21 @@ func (a *App) beginRun(id string) (*sessionRun, bool) {
 	a.markRunOwner(id)     // 记下「本实例在跑它」：别的实例启动时不会把它误判成中断
 	a.ensureRunHeartbeat() // 有在跑的会话时才起心跳，空闲时零唤醒（见 runowner.go）
 	return r, true
+}
+
+// liveSession 返回本会话当前那一轮持有的会话对象（没在跑就 nil）。后台审批
+// 在别的协程里落地提权时用它：工具执行时读的是这个活对象，只改库里那份，
+// 当前这一轮下一步仍按旧档走。
+func (a *App) liveSession(id string) *SessionMeta {
+	a.runMu.Lock()
+	run := a.runners[id]
+	a.runMu.Unlock()
+	if run == nil {
+		return nil
+	}
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	return run.sess
 }
 
 // finishRun 注销执行、关闭订阅者并置为空闲：按 id 摘注册表里**当前**那一轮。
@@ -141,6 +169,7 @@ func (a *App) finishRunOf(id string, r *sessionRun) {
 // 关闭订阅者与 done、取消残余 ctx、置空闲、清归属与停止待收标志、触发交付与
 // 兜底续发。
 func (a *App) closeRun(id string, r *sessionRun) {
+	a.dropManagerTurnOf(id, r) // 经理代批授权随轮撤销（mgrnotify.go）：收口即失去代决窗口
 	r.mu.Lock()
 	for i, ch := range r.subs {
 		close(ch)
@@ -220,7 +249,7 @@ func (a *App) stopRun(id string) bool {
 // 取消 + 终止该会话后台作业 + 停止原因落库），只有落库的 Actor/Note 不同——人工点
 // 按钮走 stopActorUser，数字助理的 stop_session 工具按用户指示代停走
 // stopActorAssistant。这样「谁把任务停了」在停止记录、重启恢复与派发回报里都分得开
-//（两者都算人为叫停：Kind 都是 stopByUser，不会被当成故障而重新派发）。
+// （两者都算人为叫停：Kind 都是 stopByUser，不会被当成故障而重新派发）。
 func (a *App) stopRunBy(id, actor, note string) bool {
 	jobsKilled := a.stopSessionJobs(id)
 	r := a.runOf(id)
@@ -291,6 +320,7 @@ func (a *App) watchStop(id string, r *sessionRun) {
 //  4. 强制收口（finishRun：摘注册表、关闭订阅者、置空闲、清归属）——之后
 //     执行体再醒来，finishRunOf 认出注册表里已不是自己，收口幂等空转，
 //     不会把状态改回去；终态交代被 wasKilled 拦住，不再写库发事件。
+//
 // 只动这一个会话：其他正在执行的会话、发布流程（隔离目录构建）一概不碰。
 func (a *App) forceStopRun(id string, r *sessionRun) {
 	if !r.markKilled() {
@@ -488,13 +518,22 @@ func (a *App) broadcast(ev Event) {
 // 下一步带着插话重组重调（工具执行段 kick 无效，照旧等下一步注入）——所有
 // 插话入口（用户 interject、排队坞提前、AI 派发投递）在此统一生效。
 func (a *App) pushPending(sessionID, mode, content, kind, origin string) *PendingMsg {
-	pm := &PendingMsg{ID: newID(), Content: content, CreatedAt: now(), Kind: kind, Origin: origin}
+	return a.pushPendingMsg(sessionID, mode, &PendingMsg{Content: content, Kind: kind, Origin: origin})
+}
+
+// pushPendingMsg 是 pushPending 的完整形态：待生效项由调用方整体构造
+// （合成工具回执对带 ToolName/ToolArgs，见 PendingMsg），入队与 kick 行为
+// 与 pushPending 完全一致——回执对与普通插话共用同一套时机语义。
+func (a *App) pushPendingMsg(sessionID, mode string, pm *PendingMsg) *PendingMsg {
+	pm.ID = newID()
+	pm.CreatedAt = now()
 	a.pendMu.Lock()
 	if mode == "steer" {
 		a.pendingSteer[sessionID] = append(a.pendingSteer[sessionID], pm)
 	} else {
 		a.pendingQueue[sessionID] = append(a.pendingQueue[sessionID], pm)
 	}
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	if mode == "steer" {
 		a.kickModelStream(sessionID)
@@ -556,6 +595,102 @@ func (a *App) deliverToSessionNoKick(m *SessionMeta, content, kind, origin strin
 	a.landUserSide(m, content, kind, origin, nil)
 }
 
+// originToolReport 是合成工具回执对两行（assistant+tool_calls / tool）的
+// origin 标记：后台异步完成的回执以「当初那次调用的后续结果」形态回到会话，
+// 前端据此强制按普通工具行折叠（不升格计划卡/子任务卡），详见《消息类型规范.md》。
+const originToolReport = "toolreport"
+
+// landToolPair 是合成工具回执对落库的唯一收口：assistant（tool_calls，函数名
+// 与参数由回执构造方回显）+ 紧随的 tool（回执正文）两行 kind=chat。与真实
+// 工具调用同路径：组装层原样进上下文（配对由 repairToolPairing 兜底）、前端
+// 按工具行折叠、repairDanglingToolCalls 视为已配对。emit 为空走全局广播
+// （空闲投递），否则走本轮订阅通道（插话注入，与 landUserSide 同口径）。
+// 侧栏活动时间按 touchesActivity 纪律不刷新（工具结果不算会话活动；唤醒轮
+// 的最终输出照常刷新）。
+func (a *App) landToolPair(m *SessionMeta, pm *PendingMsg, emit func(Event)) {
+	args := strings.TrimSpace(pm.ToolArgs)
+	if args == "" {
+		args = "{}"
+	}
+	callID := "call-" + newID()
+	asm := a.appendRow(m, StoredMessage{
+		Message: Message{Role: "assistant", ToolCalls: []ToolCall{{ID: callID, Type: "function",
+			Function: ToolCallFunc{Name: pm.ToolName, Arguments: args}}}},
+		Kind: kindChat, Origin: originToolReport, CreatedAt: now(),
+	})
+	tsm := a.appendRow(m, StoredMessage{
+		Message: Message{Role: "tool", Content: clipToolResult(pm.Content), ToolCallID: callID},
+		Kind:    kindChat, Origin: originToolReport, CreatedAt: now(),
+	})
+	ev := func(e Event) {
+		if emit != nil {
+			emit(e)
+		} else {
+			a.broadcast(e)
+		}
+	}
+	ev(Event{Type: "message", Message: &asm.Message, Seq: asm.Seq, Kind: kindChat, Origin: originToolReport})
+	ev(Event{Type: "message", Message: &tsm.Message, Seq: tsm.Seq, Kind: kindChat, Origin: originToolReport})
+}
+
+// toolReportPair 组装一条合成工具回执对（后台作业/后台请求收尾投递用）：
+// tool 回显当初发起后台动作的原工具名，args 回显识别参数，result 是回执正文。
+func toolReportPair(tool, args, result string) *PendingMsg {
+	return &PendingMsg{Content: result, ToolName: tool, ToolArgs: args, Origin: originToolReport}
+}
+
+// startToolReportRound 把一条合成工具回执对投进会话并接上续跑轮（模板照
+// startReportRound / deliverToSession，时机语义与派发回报完全一致）：空闲 =
+// 落对并起轮（模型按工具结果续跑）；正在执行 = 插话注入它当前那一轮（模型
+// 调用中立见打断重组重调，工具执行段等下一步调用模型前注入）。多条回执同时
+// 到达时，第一条起轮、其余自然插话进同一轮（pushPendingMsg 保序）。
+// 事件分发必须与 executeRun 同一套（runEmitOf）：这种轮没有 HTTP 请求挂着流，
+// 前端全靠广播的 session_updated 翻新并接上执行流——只 run.publish 不广播的
+// 话，批准计划后的整个执行过程在前端不可见，直到跑完 done 才整包出现。
+func (a *App) startToolReportRound(m *SessionMeta, pm *PendingMsg) {
+	lock := a.sessLock(m.ID)
+	lock.Lock()
+	if a.IsRunning(m.ID) {
+		a.pushPendingMsg(m.ID, "steer", pm)
+		lock.Unlock()
+		return
+	}
+	run, ok := a.beginRun(m.ID)
+	if !ok { // 极小概率竞态：刚被别的入口占住，同样插话（注入它接下来的一步）
+		a.pushPendingMsg(m.ID, "steer", pm)
+		lock.Unlock()
+		return
+	}
+	emit := a.runEmitOf(m, run)
+	a.landToolPair(m, pm, emit)
+	lock.Unlock()
+	go func() {
+		defer a.finishRunOf(m.ID, run)
+		run.publish(Event{Type: "run_start"})
+		err := a.runRoundsWithQueue(m, run, emit, true, a.queueAutoSendOn())
+		if err == nil {
+			run.markCleanEnd()
+		}
+		a.broadcast(Event{Type: "session_updated", SessionID: m.ID})
+		a.broadcast(Event{Type: "done", SessionID: m.ID})
+	}()
+}
+
+// deliverToolReportNoKick 是回执对的「投递但绝不拉起执行」变体（对齐
+// deliverToSessionNoKick 的叫停纪律）：会话忙则照常插话进它正在执行的那一轮
+// （不是我们拉起的）；空闲则只落对，不起轮——被终止的后台作业、超时未处理
+// 的回执走这里，用户下次与它对话时自然看到（落库即完成，投递路径仍然唯一）。
+func (a *App) deliverToolReportNoKick(m *SessionMeta, pm *PendingMsg) {
+	lock := a.sessLock(m.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if a.IsRunning(m.ID) {
+		a.pushPendingMsg(m.ID, "steer", pm)
+		return
+	}
+	a.landToolPair(m, pm, nil)
+}
+
 // subQueueNote 组织「目标会话正在执行，派发需求已插话」时回给模型的文案：
 // 模型调用中插话会立即打断其当前输出、下一步就带着这句话重调；工具执行中
 // 则等下一步调用模型前注入——两种情况对方都立刻能看到。
@@ -567,11 +702,11 @@ func subQueueNote(sub *SessionMeta, note string) string {
 
 // landUserSide 是「用户侧消息落库」的唯一收口：chat（真实用户发言）走
 // appendMessage——锚定本轮环境时间、刷新会话活动时间，与用户自己发完全一致
-//（chat 带 origin 时——如插话 origin=interject——按同口径落库，只是多存一个
+// （chat 带 origin 时——如插话 origin=interject——按同口径落库，只是多存一个
 // 来源标记）；aiuser（AI 发出的用户消息）与注入类（report 等）走 appendRow，
 // 并按 AGENT.md 的约定显式刷新会话时间（touchesActivity 的口径不含这两类行，
 // 不能去改它）。落库后广播同型 message 事件：emit 非空时走本轮订阅通道
-//（执行体内部），否则走全局广播。
+// （执行体内部），否则走全局广播。
 func (a *App) landUserSide(m *SessionMeta, content, kind, origin string, emit func(Event)) *StoredMessage {
 	if kind == "" {
 		kind = kindChat
@@ -600,11 +735,23 @@ func (a *App) landUserSide(m *SessionMeta, content, kind, origin string, emit fu
 	return sm
 }
 
+// bumpPendingLocked 递增会话的待生效队列版本号（必须在 pendMu 持有下调用）。
+// 版本号随快照下发，是「快照取值时刻」的标记：插话排水极快（打断→注入可在
+// 响应写回前完成），interject 响应/pending 广播在途时队列可能已排空，旧快照
+// 晚到若被前端照画就是无人再摘的幽灵虚线框——前端按 ver 只接受更新的快照。
+func (a *App) bumpPendingLocked(sessionID string) {
+	if a.pendVer == nil { // 惰性建表：测试/非常规构造路径没走 initRuntime 也不炸
+		a.pendVer = map[string]int64{}
+	}
+	a.pendVer[sessionID]++
+}
+
 // drainSteer 取走并清空会话的插话队列（agent 循环步间排水）。
 func (a *App) drainSteer(sessionID string) []*PendingMsg {
 	a.pendMu.Lock()
 	q := a.pendingSteer[sessionID]
 	delete(a.pendingSteer, sessionID)
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	return q
 }
@@ -623,6 +770,7 @@ func (a *App) popQueue(sessionID string) *PendingMsg {
 	} else {
 		a.pendingQueue[sessionID] = q[1:]
 	}
+	a.bumpPendingLocked(sessionID)
 	return first
 }
 
@@ -634,6 +782,7 @@ func (a *App) requeueSteer(sessionID string) {
 	}
 	a.pendMu.Lock()
 	a.pendingQueue[sessionID] = append(a.pendingQueue[sessionID], left...)
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	a.broadcastPending(sessionID)
 }
@@ -644,6 +793,7 @@ func (a *App) pendingOf(sessionID string) *PendingState {
 	defer a.pendMu.Unlock()
 	st := &PendingState{Steer: []*PendingMsg{}, Queue: []*PendingMsg{}}
 	st.Paused = a.queuePaused[sessionID]
+	st.Ver = a.pendVer[sessionID]
 	st.Steer = append(st.Steer, a.pendingSteer[sessionID]...)
 	st.Queue = append(st.Queue, a.pendingQueue[sessionID]...)
 	return st
@@ -686,6 +836,9 @@ func (a *App) updatePending(sessionID, msgID, action string) bool {
 	}
 	if moved != nil {
 		a.pendingSteer[sessionID] = append(a.pendingSteer[sessionID], moved)
+	}
+	if found {
+		a.bumpPendingLocked(sessionID)
 	}
 	a.pendMu.Unlock()
 	if found {
@@ -740,6 +893,7 @@ func (a *App) movePending(sessionID, id, before string) bool {
 	}
 	list = append(list[:to], append([]*PendingMsg{pm}, list[to:]...)...)
 	a.pendingQueue[sessionID] = list
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	a.broadcastPending(sessionID)
 	return true
@@ -750,6 +904,7 @@ func (a *App) movePending(sessionID, id, before string) bool {
 func (a *App) setQueuePaused(sessionID string, paused bool) {
 	a.pendMu.Lock()
 	a.queuePaused[sessionID] = paused
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	a.broadcastPending(sessionID)
 }
@@ -770,6 +925,7 @@ func (a *App) dropPending(sessionID string) {
 	delete(a.pendingSteer, sessionID)
 	delete(a.pendingQueue, sessionID)
 	delete(a.queuePaused, sessionID)
+	a.bumpPendingLocked(sessionID)
 	a.pendMu.Unlock()
 	a.broadcastPending(sessionID)
 }
@@ -847,7 +1003,13 @@ func (a *App) drainQueue(sess *SessionMeta, run *sessionRun, emit func(Event), a
 			break
 		}
 		a.broadcastPending(sess.ID)
-		a.landUserSide(sess, pm.Content, pm.Kind, pm.Origin, emit)
+		if pm.ToolName != "" {
+			// 合成工具回执对（后台回执被插话机制转到排队）：落 assistant+tool
+			// 两行，模型按工具结果续跑——与 landUserSide 并列的另一个落库收口
+			a.landToolPair(sess, pm, emit)
+		} else {
+			a.landUserSide(sess, pm.Content, pm.Kind, pm.Origin, emit)
+		}
 		if err = a.runGoalRounds(run.ctx, sess, emit); err != nil {
 			break
 		}
@@ -918,23 +1080,38 @@ func itoa(n int) string {
 // 然后把排队消息逐条作为独立一轮发出，最后给出明确的终态交代。
 // 异常结束一律落一条可见记录并写日志——绝不出现「模型没输出、对话就停在
 // 半路」的静默停止。
-func (a *App) executeRun(m *SessionMeta, run *sessionRun, opening []Event) {
-	defer a.finishRunOf(m.ID, run)
-	emit := func(ev Event) {
+// runEmitOf 构造会话执行体的事件分发器：先发本轮订阅者（挂着的 SSE 请求
+// 实时跟随），再按「消息级里程碑才进全局总线」的纪律广播——delta/reasoning
+// 这类高频事件不广播（否则前端打出一串无效请求），message/tool_start 等广播
+// session_updated（正看着会话的窗口据此翻新并接上执行流，见前端 loadSessionInto
+// 的 attachRun），done/stopped 终态原样广播（点亮「完成未查看」绿点）。
+// 用户发消息起的轮（executeRun）与后端拉起的轮（startToolReportRound：后台
+// 计划批准/后台回执触发的续跑）必须用同一套分发——后端拉起的轮没有 HTTP 请求
+// 挂着流，前端完全靠广播里的 session_updated 接上执行流；漏了广播执行过程就
+// 整段不可见，直到 done 才一次性整包出现（2026-11-19 修，勿回退）。
+func (a *App) runEmitOf(m *SessionMeta, run *sessionRun) func(Event) {
+	return func(ev Event) {
 		ev.SessionID = m.ID
 		run.observe(ev)
 		run.publish(ev)
-		// 只在「消息级」里程碑广播会话更新（前端据此刷侧栏/列表）；
-		// delta/reasoning 这类高频事件不广播，否则会打出一串无效请求
 		switch ev.Type {
 		case "delta", "reasoning", "tool_start", "tool_end", "tool_wait", "resume", "pending", "retry", "auto_retry":
 		case "done", "stopped":
-			// 终态原样进全局总线：前端据此点亮「完成未查看」绿点并刷新侧栏
 			a.broadcast(ev)
 		default:
 			a.broadcast(Event{Type: "session_updated", SessionID: m.ID})
 		}
 	}
+}
+
+func (a *App) executeRun(m *SessionMeta, run *sessionRun, opening []Event) {
+	// 记下本轮持有的会话对象：后台审批在别的协程里批准时，要把提权落到这个
+	// 活对象上（工具执行时读的就是它，只改库里那份下一句仍按旧档走）。
+	run.mu.Lock()
+	run.sess = m
+	run.mu.Unlock()
+	defer a.finishRunOf(m.ID, run)
+	emit := a.runEmitOf(m, run)
 	defer func() { // 执行体自身出问题时也要留下痕迹，不能静默消失
 		if p := recover(); p != nil {
 			log.Printf("[对话] 会话 %s 执行体异常: %v", m.ID, p)
@@ -1151,6 +1328,13 @@ func (a *App) runSubAgent(parent *SessionMeta, sub *SessionMeta, run *sessionRun
 		followUp = "这是用户主动叫停，不是故障：不要再自动重新派发、续跑或补做这个任务，用一句话向用户确认已停止即可。"
 	}
 	reportText := head + "\n\n" + summary + "\n\n" + followUp
+	// 桥派子任务（run_python 脚本经 jx.dispatch 派的）：回报定向存给脚本的
+	// jx.wait 收取，不投父会话、不起汇报轮——脚本结束后统一经【后台脚本回报】
+	// 或转交投递到达，主对话只被打扰一次（bridge.go）。
+	if a.bridgeInterceptReport(sub, reportText) {
+		a.broadcast(Event{Type: "session_updated", SessionID: sub.ID})
+		return
+	}
 	// 回报的投递路径仍然统一在 deliverToSession 一族（按「用户侧消息」投，父会话
 	// 空闲就落库并起汇报轮；正被占用就插话注入它正在执行的那一轮——AI 发话
 	// 一律插话，不排队）：正常结束与失败都走 deliverToSession；唯一例外是人为

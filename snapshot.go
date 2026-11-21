@@ -307,9 +307,37 @@ func (t *toolContext) ensureJxAI() {
 // 表示"真的从盘上/SFTP 读回来了"；快照关闭（track=false）或远程回读失败
 // 降级时为 false，此时 readBack 不可作数。
 func (t *toolContext) snapshotWrite(abs string, grant *Grant, data []byte) (readBack []byte, verified bool, err error) {
-	var before []byte
-	existed := true
-	track := t.app.snapshotsEnabled()
+	before, existed, track := t.snapshotBase(abs)
+	if err := t.envWriteFileWithGrant(abs, data, grant); err != nil {
+		return nil, false, err
+	}
+	if !track {
+		return nil, false, nil
+	}
+	after, rerr := t.envReadFile(abs)
+	if rerr != nil {
+		after = data // 远程回读失败时退回写入内容（本地写即所得）；verified=false 如实相告
+	} else {
+		readBack, verified = after, true
+	}
+	t.recordCheckpoint(&Checkpoint{
+		SessionID: t.sess.ID, Seq: t.seq, ToolCallID: t.callID, ToolName: t.toolName,
+		Path: t.displayPath(abs), ExistedBefore: existed, BeforeSize: int64(len(before)),
+		AfterHash: hashBytes(after), AfterSize: int64(len(after)), CreatedAt: now(),
+	}, before)
+	return readBack, verified, nil
+}
+
+// snapshotBase 采集一次写入前的基线与"是否值得追踪"：返回旧内容、改动前是否
+// 存在、是否落快照。旧文件读不了、超单文件上限、备份开关关闭、正文属于 .jxai
+// 系统子目录时 track=false（写入照常，只是不留基线）。
+//
+// 抽出来是因为两条写入路径都要它：模型的 write/edit（snapshotWrite）与用户在
+// 右栏「文件」视图里的手工编辑（fileedit.go 的 panelWriteFile）——后者的写入
+// 不过权限引擎、也不锚定对话回合，但"写前留旧版本"的口径必须与前者一致。
+func (t *toolContext) snapshotBase(abs string) (before []byte, existed, track bool) {
+	existed = true
+	track = t.app.snapshotsEnabled()
 	if isDir, size, err := t.envStat(abs); err != nil {
 		if os.IsNotExist(err) {
 			existed = false
@@ -327,36 +355,27 @@ func (t *toolContext) snapshotWrite(abs string, grant *Grant, data []byte) (read
 		track = false // .jxai 系统子目录（快照正文/暂存/交付备份）不做快照；
 		// uploads 里的用户上传文件照常追踪——文件改动行要能看到对它的编辑
 	}
-	if err := t.envWriteFileWithGrant(abs, data, grant); err != nil {
-		return nil, false, err
-	}
-	if !track {
-		return nil, false, nil
-	}
-	after, rerr := t.envReadFile(abs)
-	if rerr != nil {
-		after = data // 远程回读失败时退回写入内容（本地写即所得）；verified=false 如实相告
-	} else {
-		readBack, verified = after, true
-	}
-	cp := &Checkpoint{
-		SessionID: t.sess.ID, Seq: t.seq, ToolCallID: t.callID, ToolName: t.toolName,
-		Path: t.displayPath(abs), ExistedBefore: existed, BeforeSize: int64(len(before)),
-		AfterHash: hashBytes(after), AfterSize: int64(len(after)), CreatedAt: now(),
-	}
+	return before, existed, track
+}
+
+// recordCheckpoint 落一条快照并把它改动前的正文写进 .jxai/snapshots/。返回快照
+// id（快照没写成返回 0）。快照只是"能回退"的保障，失败只记日志，不影响已经
+// 成功的写入。
+func (t *toolContext) recordCheckpoint(cp *Checkpoint, before []byte) int64 {
 	id, aerr := t.app.Store.AppendCheckpoint(cp)
 	if aerr != nil {
 		log.Printf("[快照] 会话 %s 写 %s 的快照落库失败: %v", t.sess.ID, cp.Path, aerr)
-		return readBack, verified, nil
+		return 0
 	}
-	if existed {
+	if cp.ExistedBefore {
 		if werr := t.writeSnapshotBody(id, before); werr != nil {
 			// 正文写不进去就把元数据行一并撤掉，避免留下"有快照却没正文"的坑
 			log.Printf("[快照] 会话 %s 写 %s 的快照正文失败: %v", t.sess.ID, cp.Path, werr)
 			_ = t.app.Store.DeleteCheckpoints(t.sess.ID, []int64{id})
+			return 0
 		}
 	}
-	return readBack, verified, nil
+	return id
 }
 
 // rewindPlan 是一个文件的回退计划：恢复到 before 状态，或删除（改动前不存在）。

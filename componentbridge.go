@@ -181,10 +181,11 @@ func (m *bridgeManager) get(compID string, def ComponentWorkerDef) (*bridgeWorke
 	if w := m.ws[key]; w != nil && w.cmd.ProcessState == nil {
 		return w, nil
 	}
-	// 组件目录锚定：注册表目录是相对 cwd 的（开发=仓库根，安装版锚 exe 旁）
-	dir := filepath.Join(m.app.Components.Dir(), compID)
-	if abs, err := filepath.Abs(dir); err == nil {
-		dir = abs
+	// 组件目录锚定：按归属解析（内置=组件/<id>，用户=组件/user/<id>），
+	// 两条路的 worker、钩子、端点走同一个桥，组件自己不需要知道归属。
+	dir, ok := m.app.Components.CompDir(compID)
+	if !ok {
+		return nil, fmt.Errorf("组件 %s 不在清单里（已卸载？）", compID)
 	}
 	argv, err := m.resolveCommand(def, dir)
 	if err != nil {
@@ -432,7 +433,9 @@ func (a *App) handleComponentBridge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m, ok := a.Components.Manifest(compID)
-	if !ok || !a.Components.IsEnabled(compID) {
+	// 生效口径：全局开着，或还有任何会话显式要它（按对话开关）——桥请求不带
+	// 会话（组件脚本只认自己的端点）；会话关掉的对话里组件 UI 已热卸载，不会来。
+	if !ok || !a.cxoComponentLive(compID) {
 		http.NotFound(w, r)
 		return
 	}

@@ -1,4 +1,4 @@
-﻿# 坚祥数字助理GO 安装包构建脚本（exe 文件名切换期：见下方 $ExeBaseName）
+﻿# AI数字助理 安装包构建脚本
 #
 # 用法（在仓库根目录）：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File 打包\打包安装包.ps1
@@ -7,10 +7,9 @@
 #   -ExeSource   使用已构建好的发行 exe（默认现场 go build；
 #                需要排除工作区未完成改动时，先在干净 worktree 里构建再传入）
 #   -SkillsSource 技能目录来源（默认仓库根的 技能\，含 _runtime 便携运行时）
-#   -ExeBaseName exe 文件名基名（默认 坚祥数字助理GO；切换期见
-#                《exe名切换-AI数字助理-一周后操作清单.md》：约一周后发新版
-#                改用 AI数字助理，届时改这里的默认值即可，安装包.iss 的
-#                AppName/ExeName 经 ISCC /D 覆盖，无需动 iss）
+#   -ExeBaseName exe 文件名基名（默认 AI数字助理；2026-11-19 完成
+#                「坚祥数字助理GO → AI数字助理」切换，安装包.iss 经
+#                ISCC /D 跟随，换名版自动清理旧名 exe/快捷方式）
 #
 # 前置条件：本机装有 Inno Setup 6（winget install JRSoftware.InnoSetup）。
 
@@ -18,7 +17,7 @@ param(
   [string]$Version = "",
   [string]$ExeSource = "",
   [string]$SkillsSource = "",
-  [string]$ExeBaseName = "坚祥数字助理GO",
+  [string]$ExeBaseName = "AI数字助理",
   # IssFile：Inno 脚本（默认正式版；测试版传 安装包-测试版.iss——独立 AppId 并行安装）
   [string]$IssFile = "安装包.iss",
   # ConfigTemplate：随包内置的 config.json 模板（测试版用来首装即指测试环境；
@@ -42,9 +41,14 @@ if (-not (Test-Path $pyExe)) {
 # 模块在便携运行时里真实可导入——装配是按需触发的，开发机上没跑过的
 # 技能依赖可能没装，缺着出包会让最终用户在离线机器上踩坑，故缺一不出包。
 $modules = @{}
-# ★ 2026-10-12：递归扫描（含 user\ 子目录的用户技能，跳过 _runtime）——非递归会漏掉用户技能的依赖声明、校验假通过（实测曾漏 pywin32 全家；微信操作就在 user\ 下）
+# ★ 2026-10-12：递归扫描用户技能的依赖声明（实测曾漏 pywin32 全家；微信操作就在 user\ 下）
+# ★ 2026-11-08 口径修正：只校验**内置技能**（技能\ 下非 user）——用户技能不随包
+# 分发，其依赖也不该进发行包；此前连 user 技能的依赖一起校验，等于逼着把用户
+# 技能装的包（AI 剪视频的 faster-whisper / ctranslate2 / nvidia 全家，2 GB+）
+# 塞进共享运行时再随包发给客户，安装包体积直接失控。
 Get-ChildItem $SkillsSource -Recurse -Depth 2 -Directory | Where-Object {
   $_.FullName -notmatch '\\_runtime(\\|$)' -and
+  $_.FullName -notmatch '\\技能\\user(\\|$)' -and
   (Test-Path (Join-Path $_.FullName "manifest.json"))
 } | ForEach-Object {
   # manifest 是 UTF-8：PS5.1 的 Get-Content 默认按 GBK 读会把中文读成
@@ -115,8 +119,92 @@ if ($exeItem.Length -lt 30MB) {
 }
 Write-Host ("== stage exe 校验通过：PE AMD64 / {0:N1} MB" -f ($exeItem.Length / 1MB))
 
+# ★ 版本串自检（2026-11-14 硬化，踩过的坑：把旧 exe 复制改名当新包，用户端
+# 版本号永远不变、反复弹更新）。判据只有一条：exe 二进制里必须能扫到本次
+# $Version 的版本串——即 appVersion 真的被 -X 注进了产物，或者 -ExeSource
+# 给的正是这一版。扫不到一律拒绝出包，不允许「先发出去再说」。
+$verBytes = [Text.Encoding]::ASCII.GetBytes($Version)
+$exeBytes = [IO.File]::ReadAllBytes($exe)
+$hitAt = -1
+for ($i = 0; $i -le ($exeBytes.Length - $verBytes.Length); $i++) {
+  if ($exeBytes[$i] -eq $verBytes[0]) {
+    $okAll = $true
+    for ($j = 1; $j -lt $verBytes.Length; $j++) {
+      if ($exeBytes[$i + $j] -ne $verBytes[$j]) { $okAll = $false; break }
+    }
+    if ($okAll) { $hitAt = $i; break }
+  }
+}
+if ($hitAt -lt 0) {
+  throw ("stage\{0}.exe 里扫不到版本串「{1}」——产物不是本版编译的（疑似旧 exe 改名，或 appVersion 注入丢失），拒绝出包" -f $ExeBaseName, $Version)
+}
+Write-Host ("== 版本串自检通过：exe 内命中「{0}」（偏移 {1:N0}）" -f $Version, $hitAt)
+
 Write-Host "== 暂存技能目录（含便携 Python 运行时，体积较大）"
 Copy-Item $SkillsSource (Join-Path $stage "技能") -Recurse -Force
+
+# 迁移账本（技能\.migrations.json）是「本机跑过哪些一次性迁移」的记账，绝不能进包：
+# 随包发给客户等于替客户声称全部迁移早已跑过，新装机器会跳过首次运行该跑的任务
+# （典型：释放内置 MCP 连接器 cua / windows-mcp 的任务），功能凭空缺一块。
+Remove-Item (Join-Path $stage "技能\.migrations.json") -Force -ErrorAction SilentlyContinue
+
+# 技能\_runtime 按发行白名单收敛：开发机上跑用户技能时 pip 装进共享运行时的
+# 第三方包（实测 AI 剪视频技能带来 nvidia/ctranslate2/faster-whisper 等 2.5 GB）
+# 绝不能随包发给客户——用户技能的依赖由对方机器装技能时自己装配。
+# 基准是 打包\runtime-基线清单.txt：服务器当前发布中的 runtime 块（客户装的
+# 就是它）的条目清单。**不能用 git 索引**——运行时主体（python.exe / Lib /
+# DLL）从未入库，按索引收敛会把整个运行时掏空（2026-11-08 实测踩过，包从
+# 270 MB 掉到 165 MB、stage 里 python.exe 都没了）。清单缺失或运行时核心缺失
+# 一律拒绝出包。
+$rtStage = Join-Path $stage "技能\_runtime"
+if (Test-Path $rtStage) {
+  $rtList = Join-Path $packDir "runtime-基线清单.txt"
+  if (-not (Test-Path $rtList)) {
+    throw "缺少 打包\runtime-基线清单.txt（_runtime 发行白名单），拒绝出包：请按当前发布中的 runtime 块条目重生清单"
+  }
+  $tracked = @{}
+  Get-Content $rtList -Encoding UTF8 | ForEach-Object {
+    $rel = $_.Trim()
+    if ($rel -eq "" -or $rel.StartsWith("#")) { return }
+    $tracked[$rel] = $true
+  }
+  if ($tracked.Count -lt 500) { throw "runtime 基线清单条目太少（$($tracked.Count) 条），清单异常，拒绝出包" }
+  $rtPrefix = "技能\_runtime\"
+  $removedCnt = 0; [long]$removedBytes = 0
+  Get-ChildItem $rtStage -Recurse -File -Force | ForEach-Object {
+    $rel = ($_.FullName.Substring($rtStage.Length + 1) -replace "\\", "/")
+    if (-not $tracked.ContainsKey($rel)) {
+      $removedBytes += $_.Length
+      Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+      $removedCnt++
+    }
+  }
+  Get-ChildItem $rtStage -Recurse -Directory -Force | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object {
+    if (-not (Get-ChildItem $_.FullName -Force -ErrorAction SilentlyContinue)) {
+      Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+  }
+  Write-Host ("== 运行时按发行白名单收敛：剔除清单外 {0} 个文件 / {1:N0} MB（用户技能装的依赖不随包）" -f $removedCnt, ($removedBytes / 1MB))
+  $rtPy = Join-Path $rtStage "python\python.exe"
+  if (-not (Test-Path $rtPy)) { throw "收敛后运行时缺 python.exe（白名单或源目录异常），拒绝出包：$rtPy" }
+  # 自检用 stage 自己的 python 导入**内置技能 manifest 声明的模块集合**（与前面
+  # 源运行时校验同一份 $modules），确认白名单没把内置依赖剔掉。python 的报错
+  # 走 stderr，先降 ErrorActionPreference 免得被当成脚本错误中断。
+  $oldEAP = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  $bad = @()
+  foreach ($rm in $modules.Keys) {
+    $out = & $rtPy -c "import $rm" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      $bad += ($rm + " -> " + (($out.Trim() -split "`n") | Select-Object -Last 1))
+    }
+  }
+  $ErrorActionPreference = $oldEAP
+  if ($bad.Count -gt 0) {
+    throw ("收敛后 stage 运行时导入失败：" + ($bad -join "；") + "（白名单缺内置依赖，拒绝出包）")
+  }
+  Write-Host ("== 收敛后 stage 运行时自检通过（python.exe + {0} 个内置依赖全部可导入）" -f $modules.Count)
+}
 
 # 技能\user\ 是「用户自己装的技能」（本机开发机上是我们的内部技能，含服务器地址、
 # 部署命令），绝不随安装包发给客户——静默更新块早就是这个口径（发布静默更新.ps1
@@ -139,7 +227,39 @@ $compCount = (Get-ChildItem $compDir -Directory | Where-Object {
   Test-Path (Join-Path $_.FullName "manifest.json")
 }).Count
 if ($compCount -eq 0) { throw "组件目录里没有任何带 manifest.json 的组件，拒绝出包" }
-Copy-Item $compDir (Join-Path $stage "组件") -Recurse -Force
+# 组件运行时残留（开发机上边跑边写的产物，如独立语音输入法的录音留档与
+# 浏览器 profile）：绝不进发行包，且复制阶段就要跳过——webview2 profile 被
+# 运行中的实例锁着，先复制后删除会在 Copy-Item 上卡死。清单见
+# 打包\组件运行时排除.txt（相对仓库根、/ 分隔、# 注释）；robocopy 的
+# /XD /XF 传完整路径可精确排除（纯目录名会误伤任意层级同名项）。
+$rtList = Join-Path $packDir "组件运行时排除.txt"
+$rtSkip = @()
+if (Test-Path $rtList) {
+  $rtSkip = Get-Content $rtList -Encoding UTF8 | ForEach-Object {
+    $rel = $_.Trim()
+    if ($rel -eq "" -or $rel.StartsWith("#")) { return }
+    $rel
+  }
+}
+$stageComp = Join-Path $stage "组件"
+$xd = @(); $xf = @()
+foreach ($rel in $rtSkip) {
+  $src = Join-Path $root ($rel -replace "/", "\")
+  if (-not (Test-Path $src)) { continue }
+  if ((Get-Item $src).PSIsContainer) { $xd += $src } else { $xf += $src }
+}
+# 用户组件区（组件/user/）绝不进包：那是用户自己装的东西（市场/发行渠道单个
+# 安装），与用户技能 技能/user 同款——不进打包、不上 git、不参与静默更新。
+$userCompDir = Join-Path $compDir "user"
+if (Test-Path $userCompDir) { $xd += $userCompDir }
+$rcArgs = @($compDir, $stageComp, "/E", "/R:0", "/W:0", "/NFL", "/NDL", "/NJH", "/NJS")
+if ($xd.Count -gt 0) { $rcArgs += "/XD"; $rcArgs += $xd }
+if ($xf.Count -gt 0) { $rcArgs += "/XF"; $rcArgs += $xf }
+robocopy @rcArgs
+if ($LASTEXITCODE -ge 8) { throw "复制组件目录失败（robocopy 退出码 $LASTEXITCODE；可能是清单外的新运行时残留被锁，把它加进 组件运行时排除.txt）" }
+if ($rtSkip.Count -gt 0) {
+  Write-Host ("== 组件复制排除清单：{0}" -f ($rtSkip -join '、'))
+}
 Write-Host "== 内置组件 $compCount 个已暂存"
 
 # 内置 MCP 组件（「操作电脑」能力的来源）：cua-driver 与 windows-mcp 依赖。
@@ -197,6 +317,19 @@ $notices = Join-Path $root "THIRD-PARTY-NOTICES.md"
 if (-not (Test-Path $notices)) { throw "缺少第三方组件声明：$notices（仓库根目录必须有 THIRD-PARTY-NOTICES.md）" }
 Copy-Item $notices $stage -Force
 
+# 最终用户许可协议（安装向导第二步显示，选中「我同意」才能继续）：LicenseFile
+# 由 ISCC 编译期嵌入安装包（不进 stage）；源文件缺失或无 BOM 时 Inno 会把中文
+# 显示成乱码，这里出包前防呆校验。
+$license = Join-Path $packDir "法律文档\最终用户许可协议（含隐私与数据处理说明）.txt"
+if (-not (Test-Path $license)) { throw "缺少最终用户许可协议：$license（安装包.iss 的 LicenseFile 依赖它）" }
+$licHead = [byte[]](0)
+$licFs = [IO.File]::OpenRead($license)
+try { $licHead = New-Object byte[] 3; [void]$licFs.Read($licHead, 0, 3) } finally { $licFs.Close() }
+if (-not ($licHead[0] -eq 0xEF -and $licHead[1] -eq 0xBB -and $licHead[2] -eq 0xBF)) {
+  throw "许可协议不是 UTF-8 带 BOM 编码：$license（Inno 的 LicenseFile 按 BOM 识别 UTF-8，无 BOM 中文会乱码）"
+}
+Write-Host "== 许可协议就绪（安装向导第二步展示，需同意后继续）：$(Split-Path -Leaf $license)"
+
 # 测试版：内置配置模板 → stage\config.json（iss 以 onlyifdoesntexist 落盘）
 if ($ConfigTemplate -ne "") {
   if (-not (Test-Path $ConfigTemplate)) { throw "ConfigTemplate 不存在：$ConfigTemplate" }
@@ -218,7 +351,10 @@ Get-ChildItem (Join-Path $stage "技能") -Directory | Where-Object {
   $cleanLines.Add('Type: filesandordirs; Name: "{app}\技能\' + $_.Name + '"')
 }
 if (Test-Path (Join-Path $stage "组件")) {
-  Get-ChildItem (Join-Path $stage "组件") -Directory | ForEach-Object {
+  # 只清随包发的内置组件；用户组件区（组件\user）与用户技能一样天然保留
+  Get-ChildItem (Join-Path $stage "组件") -Directory | Where-Object {
+    $_.Name -ne "user"
+  } | ForEach-Object {
     $cleanLines.Add('Type: filesandordirs; Name: "{app}\组件\' + $_.Name + '"')
   }
 }

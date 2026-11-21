@@ -1,0 +1,82 @@
+/* 组件：充值与个人中心（portal）—— 样式。
+ * 规范：字号挂 em（相对所在处文字基准，不写死 px）；颜色一律走主题变量。
+ * 插槽容器本身（.pf-card-slot 及其 :empty 不占位）由主程序 style.css 提供——
+ * 那是卡片标题行布局的一部分，与组件在不在无关。 */
+
+/* 「充值」胶囊按钮（公司通道卡片标题行内，收起态也可见）：与同一行的额度/状态
+   徽标同高同色系，圆角做成胶囊（999px）——2026-11-16 用户口径「不要方框」。
+   强调色描边 + 淡底，hover 加深底色；不写死颜色与 px 字号。 */
+.pp-btn {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--accent, #4d6bfe);
+  color: var(--accent, #4d6bfe);
+  background: color-mix(in srgb, var(--accent, #4d6bfe) 8%, transparent);
+  border-radius: 999px;
+  padding: 0.12em 0.85em;
+  font-size: 0.8em;                /* 相对卡片标题行的文字基准（.pv-head 继承主界面字号） */
+  font-family: inherit;
+  line-height: 1.6;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color .12s ease, border-color .12s ease;
+}
+.pp-btn:hover { background: color-mix(in srgb, var(--accent, #4d6bfe) 22%, transparent); }
+.pp-btn:active { background: color-mix(in srgb, var(--accent, #4d6bfe) 32%, transparent); }
+
+/* 报错条「去充值」：主体复用主程序 re-btn/re-retry，这里只给强调色
+   （形状与字号跟随主程序那排按钮，不套胶囊） */
+.re-btn.pp-btn { color: var(--accent, #4d6bfe); border-color: var(--accent, #4d6bfe); background: none; font-size: inherit; padding: inherit; border-radius: inherit; }
+
+/* 充值浮窗（.modal 遮罩是全局类）：中央卡片 = 标题栏 + iframe */
+#portal-modal { align-items: center; justify-content: center; }
+.portal-win {
+  display: flex; flex-direction: column;
+  width: min(92vw, 60em); height: min(88vh, 44em);
+  background: var(--bg, #fff); border-radius: 0.8em;
+  box-shadow: 0 1.2em 3em rgba(0, 0, 0, .25);
+  overflow: hidden;                       /* 圆角裁住 iframe */
+}
+.portal-head {
+  display: flex; align-items: baseline; gap: 0.7em;
+  padding: 0.7em 1em 0.6em;
+  border-bottom: 1px solid var(--border, #e6e8eb);
+  font-size: calc(var(--chat-fs, 14px) * 1.0);
+  flex: none;
+}
+.portal-head b { font-size: 1.07em; }
+.portal-sub { color: var(--text-3, #8b949e); font-size: 0.86em; }
+.portal-close {
+  margin-left: auto; border: none; background: none; cursor: pointer;
+  color: var(--text-2, #57606a); font-size: 1em; padding: 0.2em 0.5em; border-radius: 0.4em;
+}
+.portal-close:hover { background: var(--hover, #f5f6f8); color: var(--text, #1f2328); }
+
+.portal-frame { flex: 1; width: 100%; border: none; background: #fff; }
+
+/* 注册引导条（浮窗内、iframe 之上）：门户未登录时出现。注册端点（/portal/api/
+   register）是服务端专为本组件开的——门户页本身只有登录，首次使用在这里建档。 */
+.portal-reg {
+  display: flex; align-items: center; gap: 0.5em; flex-wrap: wrap;
+  padding: 0.5em 1em;
+  background: color-mix(in srgb, var(--accent, #4d6bfe) 6%, var(--bg, #fff));
+  border-bottom: 1px solid var(--border, #e6e8eb);
+  font-size: calc(var(--chat-fs, 14px) * 0.93);
+  flex: none;
+}
+.prg-label { color: var(--text-2, #57606a); }
+.portal-reg input {
+  border: 1px solid var(--border, #e6e8eb); border-radius: 0.4em;
+  padding: 0.32em 0.6em; font-size: 0.95em; outline: none;
+  background: var(--bg, #fff); min-width: 9em;
+}
+.portal-reg input:focus { border-color: var(--accent, #4d6bfe); }
+.prg-go {
+  border: none; border-radius: 0.4em; background: var(--accent, #4d6bfe);
+  color: #fff; padding: 0.38em 1em; font-size: 0.95em; cursor: pointer;
+}
+.prg-go:hover { opacity: .9; }
+.prg-go:disabled { opacity: .55; cursor: default; }
+.prg-msg { font-size: 0.9em; color: var(--text-3, #8b949e); }
+.prg-msg.err { color: var(--danger, #c0392b); }
+.prg-msg.ok { color: var(--green, #1f9d55); }

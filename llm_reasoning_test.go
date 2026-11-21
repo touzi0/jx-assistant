@@ -95,3 +95,35 @@ func TestFillReasoningStubIdempotent(t *testing.T) {
 		t.Fatalf("空串指针应原样保留：%v", req.Messages[0].ReasoningContent)
 	}
 }
+
+// 思考档位的线上报文口径：开/关走 thinking{type}（DeepSeek/GLM 风格），强度档
+//（low/high/max 等）走 reasoning_effort 原样透传且不再发 thinking；空串不干预。
+func TestApplyThinking(t *testing.T) {
+	cases := []struct {
+		level    string
+		wantJSON string // 附加在基础报文后的键（不含外层花括号）
+	}{
+		{"", ``},
+		{"enabled", `"thinking":{"type":"enabled"}`},
+		{"disabled", `"thinking":{"type":"disabled"}`},
+		{"low", `"reasoning_effort":"low"`},
+		{"high", `"reasoning_effort":"high"`},
+		{"max", `"reasoning_effort":"max"`},
+	}
+	for _, c := range cases {
+		req := ChatRequest{Model: "m", Messages: []Message{}, Stream: true}
+		req.ApplyThinking(c.level)
+		raw, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `{"model":"m","messages":[],"stream":true`
+		if c.wantJSON != "" {
+			want += "," + c.wantJSON
+		}
+		want += `}`
+		if string(raw) != want {
+			t.Errorf("档位 %q 报文为 %s，期望 %s", c.level, raw, want)
+		}
+	}
+}

@@ -1,4 +1,4 @@
-/* 组件：小程序平台（jxai-server 的 /sites 网页托管平台）—— 浏览器半边。
+/* 组件：企业小程序（jxai-server 的 /sites 网页托管平台）—— 浏览器半边。
  *
  * 原本体 web/app-market.js 的 sites* 系列与 index.html 里的两块硬编码
  * （侧栏按钮 / #sites-view 视图）整体迁入本组件：后端透明反向代理
@@ -16,7 +16,8 @@
 
   const ID = 'sites-platform';
 
-  let btnEl = null, viewEl = null;   // 本组件注入的两个节点
+  let btnEl = null, btnEntry = null, viewEl = null; // 本组件注入的节点（btnEntry＝插槽条目句柄）
+  let legacyHost = false;    // 老前端硬编码形态（组件化之前的产品）：按钮/视图是 index.html 硬编码的，本组件整体让位
   const docKeys = [];                // document keydown 监听（dispose 逐个解绑）
 
   const $ = (id) => document.getElementById(id);
@@ -25,21 +26,43 @@
   /* ---------- DOM 注入（HTML 原样来自原 index.html） ---------- */
 
   function injectDOM() {
-    // 侧栏入口：往组件入口格 #foot-apps（回收站上方的分区挂载点）末尾 append
-    // （组件挂载规矩：不锚定其他按钮）
-    const grid = document.getElementById('foot-apps') || document.querySelector('.sidebar-foot .foot-grid');
-    if (grid) {
+    // 侧栏入口：向底部插槽申请一个条目（order 3，排在回收站 1、企业技能包 2 之上）。
+    // 骨架、排序、电脑竖排 / 手机三列网格全归插槽——见 app-core.js 的 JX.slot 与
+    // AGENT.md「界面插槽」。标签交给插槽包成 .foot-btn-label（裸文本节点拿不到
+    // 手机端"最多两行、超出裁断"的规则，会被挤成竖排）
+    btnEntry = (window.JX && JX.slot) ? JX.slot('sidebar.foot').add({
+      key: 'sites-platform', id: 'btn-sites', order: 3, owner: '组件 sites-platform',
+      title: '企业小程序：发布与管理小程序、数据文件、二维码',
+      label: '企业小程序',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18"/><path d="M8 4V2M16 4V2"/><path d="M7 13h4M7 16h7"/></svg>',
+    }) : null;
+    if (btnEntry) {
+      btnEl = btnEntry.el;
+    } else {
+      // 旧 engine 没有插槽（组件块先于 engine 静默换装生效的窗口期）。先辨形态：
+      // · 老前端硬编码形态（组件化之前的产品）——index.html 里自带 btn-sites 与
+      //   #sites-view，老前端逻辑完整在场。再注入任何东西都是重复（按钮/视图
+      //   id 全撞车、入口翻倍，2026-11-06 窗口期底部入口串成"乱码"就是重复
+      //   条目在窄格里被挤成竖排的字）——整体让位，重启到新 engine 自动归位。
+      if (document.getElementById('btn-sites')) { legacyHost = true; return; }
+      // · 中间形态（有 #foot-apps 挂载点、还没插槽）：退回旧版直接注入，入口
+      //   不因时序消失（2026-11-06 客户事故的症状）。重注入先清自己上次的
+      //   按钮（热重载/静默换装重放同一脚本不落双份）；容器认准 #foot-apps，
+      //   不再兜底 .foot-grid——那会命中硬编码按钮的容器（让位形态之外也可能
+      //   存在更老的骨架），把按钮塞进别人家的格子里。
+      const grid = document.getElementById('foot-apps');
+      if (!grid) return;
+      grid.querySelector('[data-cx-mount="' + ID + '"]')?.remove();
       btnEl = document.createElement('button');
       btnEl.id = 'btn-sites';
+      btnEl.dataset.cxMount = ID;
       btnEl.className = 'foot-btn';
-      btnEl.dataset.order = '20'; // 挂载点内组件按钮的稳定排序（约定见 skill-market 的 sortMounts）
-      btnEl.title = '企业小程序平台：发布与管理小程序、数据文件、二维码';
+      btnEl.dataset.order = '20';
+      btnEl.title = '企业小程序：发布与管理小程序、数据文件、二维码';
       btnEl.innerHTML =
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18"/><path d="M8 4V2M16 4V2"/><path d="M7 13h4M7 16h7"/></svg>' +
-        '小程序平台';
+        '<span class="foot-btn-label">企业小程序</span>';
       grid.appendChild(btnEl);
-      // 挂载点内组件按钮按 data-order 稳定排序（资产加载竞速决定不了注入先后；
-      // 排的是同为组件的兄弟，不锚定内置按钮——AGENT.md 挂载规矩）
       [...grid.children]
         .sort((a, b) => (parseFloat(a.dataset.order || 50) - parseFloat(b.dataset.order || 50)))
         .forEach((el) => grid.appendChild(el));
@@ -51,14 +74,14 @@
       viewEl = document.createElement('div');
       viewEl.id = 'sites-view';
       viewEl.className = 'hidden';
-      viewEl.innerHTML = '<iframe id="sites-frame" class="sites-frame" title="企业小程序平台"></iframe>';
+      viewEl.innerHTML = '<iframe id="sites-frame" class="sites-frame" title="企业小程序"></iframe>';
       main.insertBefore(viewEl, topbar.nextSibling);
     }
   }
 
   /* ---------- 视图开关（body.sites-mode 占领主区；与市场互斥） ---------- */
 
-  // renderSitesFrame：进小程序平台页时确保 iframe 已加载。
+  // renderSitesFrame：进企业小程序页时确保 iframe 已加载。
   function renderSitesFrame() {
     const frame = $('sites-frame');
     if (!frame) return;
@@ -93,13 +116,13 @@
 
   function closeSites() { setSitesView(false); }
 
-  // openSitesPlatform 侧栏「小程序平台」入口：代理目标从市场地址推导，没配置时
+  // openSitesPlatform 侧栏「企业小程序」入口：代理目标从市场地址推导，没配置时
   // 引导去设置（代理本身也会回 503 提示）。
   async function openSitesPlatform() {
     let cfg = null;
     try { cfg = await api('/api/market'); } catch (e) {}
     if (!(cfg && cfg.configured)) {
-      alert('还没配置企业技能包 / 工作流 / 小程序平台地址：请到 设置 · 网络访问 填服务器地址（如 https://example.com:2227），技能市场与小程序平台同一台服务端。');
+      alert('还没配置企业技能包 / 工作流 / 企业小程序地址：请到 设置 · 网络访问 填服务器地址（如 https://jxaizz.com:2227），技能市场与企业小程序同一台服务端。');
       if (typeof openSettings === 'function') openSettings('network');
       return;
     }
@@ -110,7 +133,7 @@
      极简：一个「打开托管平台」入口。与市场组件共用同一台服务器地址（config
      的 marketURL）：skill-market 在场时地址归它的配置段（同在网络访问页上方），
      这里只留入口；它不在场（关闭/摘除）时这里顶上地址字段，平台仍可独立配置
-     使用。市场组件热开关时经 cx:change 联动重挂。组件开关归「内置组件」页。 */
+     使用。市场组件热开关时经 cx:change 联动重挂。组件开关归「组件」页。 */
 
   async function renderNetCfg() {
     const host = document.getElementById('net-sites-cfg');
@@ -121,13 +144,13 @@
     if (!marketLive) {
       urlHtml =
         '<div class="set-field">' +
-        '<div class="sf-label">企业技能包 / 工作流 / 小程序平台地址</div>' +
-        '<input id="set-market-url" class="pf-input" placeholder="https://example.com:2227" autocomplete="off" spellcheck="false">' +
-        '<p class="sf-desc">小程序平台（与技能市场同一台服务端）：填服务器地址即可（https://域名或IP:端口），/sites 等路径后缀由程序自动拼；改动即时生效。</p>' +
+        '<div class="sf-label">企业技能包 / 工作流 / 企业小程序地址</div>' +
+        '<input id="set-market-url" class="pf-input" placeholder="https://jxaizz.com:2227" autocomplete="off" spellcheck="false">' +
+        '<p class="sf-desc">企业小程序（与技能市场同一台服务端）：填服务器地址即可（https://域名或IP:端口），/sites 等路径后缀由程序自动拼；改动即时生效。</p>' +
         '</div>';
     }
     host.innerHTML =
-      '<h4>小程序平台</h4>' +
+      '<h4>企业小程序</h4>' +
       urlHtml +
       '<div class="set-field">' +
       '<div class="sf-label">网页托管平台</div>' +
@@ -175,6 +198,7 @@
 
   function init() {
     injectDOM();
+    if (legacyHost) return; // 让位形态：老前端的按钮/视图/window 接口全在场，本组件不注入不覆盖
     if (btnEl) btnEl.onclick = () => { // 与企业技能包 / 工作流同款 toggle：开着再点关闭，关着点开
       if (sitesViewOpen()) { closeSites(); return; }
       openSitesPlatform();
@@ -197,11 +221,13 @@
   }
 
   function dispose() {
+    if (legacyHost) { legacyHost = false; return; } // 让位形态什么都没装，无可撤
     if (sitesViewOpen()) closeSites(); // 平台正开着：先还回对话区
     docKeys.forEach((fn) => document.removeEventListener('keydown', fn));
     docKeys.length = 0;
     window.removeEventListener('cx:change', onCxChange);
-    if (btnEl) { btnEl.remove(); btnEl = null; }
+    if (btnEntry) { btnEntry.remove(); btnEntry = null; btnEl = null; }
+    else if (btnEl) { btnEl.remove(); btnEl = null; } // 旧 engine 的 DOM 注入 fallback
     if (viewEl) { viewEl.remove(); viewEl = null; }
     delete window.sitesViewOpen;
     delete window.closeSites;

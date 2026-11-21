@@ -1,4 +1,4 @@
-plugins {
+﻿plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
@@ -11,8 +11,8 @@ android {
         applicationId = "com.jianxiang.link"
         minSdk = 26          // 与主壳一致（Android 8.0 起）
         targetSdk = 34       // 无 W^X 需求，锚新一些；35 会强制 edge-to-edge，34 免处理
-        versionCode = 2026103001
-        versionName = "20261030-1"
+        versionCode = 2026112101
+        versionName = "20261121-1"
     }
 
     signingConfigs {

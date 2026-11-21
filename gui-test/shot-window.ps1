@@ -1,4 +1,4 @@
-# 截取「坚祥数字助理GO」主窗口（按 PID 主窗口句柄定位，避免中文标题编码问题）。
+# 截取「AI数字助理」主窗口（按 PID 主窗口句柄定位，避免中文标题编码问题）。
 # 用法: powershell -File shot-window.ps1 <输出png> [pid] [激活窗口:1/0]
 param(
   [Parameter(Mandatory = $true)][string]$OutFile,

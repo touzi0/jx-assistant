@@ -183,8 +183,8 @@ func TestAssistantLosesSubDispatchTools(t *testing.T) {
 			t.Fatalf("数字助理提示词里不该再有子对话指引 %q", gone)
 		}
 	}
-	if !strings.Contains(sys, "建会话一律用 dispatch_task") {
-		t.Fatalf("数字助理提示词应写明一律用 dispatch_task 建会话：\n%s", sys)
+	if !strings.Contains(sys, "建会话只用 dispatch_task") {
+		t.Fatalf("数字助理提示词应写明只用 dispatch_task 建会话：\n%s", sys)
 	}
 	// 任务的「子对话派发」准则不受影响
 	if tkSys := a.systemPrompt(&SessionMeta{Mode: "task"}); !strings.Contains(tkSys, "## 子对话派发") {
@@ -210,9 +210,10 @@ func TestAssistantReadOnlyTools(t *testing.T) {
 			t.Fatalf("数字助理不该有 %s（只读红线）", gone)
 		}
 	}
-	// 提示词带使用纪律：小事自己看、只读不写不执行、大批量仍派任务、读完就答
+	// 提示词带使用纪律（2026-11-15 定稿的表述）：只判断只转手、小事十步内自己看、
+	// 不想办法绕、大批量仍派任务、看完直接答
 	sys := a.systemPrompt(&SessionMeta{Mode: "assistant"})
-	for _, want := range []string{"只读自查的纪律", "十步", "只读不写不执行", "批量分析", "读完就答"} {
+	for _, want := range []string{"只判断、只转手", "十步内能弄清", "不要想办法绕", "批量分析", "看完直接答"} {
 		if !strings.Contains(sys, want) {
 			t.Fatalf("数字助理提示词缺只读纪律要点 %q", want)
 		}

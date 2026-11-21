@@ -253,6 +253,11 @@ async function jumpToMessage(sessionId, seq) {
   if (!state.cur || state.cur.id !== sessionId) {
     await openSession(sessionId);
   }
+  // 分批加载：命中可能落在未加载的更早批次——先一批批补齐到覆盖它（或到头）
+  let guard = 0;
+  while (state.older && state.older.count > 0 && !document.querySelector('[data-seq="' + seq + '"]')) {
+    if (!(await loadOlder(mainView)) || ++guard > 20) break; // 失败/到头/保险上限即停
+  }
   // 用 setTimeout 而非 rAF：页面在后台时 rAF 会被暂停，定位就丢了
   setTimeout(() => {
     const el = document.querySelector('[data-seq="' + seq + '"]');
@@ -643,7 +648,9 @@ async function restoreSession(s) {
 // 彻底删除工作目录：删除其名下全部会话记录、注销登记并拉黑（不碰磁盘文件夹）
 async function deleteWorkspace(ws) {
   const name = lsGet('jx.wsalias', {})[ws] || baseName(ws) || '默认工作区';
-  const targets = (state.sessions || []).filter((s) => s.mode !== 'assistant' && wsOf(s) === ws);
+  // 与回收站同口径：排除的只有「数字助理主对话本体」；子对话（含从长期助理克隆
+  // 出来的 assistant 子对话）是这个目录里真实发生过的活动，随目录一起删。
+  const targets = (state.sessions || []).filter((s) => !(s.mode === 'assistant' && !s.parentId) && wsOf(s) === ws);
   if (!(await confirmCenter(`彻底删除工作目录「${name}」及其 ${targets.length} 个对话？\n只从应用中移除记录，不会删除磁盘上的文件夹。默认工作区路径来自配置，删除后也不会再显示空目录，直到你重新添加它。\n此操作不可恢复。`))) return;
   if (!(await confirmCenter(`再次确认：目录「${name}」及其全部对话将被彻底删除、无法恢复。\n确定要继续吗？`, false, true))) return;
   for (const s of targets) {
@@ -715,8 +722,12 @@ function renderBin(box) {
   // 随父整组恢复与清空（collectEmptyTargets 的连坐删除同口径）
   const keep = new Set(lsGet('jx.wskeep', []));
   const archivedIds = new Set((state.sessions || []).filter((x) => x.archived).map((x) => x.id));
+  // 排除的只有「数字助理主对话本体」（mode=assistant 且没有父）：按 mode 一刀切会
+  // 把子对话也滤掉，而子对话会继承父会话的 mode——从长期助理克隆出来的子对话
+  // mode 也是 assistant，归档后既不在右栏下拉、又不进回收站，就彻底没了入口
+  // （2026-11-16 事故：4 条会话因此失踪）。
   const all = (state.sessions || []).filter((s) =>
-    s.mode !== 'assistant' && (!s.parentId || (s.archived && !archivedIds.has(s.parentId))));
+    s.parentId ? (s.archived && !archivedIds.has(s.parentId)) : s.mode !== 'assistant');
   const inBin = all.filter((s) => !keep.has(s.id) && (s.archived || recycledWs.includes(wsOf(s))));
   if (!recycledWs.length && !inBin.length) {
     box.innerHTML = '<div class="ws-empty">回收站是空的</div>';
@@ -1053,7 +1064,18 @@ $('btn-new-assistant').onclick = () => {
   setFace('thinking', 1600); // 进入时压眼扫视
   openAssistant();
 };
-$('btn-recycle').onclick = () => setBinView(!binView);
+/* ---------- 底部插槽的第一位使用者：内置「回收站」 ----------
+   条目本身（骨架、排序、电脑竖排/手机三列网格、标签行数）全归插槽，这里只交
+   图标、名字、序号与点击。序号 1 ＝ 最下面（紧贴设置行），组件入口（企业技能包 /
+   工作流 2、企业小程序 3 …）从 2 起往上叠——契约见 app-core.js 的 JX.slot 与
+   AGENT.md「界面插槽」。id 保持 btn-recycle：回收站视图的选中红边与
+   setBinView 都按它取（见 style.css 的 body.bin-mode 段）。 */
+JX.slot('sidebar.foot').add({
+  key: 'recycle', id: 'btn-recycle', order: 1, owner: '内置',
+  label: '回收站', title: '回收站',
+  icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
+  onClick: () => setBinView(!binView),
+});
 
 /* ---------- 左上角入口按钮：图标 hover 随机轻扭（三个按钮共用一套） ----------
    鼠标进入任一入口按钮（新工作任务 / 数字助理主对话 / 待办与定时任务）时，图标朝随机
@@ -1136,7 +1158,10 @@ function setupSidebarResize() {
     h.classList.add('dragging');
     try { h.setPointerCapture(e.pointerId); } catch (err) { /* 旧浏览器忽略 */ }
   });
-  h.addEventListener('pointermove', (e) => {
+  // 拖动跟随不依赖 setPointerCapture（远程页面上捕获会静默失效，10px 把手之外
+  // 收不到 move）：move/up 由 window 接管，事件从指针下元素冒泡到 window——
+  // 与对话区把手（app-chat.js）、右栏左缘（app-right.js）同一模式。
+  window.addEventListener('pointermove', (e) => {
     if (!h.classList.contains('dragging')) return;
     if (applySidebarWidth(startW + (e.clientX - startX)) !== startW) moved = true;
   });
@@ -1145,8 +1170,8 @@ function setupSidebarResize() {
     h.classList.remove('dragging');
     if (moved) applySidebarWidth(sbWidth(), true); // 松手落盘
   };
-  h.addEventListener('pointerup', up);
-  h.addEventListener('pointercancel', up);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
   h.addEventListener('dblclick', () => {
     lsSet('jx.sbw', null);
     applySidebarWidth(272);

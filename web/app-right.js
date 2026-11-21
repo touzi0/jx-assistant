@@ -225,7 +225,10 @@ function toggleRpanel() {
   }
 }
 
-/* 右栏左缘拖拽：拖动中右栏与对话区同时变宽窄；松手只把对话区宽度落盘 */
+/* 右栏左缘拖拽：拖动中右栏与对话区同时变宽窄；松手只把对话区宽度落盘。
+   拖动跟随不依赖 setPointerCapture（捕获在远程页面会静默失效，10px 把手
+   之外收不到 move）——move/up 由 window 接管，事件从指针下元素冒泡到
+   window，捕获在不在都持续跟随；捕获保留为增强（本地拖出窗口也不断）。 */
 function setupRpanelResize() {
   const h = $('rp-resize');
   if (!h) return;
@@ -247,7 +250,7 @@ function setupRpanelResize() {
     h.classList.add('dragging');
     try { h.setPointerCapture(e.pointerId); } catch (err) { /* 旧浏览器忽略 */ }
   });
-  h.addEventListener('pointermove', (e) => {
+  window.addEventListener('pointermove', (e) => {
     if (!h.classList.contains('dragging')) return;
     const upper = Math.max(avail - RP_CONTENT_MIN, RP_MIN);
     const w = Math.round(Math.min(Math.max(startW + (startX - e.clientX), RP_MIN), upper));
@@ -268,8 +271,8 @@ function setupRpanelResize() {
     document.documentElement.style.setProperty('--content-w', cw + 'px');
     lsSet('jx.contentWidth', String(cw));
   };
-  h.addEventListener('pointerup', up);
-  h.addEventListener('pointercancel', up);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
 }
 
 let subKids = []; // 当前主对话的子对话清单（下拉面板数据）
@@ -338,6 +341,15 @@ function renderSubDDPop() {
   neu.innerHTML = '<span class="d-status">＋</span><span class="d-title">新建子对话</span>';
   neu.onclick = () => { closePopovers(); newAuxChat(); };
   pop.appendChild(neu);
+  // 回收站入口（固定在最底下）：子对话下拉只看得到没归档的，归档掉的孩子要有个
+  // 稳定的去处——否则一旦它也继承了父对话的 assistant 模式而被各处过滤，用户就
+  // 彻底没有入口了（2026-11-16 事故）。点它等于左栏切到回收站视图。
+  const bin = document.createElement('button');
+  bin.className = 'drawer-item sub-dd-bin';
+  bin.innerHTML = '<span class="d-status">🗑</span><span class="d-title">回收站 ›</span>';
+  bin.title = '打开左栏回收站：归档的会话（含子对话）都在这里，可恢复';
+  bin.onclick = () => { closePopovers(); setBinView(true); };
+  pop.appendChild(bin);
 }
 
 // 子对话下拉项的「更多/右键」菜单：与主对话会话菜单（openSessionMenu）同一套
@@ -407,7 +419,7 @@ function subClearCurrent() {
   navBusy.sub = false;
   subState.cur = null;
   subState.msgs = [];
-  subState.pendingSteer = []; subState.pendingQueue = [];
+  subState.pendingSteer = []; subState.pendingQueue = []; subState.pendingVer = 0;
   subState.checkpoints = []; subState.deliveries = [];
   subState.streamText = ''; subState.streamThinking = '';
   subState.queuePaused = false; subState.queueHeld = false;
@@ -420,6 +432,10 @@ function subClearCurrent() {
   renderPanels();            // 子对话的待办卡随之回到主对话区/角标堆
   subView.col.innerHTML = '<div class="empty"><h2>子对话</h2><p>在下方输入框直接发消息，会自动新建子对话；顶部下拉可切换已有的，数字助理派发的也出现在这里。</p></div>';
   $('sub-input').value = ''; // 没有选中的子对话：不留上一个子对话的草稿
+  // 空态没有「会话草稿」这个上下文，引用胶囊只可能是不该留在这儿的上一个子对话
+  // 的残留（它的正文标记也在上面被清掉的输入框里）。留着它，空态直发时那句
+  // 「引用N」就会指向一条已经不存在的引用——空态一律收掉。
+  clearQuote(subView);
   setSubPlaceholder('发消息自动新建子对话…'); // 空态引导：像新对话页一样直接打字就能开聊
   autoGrow($('sub-input'));
 }
@@ -435,7 +451,8 @@ async function openSubSession(id) {
   const brief = (state.sessions || []).find((s) => s.id === id);
   if (brief && (!subState.cur || subState.cur.id !== id)) optimisticSwitch(subView, brief);
   try {
-    const data = await api('/api/sessions/' + id);
+    // 分批口径与主对话同款：只取最近一批（超长子对话整包同样卡），上翻预取接管更早的
+    const data = await api('/api/sessions/' + id + '?tail=' + LOAD_BATCH);
     if (tok !== navTok.sub) return; // 已被更新的导航取代：晚到的旧响应不落地
     subState._loading = false; // 数据落地：退出加载态（必须在 renderMessages 之前）
     // 迟到的旧快照（见 app-chat.js 的 snapshotStale，同会话才可比）：右栏已被
@@ -450,6 +467,10 @@ async function openSubSession(id) {
     flushSubDraft();
     subState.cur = data.meta;
     subState.msgs = data.messages || [];
+    // 分批记账：本窗之上的未加载条数与基础窗基线、批栈清零（主对话同款）
+    subState.older = data.older ? { count: data.older.count || 0, base: data.older.base } : undefined;
+    subState._baseWinBase = data.older && data.older.base;
+    subState._batches = [];
     // 打开即视为已读（与主对话 openSession 同款）：清红点与完成绿点，下拉清单数据同步
     delete dotDone[id];
     if (subState.cur.unread) {
@@ -460,6 +481,7 @@ async function openSubSession(id) {
     }
     subState.pendingSteer = (data.pending && data.pending.steer) || [];
     subState.pendingQueue = (data.pending && data.pending.queue) || [];
+    subState.pendingVer = (data.pending && data.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
     subState.queuePaused = !!(data.pending && data.pending.paused);
     // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
     subState.queueHeld = subState.pendingQueue.length > 0 && !subState.queuePaused &&
@@ -471,6 +493,7 @@ async function openSubSession(id) {
     subState.streamThinking = '';
     subRenderHeader();
     renderMessages(subState.msgs, subView, { jump: true });
+    renderLoadOlderBar(subView); // 分批顶条（右栏同款）
     renderQueueDock(subView);
     syncComposer(subView); // 右栏那套输入区控件跟着这个子对话刷新（权限/模型/模式/上下文圆环）
     syncComposerPad(subView); // 悬浮输入区：重算子对话消息列的垫高与按钮锚点
@@ -503,6 +526,12 @@ async function openSubSession(id) {
 
 // 新建子对话并就地打开：下拉「新建」与右栏直接发消息的懒创建路径（prepareSend）
 // 共用。返回创建的会话；无父可挂或失败返回 null（已就地提示，输入内容保留）。
+//
+// 连点/并发保护（2026-11-16）：派生一个长父会话要读几十 MB 历史，几百毫秒内
+// 按钮没有反馈，用户会再点一次——旧实现每次点击都发一个 POST，于是建出两条
+// 「子对话」（事故当晚 23:28:10 与 23:28:16 那两条就是这么来的）。这里用
+// 模块级 in-flight 标记收口：进行中再点只给提示，不重复下发。
+let auxChatCreating = false;
 async function newAuxChat() {
   const fid = drawerFamilyId();
   if (!fid) {
@@ -511,9 +540,15 @@ async function newAuxChat() {
     setTimeout(() => { subView.hint.textContent = ''; }, 2500);
     return null;
   }
+  if (auxChatCreating) {
+    subView.hint.textContent = '正在新建子对话，请稍候…';
+    setTimeout(() => { subView.hint.textContent = ''; }, 2500);
+    return null;
+  }
+  auxChatCreating = true;
   try {
-    // 子对话＝当前对话的分支：后端照抄父会话的模式/工作区/权限/能力并完整复制历史，
-    // 系统提示词与上下文与主对话一致（继承段在对话里折叠成一条「来自主对话」）
+    // 子对话＝当前对话的分支：后端照抄父会话的模式/工作区/权限/能力，并承接
+    // 「摘要 + 边界后原文」（见 context.go prepareInheritedRows）
     const s = await api('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({ parent: fid, title: '子对话', inheritContext: true }),
@@ -525,6 +560,8 @@ async function newAuxChat() {
   } catch (e) {
     alert('新建子对话失败：' + e.message);
     return null;
+  } finally {
+    auxChatCreating = false;
   }
 }
 $('rp-close').onclick = () => {
@@ -602,6 +639,28 @@ function bpwActive() {
   const panel = $('rpanel');
   return !!panel && !panel.classList.contains('hidden') && rpActive === 'browser';
 }
+
+/* 浮层让位（桌面壳）：HTML 永远无法浮于原生子窗口之上，设置等全屏 .modal
+ * 打开时右栏浏览器面板会把它们整个盖住。这里用 MutationObserver 监视所有
+ * .modal 的显隐（hidden class），任一打开即上报宿主把面板 Z 序压到主
+ * WebView2 之下（POST /api/browser/panel-overlay，browser_host.go 落到面板的
+ * YieldTop——主 WebView2 铺满客户区且不透明，压底即被盖住，浮层完整显示）；
+ * 全部关闭后上报恢复提顶。Electron 壳的 webview 是 DOM 元素天然参与 z-index，
+ * 网页形态没有原生面板，都无需上报。观察整个 DOM 树的 class 变化：聊天渲染
+ * 高频改 class，回调里只做几个 modal 的 className 检查且状态不变即返回，
+ * 开销可忽略。 */
+let bpwOverlayOn = false;
+function bpwOverlayReport() {
+  if (!bpwDesktop()) return;
+  let on = false;
+  document.querySelectorAll('.modal').forEach((m) => {
+    if (!m.classList.contains('hidden')) on = true;
+  });
+  if (on === bpwOverlayOn) return; // 状态没变不发（class 变化风暴里必须廉价+去重）
+  bpwOverlayOn = on;
+  api('/api/browser/panel-overlay', { method: 'POST', body: JSON.stringify({ on, desktop: true }) }).catch(() => {});
+}
+new MutationObserver(bpwOverlayReport).observe(document.body, { subtree: true, attributeFilter: ['class'] });
 
 // 浏览器上报与工具栏操作统一携带的会话身份：右栏浏览器每会话一个独立面板
 // （后端 App.panels），矩形/导航/状态都按它路由；首页态（无会话）为空串，

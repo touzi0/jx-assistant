@@ -64,3 +64,17 @@ func (a *App) handleDesktopFront(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
+
+// handleAlertScreenHide 前端收起主窗口提醒层时，把桌面全屏蒙层一起关掉
+//（两处提醒点任意一处、两边同退的另一半边；实现见 alertfull_windows.go）。
+//
+//	POST /api/alert/screen {"qid": "..."}   qid=这轮提醒的 questionId/approvalId，
+//	与蒙层当前显示的那轮一致才关——上一轮迟到的关闭请求不许把刚弹出的新一轮关掉。
+func (a *App) handleAlertScreenHide(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Qid string `json:"qid"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	alertScreenHideIf(strings.TrimSpace(body.Qid))
+	writeJSON(w, 200, map[string]string{"ok": "1"})
+}

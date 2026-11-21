@@ -4,7 +4,11 @@ package main
 // 旧写法「日期+V序号」（20261008V2）与更旧的点分号（0.1.9），
 // 以及两体系交界处「日期恒新」的规则。
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestVersionCompare(t *testing.T) {
 	cases := []struct {
@@ -47,5 +51,30 @@ func TestVersionCompare(t *testing.T) {
 		if rev := versionCompare(c.b, c.a); rev != -c.want {
 			t.Fatalf("versionCompare(%q, %q) = %d，与正向 %d 不对称", c.b, c.a, rev, c.want)
 		}
+	}
+}
+
+// verifyEngineCarriesVersion：engine 载荷必须真带本版版本串（2026-11-19
+// 内测源把 17 号二进制标成 20261119-2 发布的事故护栏）。
+func TestVerifyEngineCarriesVersion(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "fake.exe")
+	// 模拟 -X main.appVersion 注入的 ASCII 版本串字面量嵌在二进制里
+	body := append([]byte("MZ\x90\x00\x03\x00garbage-bytes-"), []byte("20261120-1")...)
+	body = append(body, 0x00, 0x00, 't', 'a', 'i', 'l')
+	if err := os.WriteFile(p, body, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyEngineCarriesVersion(p, "20261120-1"); err != nil {
+		t.Fatalf("含版本串的 exe 被误拒: %v", err)
+	}
+	if err := verifyEngineCarriesVersion(p, "20261121-9"); err == nil {
+		t.Fatal("不含版本串的 exe 应被拒绝（载荷与版本号不符）")
+	}
+	if err := verifyEngineCarriesVersion(p, ""); err != nil {
+		t.Fatalf("空版本号应放行: %v", err)
+	}
+	if err := verifyEngineCarriesVersion(filepath.Join(dir, "none.exe"), "20261120-1"); err == nil {
+		t.Fatal("文件读不到应报错而不是放行")
 	}
 }

@@ -193,8 +193,9 @@ type vtHotkeysCfg struct {
 }
 
 // vtDefaultAvoidHostNames 宿主进程名默认名单（hotkeys.json 未配 avoidHostNames 时用）。
-// 改名过渡期两个名字都留着：老版本装的叫坚祥数字助理GO，新版本改叫 AI数字助理。
-var vtDefaultAvoidHostNames = []string{"坚祥数字助理GO.exe", "AI数字助理.exe"}
+// 改名过渡期三个名字都留着：老版本装的叫坚祥数字助理GO，新版改叫 AI数字助理，
+// 开发实例叫 AI数字助理-开发（正式版改名后开发版随之让名，见 开发桌面版-录屏演示.ps1）。
+var vtDefaultAvoidHostNames = []string{"坚祥数字助理GO.exe", "AI数字助理.exe", "AI数字助理-开发.exe"}
 
 // vtDefaultHoldMs 默认长按阈值（毫秒）。
 const vtDefaultHoldMs = 300
@@ -310,8 +311,13 @@ func vtLoadHotkeys() {
 	}
 
 	// 3) 联动覆盖：主程序说的算（热键 + 触发方式 + 长按阈值）
+	//
+	// 判据用 Main != nil 而不是非空：主程序写的是 `[]` 时是**用户显式停用**
+	//（设置页把主热键叉掉），必须照办——按空数组回退到 hotkeys.json 会让旧键
+	// 死而复生（实测 bug：叉掉鼠标侧键后输入法还在用侧键）。字段缺失/null 才算
+	// 联动没管热键（只有颜色的手写文件），这时才留给下一级。
 	src := "本目录 hotkeys.json"
-	if len(link.Cfg.Hotkeys.Main) > 0 {
+	if link.Cfg.Hotkeys.Main != nil {
 		c.Main = append([]string{}, link.Cfg.Hotkeys.Main...)
 		if link.Cfg.Hotkeys.Sub == nil {
 			c.Sub = []string{}
@@ -425,6 +431,8 @@ func vtKeyName(vk uint32) string {
 
 // vtKeyMatches 配置键名 vs 实际按下的键名：`alt`/`ctrl`/`shift`/`meta` 匹配左右任一侧，
 // 配了 `ralt` 这类具体一侧的就只匹配那一侧。旧配置（`["alt"]`）保持能用。
+// 鼠标侧键同理：`mouse-side` 两枚都算（旧写法），`mouse-side-1`/`mouse-side-2`
+// 只认对应那一枚（XBUTTON1=侧键1·后退位 / XBUTTON2=侧键2·前进位）。
 func vtKeyMatches(configured, actual string) bool {
 	if configured == actual {
 		return true
@@ -438,6 +446,8 @@ func vtKeyMatches(configured, actual string) bool {
 		return actual == "lshift" || actual == "rshift"
 	case "meta":
 		return actual == "lmeta" || actual == "rmeta"
+	case "mouse-side":
+		return actual == "mouse-side-1" || actual == "mouse-side-2"
 	}
 	return false
 }
@@ -457,11 +467,20 @@ func vtIsAltName(name string) bool {
 	return name == "lalt" || name == "ralt" || name == "alt"
 }
 
+// vtIsAltVK 是不是 Alt 键（左 Alt 0xA4 / 右 Alt 0xA5 / 通用 0x12）。
+//
+// 用途：**注入前的一道硬闸**。本组件从不注入 Alt（见 vtSendKeyEvent 的说明），
+// 也从不吞左 Alt（见 vtHookConsume），两件事合起来保证：左 Alt 的按下/抬起完全
+// 由 Windows 与用户自己掌管，我们没有任何机会让它停在"按着"的状态。
+func vtIsAltVK(vk uint32) bool {
+	return vk == 0xA4 || vk == 0xA5 || vk == 0x12
+}
+
 // vtModifierVKs 全部修饰键的 vk（与 SayIt MODIFIER_VK_CODES 同一份口径）。
 var vtModifierVKs = []uint32{0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
 
 var (
-	vtHeld     = map[string]bool{} // 当前物理按住的键名（左右分开；鼠标侧键为 "mouse-side"）
+	vtHeld     = map[string]bool{} // 当前物理按住的键名（左右分开；鼠标侧键为 "mouse-side-1"/"mouse-side-2"）
 	vtConsumed = map[string]bool{} // 已被我们吞掉 down 的键名 → 配对 up 也要吞
 	vtComboOn  [2]bool             // main/sub 组合的匹配态（边沿检测）
 )
@@ -497,14 +516,60 @@ var (
 // vtReplayHeldDown 把已经吞掉的按键 down 还给前台（只发 down，up 由真实事件放行）。
 // 在钩子回调线程调用：清掉 consumed 位、记 passthrough 与 injected，保证配对 up
 // 一定放行（passthrough 管"下一个 up 放行"，injected 管"万一 up 丢了要补发"）。
+//
+// Alt 例外（纪律，见 vtSendKeyEvent）：热键是 Alt 时**不补发 down**，只把 passthrough
+// 记上——前台收不到我们补的 down，也就不会出现"按下没人抬起"；代价只是那一次
+// 组合（如右 Alt+Tab）在极端时机下不完整。用户明确选了这条：宁可不完整，不要卡键。
 func vtReplayHeldDown(vk uint32) {
 	name := vtKeyName(vk)
 	if name != "" {
 		delete(vtConsumed, name)
 		vtPassthrough[name] = true
+	}
+	if vtIsAltVK(vk) {
+		vtLog("组合键介入：热键是 Alt（vk=%#x），按纪律不补发 down，只放行真实抬起", vk)
+		return
+	}
+	if name != "" {
 		vtInjected[name] = true
 	}
 	vtSendKeyEvent(vk, true, false)
+}
+
+// vtReleaseInjectedKeys 把"我们补发过 down"的键全部补一次抬起。
+//
+// 这是注入模块的收尾保险：无论这一轮是怎么结束的（正常松手、取消、窗口收起、
+// 钩子重装、进程要退出），都不许把我们按下过的键留在按下状态。
+// **只能在钩子线程调用**（vtInjected/vtPassthrough 只在钩子回调里维护，没有锁）；
+// 其他 goroutine 请用 vtAskKeySweep 投递请求。
+func vtReleaseInjectedKeys(why string) {
+	for name := range vtInjected {
+		vk := vtVKByName(name)
+		if vk == 0 || vtIsAltVK(vk) {
+			// Alt 按纪律本来就不会被注入；这里再兜一层，绝不给 Alt 发 up
+			//（凭空一个 Alt up 会被前台当成"点了一下 Alt"，反而弹菜单）。
+			delete(vtInjected, name)
+			delete(vtPassthrough, name)
+			continue
+		}
+		vtSendKeyEvent(vk, false, true)
+		delete(vtInjected, name)
+		delete(vtPassthrough, name)
+		vtLog("释放注入键：%s（%s）", name, why)
+	}
+}
+
+// vtKeySweep 钩子线程上的"按键账本结算 + 快照"（由 vtAskKeySweep 投递，见钩子消息循环）。
+//
+// 做两件事：① 把我们注入过、却还没闭合的键补抬起；② 记一条修饰键快照——
+// 万一用户再报"Alt 卡住"，日志里能直接看到那一刻是**我们**吞的（consumed）还是
+// 系统/别的程序留下的（两者都没动过，物理状态却按着）。只读，不注入 Alt。
+func vtKeySweep(why string) {
+	vtReleaseInjectedKeys(why)
+	if vtAsyncKeyDown(0xA4) && !vtIsRecording() {
+		vtLog("注意：左 Alt 物理状态是『按下』，但本组件没在录音、账本里也没有它（consumed=%v injected=%v）"+
+			"——不是我们造成的；本组件不吞、不注入左 Alt（%s）", vtConsumed["lalt"], vtInjected["lalt"], why)
+	}
 }
 
 // vtHeldAny 某个配置键名当前是否按住（`alt` 认两侧）。
@@ -590,8 +655,8 @@ func vtReconcileHeld() {
 		}
 	}
 	for name, on := range vtHeld {
-		if !on || name == "mouse-side" {
-			continue
+		if !on || strings.HasPrefix(name, "mouse-side") {
+			continue // 鼠标侧键没有 vk，不在物理键自愈的范围（鼠标钩子自己记账）
 		}
 		// 被我们吞住的键不能拿 GetAsyncKeyState 作依据：吞掉的键事件不进输入队列，
 		// 物理状态在系统眼里就是"没按下"，照这个自愈会把热键键位误清掉。
@@ -649,6 +714,35 @@ var vtHKEvents = make(chan vtHotkeyEvent, 8) // 回调只投递，绝不阻塞
 
 // 钩子看门狗用的私有消息（WM_APP + 0x52）：让钩子线程重装钩子。
 const vtWmReloadHooks = 0x8000 + 0x52
+
+// 按键账本结算请求（WM_APP + 0x53）：让钩子线程释放注入键并打一条快照。
+// 为什么走消息而不直接调用：vtInjected/vtPassthrough 只在钩子回调线程里维护，
+// 没有锁；其他 goroutine 直接读写就是 Go 的 map 并发读写（会直接崩进程）。
+const vtWmKeySweep = 0x8000 + 0x53
+
+// vtSweepWhy 结算原因（投递方写、钩子线程取；只做日志用）。
+var vtSweepWhy = make(chan string, 8)
+
+// vtAskKeySweep 请钩子线程做一次"释放注入键 + 快照"。任何 goroutine 都可以调。
+func vtAskKeySweep(why string) {
+	select {
+	case vtSweepWhy <- why:
+	default:
+	}
+	tid := vtHookTID
+	if tid == 0 {
+		return
+	}
+	procPostThreadMessageW.Call(uintptr(tid), vtWmKeySweep, 0, 0)
+}
+
+// vtShutdown 退出前收尾：让钩子线程结算一次注入账本（把我们按下过的键抬起），
+// 再退出。os.Exit 不执行 defer，所以每条退出路径都必须显式调它。
+func vtShutdown(why string) {
+	vtAskKeySweep(why)
+	time.Sleep(40 * time.Millisecond) // 留出把 up 真正发出去的时间
+	os.Exit(0)
+}
 
 // 上次钩子回调时间（毫秒，看门狗判断"是否被系统静默摘掉"）。
 var vtLastHookCbMs atomic.Int64
@@ -716,6 +810,20 @@ func vtHookConsume(name string, vk, flags uint32, down bool) (bool, bool) {
 	}
 	if slot < 0 {
 		return false, false
+	}
+	// 纪律（2026-11-16 用户要求）：**左 Alt 纯监听，永不吞、永不注入**。
+	//
+	// 为什么单列一条：左 Alt 是菜单栏与 Alt+Tab 的公共入口，用户要"彻底不出现卡住"。
+	// 只要它的 down 进过我们的账本，任何一次 up 丢失（钩子被摘、回调超时、进程被杀）
+	// 都会让系统认为左 Alt 一直按着（stuck LALT：之后 Ctrl+V 变成 Ctrl+Alt+V、
+	// 键盘输入失灵）。所以这里直接不接管：
+	//   · 事件原样给前台（菜单、Alt+Tab 都正常）；
+	//   · 我们照常判定它是不是热键（hotkey=true）→ 录音/点按逻辑照旧工作；
+	//   · 剩下的只是"没有吞键"，因此也不需要回放（见 main.go 的 vtOnShortTap）。
+	// 若用户偏要在配置里写 lalt，就变成"按左 Alt 会同时弹一下菜单栏"——这个代价
+	// 换的是绝不可能卡键，README 里写明了。
+	if name == "lalt" {
+		return false, true
 	}
 	if vtHookHostForeground.Load() {
 		return false, false // 宿主在前台：让路（与原先一致，只是现在连键也不吞）
@@ -930,8 +1038,10 @@ func vtKbdCallback() uintptr {
 	return vtKbdCb
 }
 
-// 鼠标侧键：WH_MOUSE_LL 只认 XBUTTON1/2（前后两枚侧键都算 mouse-side）。
-// 绑了侧键时 down/up 都吞——否则每次说话都等于给浏览器一次"后退"导航。
+// 鼠标侧键：WH_MOUSE_LL 只认 XBUTTON1/2，分别映射成 mouse-side-1 / mouse-side-2
+// （配置写 `mouse-side` 则两枚都算，旧配置不变；只配某一枚时，另一枚完全放行，
+// 保留它原生的后退/前进功能）。绑了侧键的那枚 down/up 都吞——否则每次说话
+// 都等于给浏览器一次"后退"导航；没绑的那枚不吞不记，前台行为分毫不差。
 func vtMouseCallback() uintptr {
 	if vtMouseCb == 0 {
 		vtMouseCb = syscall.NewCallback(func(nCode int32, wParam uintptr, lParam unsafe.Pointer) uintptr {
@@ -948,19 +1058,17 @@ func vtMouseCallback() uintptr {
 						r, _, _ := procCallNextHookEx.Call(0, uintptr(nCode), wParam, uintptr(lParam))
 						return r
 					}
-					xb := m.MouseData >> 16 // 高字=XBUTTON 编号
-					if xb == 1 || xb == 2 {
+					if name := vtMouseKeyName(m.MouseData >> 16); name != "" {
 						down := wParam == wmXButtonDown
-						consume := false
-						if hk := vtHotkeys(); vtMouseInHotkeys(hk) && !vtHookHostForeground.Load() {
-							consume = true
-						}
-						if down && !vtHeld["mouse-side"] {
-							vtHeld["mouse-side"] = true
-							vtEvalCombos("mouse-side", 0)
-						} else if !down && vtHeld["mouse-side"] {
-							delete(vtHeld, "mouse-side")
-							vtEvalCombos("mouse-side", 0)
+						// 只接管热键绑到**这一枚**侧键的情形：绑 mouse-side（两枚都算）
+						// 时两枚都吞（与旧行为一致）；只绑 mouse-side-1 时侧键 2 整条放行。
+						consume := vtMouseInHotkeys(vtHotkeys(), name)
+						if down && !vtHeld[name] {
+							vtHeld[name] = true
+							vtEvalCombos(name, 0)
+						} else if !down && vtHeld[name] {
+							delete(vtHeld, name)
+							vtEvalCombos(name, 0)
 						}
 						if consume {
 							return 1
@@ -975,11 +1083,23 @@ func vtMouseCallback() uintptr {
 	return vtMouseCb
 }
 
-// vtMouseInHotkeys 有热键绑在鼠标侧键上吗。
-func vtMouseInHotkeys(hk vtHotkeysCfg) bool {
+// vtMouseKeyName XBUTTON 编号（MouseData 高字）→ 键名；1=侧键1（后退位）2=侧键2（前进位）。
+func vtMouseKeyName(xb uint32) string {
+	switch xb {
+	case 1:
+		return "mouse-side-1"
+	case 2:
+		return "mouse-side-2"
+	}
+	return ""
+}
+
+// vtMouseInHotkeys 这枚侧键（mouse-side-1 / mouse-side-2）有没有热键绑在它上面：
+// 配了 `mouse-side` 的两枚都算；配了具体一枚的只算那一枚。
+func vtMouseInHotkeys(hk vtHotkeysCfg, name string) bool {
 	for _, arr := range [2][]string{hk.Main, hk.Sub} {
 		for _, k := range arr {
-			if k == "mouse-side" {
+			if vtKeyMatches(k, name) {
 				return true
 			}
 		}
@@ -1033,6 +1153,18 @@ func vtHookLoop() {
 				procUnhookWindowsHookEx.Call(vtHkMouse)
 				vtHkMouse = nhm
 			}
+			// 重装前那一刻可能有"我们吞了 down 却还没等到 up"的键：账本结算一次，
+			// 免得漏 up 的键永远停在按下状态（Alt 卡住就是这条路的典型症状）。
+			vtKeySweep("钩子重装")
+		}
+		if m.Message == vtWmKeySweep {
+			why := "定时检查"
+			select {
+			case w := <-vtSweepWhy:
+				why = w
+			default:
+			}
+			vtKeySweep(why)
 		}
 	}
 	procUnhookWindowsHookEx.Call(h)
@@ -1115,6 +1247,8 @@ func vtHookWatchdog() {
 		}
 		procPostThreadMessageW.Call(uintptr(tid), vtWmReloadHooks, 0, 0)
 		vtLog("钩子看门狗：已请求重装（上次按键回调 %d 秒前）", silent)
+		// 顺手结算一次按键账本：注入过却没闭合的键补抬起（只读+只发非 Alt 的 up）。
+		vtAskKeySweep("看门狗定时检查")
 	}
 }
 
@@ -1429,13 +1563,18 @@ var (
 	vtMutexHandle    uintptr // 常驻持有：句柄一关，锁就没了
 )
 
+// vtMutexName 单实例互斥体名。默认产品名；同机跑隔离验证实例时用
+// -ldflags "-X main.vtMutexName=..." 改名与正在运行的用户实例并存
+//（asrPort 同理，见 main.go 的 var 块——两者只服务测试隔离，产品路径不变）。
+var vtMutexName = "VoiceTypeGo_SingleInstance"
+
 // vtSingleInstanceGuard 只允许一个实例运行。
 //
 // 为什么要它：两个实例＝两套 WH_KEYBOARD_LL 钩子 + 两个悬浮窗 + 两份录音，
 // 症状是「同一句话被粘两遍」或「一个实例绑住了 ASR 端口 8320，另一个识别永远
 // 不就绪」——都会被误当成"判定坏了"。交付给用户的产品更不能出现这种叠加。
 func vtSingleInstanceGuard() bool {
-	name, err := syscall.UTF16PtrFromString("VoiceTypeGo_SingleInstance")
+	name, err := syscall.UTF16PtrFromString(vtMutexName)
 	if err != nil {
 		return true
 	}
@@ -1623,6 +1762,12 @@ func vtClipboardGetText() (string, bool) {
 	return "", false
 }
 
+// vtInjectSeam 单测缝：非 nil 时拦截"真正会发出去的按键事件"（生产恒为 nil）。
+//
+// 存在的理由：注入模块的正确性（"永不注入 Alt"、down/up 成对）必须能被单测**验证**，
+// 而单测绝不能真的去按用户的键。
+var vtInjectSeam func(vk uint32, down, up bool)
+
 // vtSendCtrlV 四事件序列一次 SendInput 提交。
 // INPUT 布局(x64)：type@0 wVk@8 wScan@10 dwFlags@12 time@16 dwExtraInfo@24
 // ——dwFlags 写错位置＝抬起变按下，Ctrl 会永远卡在按下状态（实测坑）。
@@ -1656,8 +1801,22 @@ func vtSendCtrlV() {
 //
 // 为什么不用 keybd_event：SendInput 一次提交、原子性好；带上的 INJECTED 标志会被
 // 我们自己的钩子过滤掉，所以"回放/还原"不会自我递归。
+//
+// **纪律：绝不注入 Alt（左 Alt / 右 Alt / 通用 Alt）**。
+// 原因（2026-11-16 用户反馈）：Alt 一旦被我们按下，任何一条异常路径（目标程序卡住、
+// 事件被丢弃、进程被杀、钩子被摘）都可能留下"按下没人抬起"——表现是左 Alt 卡住、
+// 之后键盘输入失灵/粘贴粘不出来。用户的原话是"就不要有按下这个动作"。
+// 所以这里直接拒发，而不是"保证成对"：不按下，就永远没有要释放的东西。
 func vtSendKeyEvent(vk uint32, down, up bool) {
 	if vk == 0 || (!down && !up) {
+		return
+	}
+	if vtIsAltVK(vk) {
+		vtLog("按纪律拒绝注入 Alt（vk=%#x down=%v up=%v）：本组件从不按下 Alt", vk, down, up)
+		return
+	}
+	if vtInjectSeam != nil { // 单测用（生产恒为 nil）
+		vtInjectSeam(vk, down, up)
 		return
 	}
 	const (
@@ -1819,6 +1978,8 @@ func vtOverlayHide() {
 	}
 	procShowWindow.Call(vtOverlayHwnd, swHide)
 	vtOverlayModeRegion(0) // 复位仅胶囊
+	// 收起悬浮窗＝这一轮用完了：把注入账本结算一次（我们补发过 down 的键补抬起）。
+	vtAskKeySweep("悬浮窗收起")
 }
 
 // vtOverlayWiden 可见区切换：0=仅胶囊 1=胶囊+气泡（流字与无声提示共用）。
@@ -1831,15 +1992,24 @@ func vtOverlayWiden(mode int) {
 }
 
 // vtOverlayModeRegion 按模式设置窗口 region（圆角矩形并集，坐标见常量表）。
+//
+// region 各边比网页元素外扩 2px（半径同步 +2）：SetWindowRgn 是 1bit 硬掩码、
+// 没有抗锯齿，以前 region 边界与网页圆角完全重合，可见边缘就是 region 的整数
+// 阶梯——圆角处呈锯齿（2026-11-21 用户反馈"侧边像锯齿"）。外扩后可见边缘
+// 变成网页 border-radius 的抗锯齿曲线（WebView2 背景已开透明，见 go-webview2/
+// webview.go 补丁，外扩区是透明像素不露底色），region 只负责点击命中——
+// 多出的 2px 透明边不可见，对点击穿透的影响可以忽略。
 func vtOverlayModeRegion(mode int) {
 	dll := syscall.NewLazyDLL("gdi32.dll")
 	combine := dll.NewProc("CombineRgn")
 	rr := dll.NewProc("CreateRoundRectRgn")
 	py := vtWinH - vtPillH
-	rPill, _, _ := rr.Call(vtPillX, uintptr(py), uintptr(vtPillX+vtPillW), vtWinH, vtPillH, vtPillH)
+	// 下界 vtWinH+2 超出窗口会被系统裁掉，但保留了"真正的外偏移曲线"几何
+	// （圆心与网页圆角同心、半径 +2），避免底边转角处内凹。
+	rPill, _, _ := rr.Call(vtPillX-2, uintptr(py-2), uintptr(vtPillX+vtPillW+2), vtWinH+2, vtPillH+2, vtPillH+2)
 	rgn := rPill
 	if mode == 1 {
-		rBub, _, _ := rr.Call(vtBubX, vtBubY, uintptr(vtBubX+vtBubW), uintptr(vtBubY+vtBubH), 14, 14)
+		rBub, _, _ := rr.Call(vtBubX-2, vtBubY-2, uintptr(vtBubX+vtBubW+2), uintptr(vtBubY+vtBubH+2), 16, 16)
 		out, _, _ := dll.NewProc("CreateRectRgn").Call(0, 0, 0, 0)
 		combine.Call(out, rPill, rBub, 2 /*RGN_OR*/)
 		rgn = out

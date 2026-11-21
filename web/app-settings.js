@@ -89,8 +89,10 @@ async function sendFeedback() {
     $('fb-text').value = '';
     fbImages = [];
     renderFbImages();
-    btn.textContent = '已发送 ✓';
-    setTimeout(() => { btn.textContent = '发送反馈'; }, 1500);
+    btn.textContent = '已提交 ✓';
+    const hint = $('fb-img-hint');
+    if (hint) hint.textContent = '已记录；连接了公司服务端时会同步一份供排查（若网络异常会稍后自动重试）';
+    setTimeout(() => { btn.textContent = '发送反馈'; }, 2500);
   } catch (e) {
     alert('发送失败：' + e.message);
     btn.textContent = '发送反馈';
@@ -116,6 +118,7 @@ function loadProvDraft(c) {
     presetURL: p.presetURL || '',
     name: p.name || '',
     baseURL: p.baseURL || '',
+    protocol: p.protocol || '',       // 渠道协议：''=OpenAI 兼容 / anthropic / responses
     key: '', keyMasked: p.apiKeyMasked || '',
     enabled: p.enabled !== false,   // 手动启停开关（服务商卡片头）
     autoDisabled: !!p.autoDisabled, // 公司通道自动停用（连不上服务端）
@@ -123,6 +126,7 @@ function loadProvDraft(c) {
     publicBaseURL: p.publicBaseURL || '', // 外网备用地址（服务端下发，只读展示）
     via: p.via || '',               // 公司通道当前线路：lan=内网 / wan=外网
     quota: p.quota || null,         // 公司通道额度快照（服务端随公告下发）
+    portalURL: p.portalURL || '',   // 门户充值入口（2026-11-13 充值组件）：卡片挂载点 dataset 带给组件判显隐
     models: (p.models || []).map((m) => ({
       id: m.id || '', name: m.name || '',
       contextWindow: m.contextWindow || 0, maxOutput: m.maxOutput || 0,
@@ -136,6 +140,7 @@ function loadProvDraft(c) {
 function provSig(p) {
   return JSON.stringify({
     id: p.id || '', presetId: p.presetId || '', name: p.name || '', baseURL: p.baseURL || '',
+    protocol: p.protocol || '',
     models: (p.models || []).map((m) => [m.id || '', m.name || '', m.contextWindow || 0, m.maxOutput || 0, !!m.supportsImages]),
   });
 }
@@ -199,7 +204,7 @@ async function openSettings(pane) {
   selRefs.midrun.set(lsGet('jx.midrun', 'queue'));
   renderPluginList();
   mountPluginSections();
-  renderComponentList();
+  renderComponentList(true); // 打开设置页＝组件清单唯一的重扫时机（见 renderComponentList）
   mountComponentPanes(); // 声明了 pane 的组件（如语音）的独立设置页
   renderHotkeysPane(); // 快捷键总表（含组件经 JX.registerHotkey 登记的条目）
   renderSkillsPanel();
@@ -228,53 +233,29 @@ async function openSettings(pane) {
     const st = await api('/api/status');
     $('about-version').textContent = '版本 ' + (st.version || '-');
     } catch (e) { /* 状态取不到时保留页面默认版本文本 */ }
-  loadAboutShell();
 }
 
-/* ---------- 关于页：远程外壳版本 + 一键清远程端缓存 ----------
-   版本 = 外壳内容哈希.代数（/api/shell-hash）。按钮 POST /api/shell-bump 把代数
-   +1：旧外壳里的嵌入版本随之全部「不一致」，remote-boot 自愈（清手机端缓存并
-   整页重拉）在它们的下一次加载时触发——见 remoteaccess.go handleShellBump。 */
-function fmtShellVer(h) {
-  // 显示带代数（哈希前 8 位 + .N）：按钮按下后版本行能看到变化
-  const i = h.lastIndexOf('.');
-  return i > 0 ? h.slice(0, 8) + '…' + h.slice(i) : h.slice(0, 12) + '…';
-}
-async function loadAboutShell() {
-  const ver = $('about-shell-ver');
-  try {
-    const d = await api('/api/shell-hash');
-    ver.textContent = d && d.hash ? '外壳版本 ' + fmtShellVer(d.hash) : '外壳版本未知';
-  } catch (e) { ver.textContent = '外壳版本读取失败'; }
-  const btn = $('btn-shell-bump');
-  if (!btn || btn.dataset.bound) return;
-  btn.dataset.bound = '1';
-  btn.onclick = async () => {
-    btn.disabled = true;
-    const done = $('about-shell-done');
-    try {
-      const d = await api('/api/shell-bump', { method: 'POST' });
-      if (d && d.hash) ver.textContent = '外壳版本 ' + fmtShellVer(d.hash);
-      done.style.display = '';
-      done.textContent = '已生效：远程端下次打开自动清缓存重载';
-    } catch (e) {
-      done.style.display = '';
-      done.textContent = '失败：' + e.message;
-    }
-    btn.disabled = false;
-  };
-}
+/* ---------- 组件清单（/api/components + CX 运行时热开关）
+   两档归属同一页分两区（与「技能」页同款排版）：
+   - 内置组件：随包分发、不可删除，只有开关；升级随程序静默更新；
+   - 用户组件：市场/发行渠道单个安装到 组件/user/，可开关、可删除。 ---------- */
 
-/* ---------- 组件清单（/api/components + CX 运行时热开关） ---------- */
-
-async function renderComponentList() {
-  const box = $('component-list');
-  if (!box) return;
-  box.innerHTML = '加载中…';
+async function renderComponentList(rescan) {
+  const bBox = $('component-builtin-list');
+  const uBox = $('component-user-list');
+  if (!bBox || !uBox) return;
+  bBox.innerHTML = '加载中…';
+  uBox.innerHTML = '';
   let list = [];
-  try { list = (await api('/api/components')).components || []; } catch (e) { box.textContent = '组件清单读取失败：' + e.message; return; }
-  box.innerHTML = '';
+  // 重扫时机只有一个：打开设置页（组件页）那一次——平时清单接口是纯读，
+  // 不扫目录；这里带 rescan=1 让服务端重扫 组件/ 与 组件/user/，运行中新放进
+  // 或删掉的组件打开设置页即见（桌面版单实例常驻，重开窗口≠重启服务）。
+  const url = rescan ? '/api/components?rescan=1' : '/api/components';
+  try { list = (await api(url)).components || []; } catch (e) { bBox.textContent = '组件清单读取失败：' + e.message; return; }
+  bBox.innerHTML = '';
+
   for (const c of list) {
+    const builtin = !!c.builtin;
     const row = document.createElement('div');
     row.className = 'plugin-row';
     const info = document.createElement('div');
@@ -282,6 +263,7 @@ async function renderComponentList() {
     info.innerHTML =
       `<div class="pr-line"><b>${esc(c.name)}</b><span class="pr-ver">${esc(c.version || '')}</span></div>` +
       `<p>${esc(c.description || '')}</p>`;
+    row.appendChild(info);
     const tg = document.createElement('label');
     tg.className = 'pr-toggle';
     const cb = document.createElement('input');
@@ -302,14 +284,31 @@ async function renderComponentList() {
     };
     tg.appendChild(cb);
     tg.appendChild(document.createElement('span'));
-    row.appendChild(info);
     row.appendChild(tg);
+    if (!builtin) { // 用户组件才有删除入口（内置的随包分发，只可开关）
+      const del = document.createElement('button');
+      del.className = 'skill-del';
+      del.title = '删除该组件';
+      del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>';
+      del.onclick = async () => {
+        if (!(await confirmCenter('删除组件「' + (c.name || c.id) + '」？组件目录（组件/user/' + c.id + '）将被一并移除。', false, true))) return;
+        try {
+          await api('/api/components/delete', { method: 'POST', body: JSON.stringify({ id: c.id }) });
+          await CX.refresh(); // 已装载的立即热卸载
+          renderComponentList();
+        } catch (e) { alert('删除失败：' + e.message); }
+      };
+      row.appendChild(del);
+    }
     const note = document.createElement('div');
     note.className = 'pr-note';
     row.appendChild(note);
-    box.appendChild(row);
+    (builtin ? bBox : uBox).appendChild(row);
   }
-  if (!list.length) box.innerHTML = '<div class="pr-note">组件/ 下没有发现组件</div>';
+  if (!list.some((c) => c.builtin)) bBox.innerHTML = '<div class="pr-note">没有发现内置组件（组件/ 下无 manifest.json）</div>';
+  if (!list.some((c) => !c.builtin)) {
+    uBox.innerHTML = '<div class="skill-empty">还没有用户组件。在市场里一键安装，或把组件目录放进 组件/user/ 即装即用。</div>';
+  }
   mountComponentSections(); // 组件自己的设置区（组件经 CX.registerSettings 交出）
 }
 
@@ -335,7 +334,7 @@ function mountComponentSections() {
 
 /* ---------- 组件设置页（CX.registerSettings 且带 pane 字段的组件 → 独立分区页）
    组件在注册时声明 pane:{label, icon}，设置页左侧一级菜单出现专属入口（插在
-   「内置组件」之后）、右侧出现专属分区页；组件停用/卸载时导航项与页面一并撤掉，
+   「组件」之后）、右侧出现专属分区页；组件停用/卸载时导航项与页面一并撤掉，
    正停在该页时退回默认页。导航状态机（setNav/renderNav/navGoto）按 data-pane
    寻址，动态项与静态项同一条路径，窄屏翻页/返回手势天然兼容。 */
 function syncComponentPanePresence() {
@@ -365,7 +364,7 @@ function syncComponentPanePresence() {
     navBtn.dataset.cxPane = d.id;
     navBtn.innerHTML = (d.pane.icon || '') + esc(d.pane.label);
     navBtn.onclick = () => navGoto(paneName);
-    // 插在「内置组件」之后；没有该入口（页面结构变动）就退到「关于」之前
+    // 插在「组件」之后；没有该入口（页面结构变动）就退到「关于」之前
     const anchor = nav.querySelector('.set-nav-item[data-pane="components"]') ||
       nav.querySelector('.set-nav-item[data-pane="about"]');
     if (anchor && anchor.nextSibling) nav.insertBefore(navBtn, anchor.nextSibling);
@@ -424,22 +423,37 @@ JX.on('hotkeys:change', () => {
 
 /* ---------- 插件清单与分区（统一插件页：/api/plugins 带 layers + JX 注册的分区） ---------- */
 
-// 各体系行的富渲染器（按层 id 注册，app-ccplugins.js 等提供）；缺省通用行
+// 各体系行的富渲染器（按层 id 注册，app-ccplugins.js 等提供）；缺省通用行。
+// opts.session（会话id）＝按对话开关浮窗的会话模式：总开关写会话级覆盖而不是全局。
 const pluginRowRenderers = { claude: ccpPluginRow };
 
-function pluginRowFor(p) {
-  return (pluginRowRenderers[p.layer] || simplePluginRow)(p);
+function pluginRowFor(p, opts) {
+  return (pluginRowRenderers[p.layer] || simplePluginRow)(p, opts);
+}
+
+// 插件行/组件行通用的「已覆盖」徽标：按 overridden 显示或摘除（点击恢复跟随全局）
+function syncPluginOverrideBadge(row, overridden) {
+  let ovr = row.querySelector('.pr-ovr');
+  if (!overridden) { if (ovr) ovr.remove(); return; }
+  if (ovr) return;
+  ovr = document.createElement('span');
+  ovr.className = 'pr-ovr';
+  ovr.title = '本对话覆盖了全局开关';
+  ovr.textContent = '已覆盖';
+  const line = row.querySelector('.pr-line');
+  if (line) line.appendChild(ovr);
 }
 
 // 通用行（DSH 等纯扫描体系）：未适配原件灰显、开关禁用
-function simplePluginRow(p) {
+function simplePluginRow(p, opts) {
   const row = document.createElement('div');
   row.className = 'plugin-row' + (p.adapted === false ? ' unadapted' : '');
   const info = document.createElement('div');
   info.className = 'pr-info';
   info.innerHTML =
     `<div class="pr-line"><b>${esc(p.name)}</b><span class="pr-ver">${esc(p.version || '')}</span>` +
-    (p.adapted === false ? '<span class="pr-badge">未适配</span>' : '') + '</div>' +
+    (p.adapted === false ? '<span class="pr-badge">未适配</span>' : '') +
+    (p.override ? '<span class="pr-ovr" title="本对话覆盖了全局开关（点击恢复跟随全局）">已覆盖</span>' : '') + '</div>' +
     `<p>${esc(p.description || '')}</p>`;
   const tg = document.createElement('label');
   tg.className = 'pr-toggle';
@@ -450,8 +464,18 @@ function simplePluginRow(p) {
   cb.onchange = async () => {
     cb.disabled = true;
     try {
-      await api('/api/plugins', { method: 'POST', body: JSON.stringify({ layer: p.layer, id: p.id, enabled: cb.checked }) });
-      row.querySelector('.pr-note').textContent = '已更新；界面部分刷新页面后生效';
+      const body = { layer: p.layer, id: p.id, enabled: cb.checked };
+      if (opts && opts.session) body.session = opts.session;
+      const r = await api('/api/plugins', { method: 'POST', body: JSON.stringify(body) });
+      // 会话模式：把定制标记带回来（加号菜单的 ✓ 读它）
+      if (opts && opts.session && window.CX && r && typeof r.sessionCustom !== 'undefined') {
+        CX.sessionCustom = !!r.sessionCustom;
+      }
+      row.querySelector('.pr-note').textContent = opts && opts.session
+        ? (cb.checked ? '本对话已启用（其他对话不受影响）' : '本对话已停用（其他对话不受影响）')
+        : '已更新；界面部分刷新页面后生效';
+      // 覆盖徽标跟实际状态对齐：与全局一致＝已恢复跟随（徽标摘掉）
+      if (opts && opts.session) syncPluginOverrideBadge(row, cb.checked !== p.globalEnabled);
     } catch (e) {
       alert('切换失败：' + e.message);
       cb.checked = !cb.checked;
@@ -495,14 +519,14 @@ async function renderPluginList() {
   }
 }
 
-function pluginLayerSection(L, group) {
+function pluginLayerSection(L, group, opts) {
   const sec = document.createElement('div');
   sec.className = 'gen-section';
   const h = document.createElement('h4');
   h.innerHTML = `${esc(L.name)} <span class="sec-sub">${group.length ? group.length + ' 个' : '暂无'}</span>`;
   sec.appendChild(h);
   if (group.length) {
-    for (const p of group) sec.appendChild(pluginRowFor(p));
+    for (const p of group) sec.appendChild(pluginRowFor(p, opts));
   } else {
     const empty = document.createElement('div');
     empty.className = 'pr-note';
@@ -560,9 +584,19 @@ function renderProvCards() {
   const box = $('prov-list');
   if (!box) return;
   box.innerHTML = '';
+  // 新装（未接公司通道、也没自己添加）时列表是空的：给一句话说清下一步，
+  // 免得以为界面上漏了东西
+  if (!provDraft.length && !provNew) {
+    box.innerHTML = '<div class="skill-empty">还没有模型通道。点下方「添加提供方」自己接一个，或用「公司接入向导」一键接入公司通道。</div>';
+  }
   provDraft.forEach((p) => box.appendChild(buildProvCard(p, p.id)));
   // 草稿卡片常驻列表（收起只是折叠）：收起/切换卡片都不丢已输入的内容
   if (provNew) box.appendChild(buildProvCard(provNew, 'new'));
+  // 渲染完成通知（2026-11-13 充值组件）：卡片是全量重建的，组件往挂载点
+  // （.pf-card-slot）里放的按钮每次渲染都会随之消失——发一个事件让组件重新挂。
+  // 与 run:error / wizard:done 同为「主程序不认识组件、组件不碰主程序函数」的
+  // 通用对接点（JX.on 同步通知，见 app-core.js）。
+  if (window.JX && typeof JX.emit === 'function') JX.emit('prov:render');
 }
 
 function buildProvCard(p, key) {
@@ -606,6 +640,18 @@ function buildProvCard(p, key) {
     offTag + viaTag + quotaChip +
     `<span class="pv-meta">${p.models.length} 个模型</span>` +
     (p.key ? '<span class="pv-dirty">密钥未保存</span>' : '');
+  // 组件插槽（2026-11-13 充值组件；2026-11-16 从展开后的表单挪到这条标题行）：
+  // 公司通道的组件按钮挂在「额度」后面，收起态也看得见、直接点——从前挂在展开
+  // 之后的表单底部，用户嫌点一下充值还要先展开卡片。主程序只给挂载点与
+  // prov:render 事件，不认识具体组件；空容器不占位（style.css 的 :empty）。
+  if (p.company) {
+    const slot = document.createElement('span');
+    slot.className = 'pf-card-slot';
+    slot.dataset.cxSlot = 'prov-actions';
+    slot.dataset.provId = p.id || '';
+    slot.dataset.portalURL = p.portalURL || '';
+    head.insertBefore(slot, head.querySelector('.pv-meta') || null);
+  }
   // 启停开关：停用的提供方不参与默认选择与会话解析（出了公司自动切到可用服务商
   // 就靠它）；公司通道另有「自动停用」，手动开启会一并清掉
   if (key !== 'new') {
@@ -672,11 +718,47 @@ function buildProvCard(p, key) {
     } else {
       p.presetId = sel.value;
       const t = presetOf(sel.value);
-      if (t) { p.name = t.name; p.baseURL = ''; p.presetURL = t.baseURL; }
+      if (t) { p.name = t.name; p.baseURL = ''; p.presetURL = t.baseURL; p.protocol = t.protocol || ''; }
     }
     renderProvCards();
   };
   form.appendChild(sel);
+
+  // 协议类型：决定同一套 agent 走哪种渠道协议（后端 llmproto.go 的三个实现）。
+  // 预置方跟随模板不可改；自定义渠道三选一，默认 OpenAI 兼容。
+  const PROTOCOLS = [
+    ['', 'OpenAI 兼容 · chat/completions（默认）'],
+    ['anthropic', 'Anthropic 原生 · /v1/messages'],
+    ['responses', 'OpenAI Responses · /v1/responses'],
+  ];
+  const protoLabel = (v) => { const hit = PROTOCOLS.find((x) => x[0] === v); return hit ? hit[1] : v; };
+  if (p.presetId) {
+    if (p.protocol) {
+      const lblProto = document.createElement('div');
+      lblProto.className = 'pf-label';
+      lblProto.textContent = '协议类型';
+      form.appendChild(lblProto);
+      const protoFixed = document.createElement('div');
+      protoFixed.className = 'pf-fixed';
+      protoFixed.textContent = protoLabel(p.protocol) + '（预置提供方固定）';
+      form.appendChild(protoFixed);
+    }
+  } else {
+    const lblProto = document.createElement('div');
+    lblProto.className = 'pf-label';
+    lblProto.textContent = '协议类型';
+    form.appendChild(lblProto);
+    const selProto = document.createElement('select');
+    selProto.className = 'pf-input';
+    for (const [v, label] of PROTOCOLS) {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = label;
+      selProto.appendChild(o);
+    }
+    selProto.value = p.protocol || '';
+    selProto.onchange = () => { p.protocol = selProto.value; renderProvCards(); };
+    form.appendChild(selProto);
+  }
 
   // 名称 + API 地址（预置方用系统地址，只展示不可改；备注展示计费方式/Key 获取方式）
   if (p.presetId) {
@@ -707,10 +789,10 @@ function buildProvCard(p, key) {
     inName.oninput = () => { p.name = inName.value; };
     cellName.appendChild(inName);
     const cellUrl = document.createElement('div');
-    cellUrl.innerHTML = '<div class="pf-label">API 地址（OpenAI 兼容）</div>';
+    cellUrl.innerHTML = '<div class="pf-label">API 地址（' + (p.protocol === 'anthropic' ? 'Anthropic，含 /v1' : p.protocol === 'responses' ? 'Responses，含 /v1' : 'OpenAI 兼容') + '）</div>';
     const inUrl = document.createElement('input');
     inUrl.className = 'pf-input';
-    inUrl.placeholder = 'https://…/v1';
+    inUrl.placeholder = p.protocol === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://…/v1';
     inUrl.value = p.baseURL;
     inUrl.oninput = () => { p.baseURL = inUrl.value; };
     cellUrl.appendChild(inUrl);
@@ -930,14 +1012,23 @@ function buildProvCard(p, key) {
     try {
       const d = await api('/api/providers/fetch', {
         method: 'POST',
-        body: JSON.stringify({ id: p.id || p.presetId || '', baseURL: effURL(p), apiKey: p.key }),
+        body: JSON.stringify({ id: p.id || p.presetId || '', baseURL: effURL(p), apiKey: p.key, protocol: p.protocol || '' }),
       });
       const oldMap = new Map(p.models.map((m) => [m.id, m]));
       const merged = [];
       for (const fm of (d.models || [])) {
         const ex = oldMap.get(fm.id);
-        if (ex) { oldMap.delete(fm.id); merged.push(ex); }
-        else merged.push({ id: fm.id, name: fm.name || '', contextWindow: fm.contextWindow || 0, maxOutput: 0, supportsImages: !!fm.supportsImages });
+        if (ex) {
+          oldMap.delete(fm.id);
+          // 思考档位没有手工编辑入口：服务端报了真实 supported_levels 就以它为准
+          if (fm.reasoningLevels && fm.reasoningLevels.length) ex.reasoningLevels = fm.reasoningLevels.slice();
+          merged.push(ex);
+        }
+        else merged.push({
+          id: fm.id, name: fm.name || '', contextWindow: fm.contextWindow || 0,
+          maxOutput: fm.maxOutput || 0, supportsImages: !!fm.supportsImages,
+          reasoningLevels: (fm.reasoningLevels && fm.reasoningLevels.length) ? fm.reasoningLevels.slice() : null,
+        });
       }
       for (const ex of oldMap.values()) merged.push(ex); // 手工添加的保留在末尾
       p.models = merged;
@@ -960,7 +1051,7 @@ function buildProvCard(p, key) {
     try {
       const d = await api('/api/providers/test', {
         method: 'POST',
-        body: JSON.stringify({ id: p.id || p.presetId || '', baseURL: effURL(p), apiKey: p.key, models: ids }),
+        body: JSON.stringify({ id: p.id || p.presetId || '', baseURL: effURL(p), apiKey: p.key, protocol: p.protocol || '', models: ids }),
       });
       provTest[key] = {};
       for (const r of (d.results || [])) provTest[key][r.id] = { state: r.ok ? 'ok' : 'fail', ms: r.ms, err: r.err || '失败' };
@@ -1030,6 +1121,7 @@ async function putProvider(p, key) {
       name: p.name,
       baseURL: p.presetId ? '' : (p.baseURL || '').trim(),
       apiKey: p.key,
+      protocol: p.presetId ? '' : (p.protocol || ''),
       models: p.models,
     }),
   });
@@ -1074,9 +1166,11 @@ async function saveProviderDrafts() {
 }
 
 async function saveSettings() {
-  // 底部通用「保存」＝先把当前二级页（模型页）的草稿改变落盘，再写上下文页配置；
-  // 常规页偏好本来即时生效。任一环节出问题就不关窗口，让用户就地修正。
+  // 底部通用「保存」＝先把当前二级页（模型页）的草稿改变落盘，再走组件设置区
+  // 的统一保存（CX.registerSettings 带 save 钩子的组件在此落库），最后写上下文页
+  // 配置；常规页偏好本来即时生效。任一环节出问题就不关窗口，让用户就地修正。
   if (!(await saveProviderDrafts())) return;
+  if (!(await CX.saveSettingsSections())) return; // 组件设置（如 AI 记忆与拟人化）
   // 间隔以 K 为单位输入（服务端存原值），×1000 提交，0=关闭规则自动压缩；
   // keepChars 的 0 是合法值（全压语义），不能用 || 兜底（会把 0 吞成默认值）
   const clampPct = (v) => Math.max(0, Math.min(100, parseInt(v, 10) || 0));
@@ -1309,9 +1403,12 @@ function syncSearchState(c) {
 
 function syncRemoteState(c) {
   const ra = c.remoteAccess || {};
+  // 远程接入出厂默认开着，所以新装机大多是「开着、但网关还没连上」——这里只给
+  // 一句轻提示（二维码照常显示，扫它就能配对），不弹错、不挡用；连上后自动
+  // 变成「已连接网关」（未连上时下面那段短轮询会再拉一次状态）
   $('set-remote-state').textContent = ra.connected
     ? '已连接网关'
-    : (ra.enabled ? '已开启（正在连接网关：' + (ra.lastError || '稍候自动重试') + '）' : '已关闭');
+    : (ra.enabled ? '已开启（未连接服务器：' + (ra.lastError || '稍候自动重试') + '）' : '已关闭');
   const entryEl = $('set-remote-entry');
   entryEl.innerHTML = ra.enabled && ra.entry
     ? '手机（外网可用）扫码或浏览器打开并收藏：<b>' + esc(ra.entry) + '</b>'
@@ -1427,8 +1524,8 @@ $('btn-remote-pk-new').onclick = async () => {
 // 搜索服务：同一套「改动即存」；留空 = 跟随市场同源。非法地址由后端 400 拦下
 // （searchURL 不合法），这里 alert 出原因并回滚为服务端值
 bindRemoteInput('set-search-url', 'searchURL');
-// 网页托管平台（小程序平台）：已随小程序平台组件化迁入 sites-platform 组件的
-// 设置区（设置 · 内置组件），此处不再绑定；后端 /sites 代理照旧。
+// 网页托管平台（企业小程序）：已随企业小程序组件化迁入 sites-platform 组件的
+// 设置区（设置 · 组件），此处不再绑定；后端 /sites 代理照旧。
 bindRemoteInput('set-registry-url', 'registryURL');
 bindRemoteInput('set-update-url', 'updateURL');
 // 更新方式：auto=分块静默（默认）/manual=仅提醒手动整包安装；改动即存
@@ -1458,6 +1555,12 @@ async function refreshUpdateBox() {
   if (u.applied && Object.keys(u.applied).length) {
     const parts = Object.keys(u.applied).sort().map((k) => esc(k) + '→' + esc(u.applied[k]));
     text += '　·　已静默更新组件：' + parts.join('、');
+  }
+  // 组件正在被占用（语音输入法等在用）：包已下载好，等重启软件自动落地——
+  // 不是错误，用户什么都不用做（update_blocks.go 的 ComponentsPending）。
+  if (u.componentsPending && Object.keys(u.componentsPending).length) {
+    const parts = Object.keys(u.componentsPending).sort().map((k) => esc(k) + '→' + esc(u.componentsPending[k]));
+    text += '　·　组件已下载待启用：' + parts.join('、') + '（重启软件后自动生效，不影响当前使用）';
   }
   if (u.lastError) text += '　·　<span style="color:var(--danger)">' + esc(u.lastError) + '</span>';
   el.innerHTML = text;
@@ -1510,7 +1613,7 @@ $('btn-wizard-rerun').onclick = async () => {
 $('btn-settings').onclick = openSettings;
 $('set-save').onclick = saveSettings;
 
-/* ---------- 对话历史与压缩：数字经理主对话的版本 ----------
+/* ---------- 对话历史与压缩：长期助理主对话的版本 ----------
    主对话不再靠「清空」删历史来重新开始，而是「换版本」：新建一版＝从零开始的
    新数字助理，老版本的历史、文件快照、交付记录原样留在它自己名下，随时选回去
    接着聊。当前是哪一版由**服务端**记在库里（/api/assistant/versions），前端只照
@@ -1679,7 +1782,7 @@ document.querySelectorAll('.set-nav-item').forEach((b) => {
 // 模型页：「添加提供方」= 插入一张展开的自定义卡片（已有未保存草稿则直接展开，不覆盖）
 $('prov-add-card').onclick = () => {
   if (!provNew) {
-    provNew = { id: '', presetId: null, presetURL: '', name: '', baseURL: '', key: '', keyMasked: '', models: [] };
+    provNew = { id: '', presetId: null, presetURL: '', name: '', baseURL: '', protocol: '', key: '', keyMasked: '', models: [] };
   }
   provOpenKey = 'new';
   provModelOpen['new'] = -1;
@@ -2297,7 +2400,7 @@ function buildExpertCard(e) {
   const card = document.createElement('div');
   card.className = 'prov-card' + (open ? ' open' : '') + (e.enabled ? '' : ' off');
 
-  // 折叠头：名称+描述（与「内置组件」行同款排版）+ 元信息 + 开关 + 编辑；
+  // 折叠头：名称+描述（与「组件」行同款排版）+ 元信息 + 开关 + 编辑；
   // 点名称区展开，开关不冒泡
   const head = document.createElement('div');
   head.className = 'pv-head';

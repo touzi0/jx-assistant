@@ -1,8 +1,8 @@
 // 计划框交互验证（CDP 真实点击 + 打桩待办数据，隔离实例）。
 // 覆盖这次改动：
-//   A. 计划审批卡：不再有「查看计划」按钮；动作是 修改 / 忽略计划 / 批准并开始执行；
+//   A. 计划审批卡：不再有「查看计划」按钮；动作是 修改 / 取消计划 / 批准并开始执行；
 //      整张卡标记为可点（点标题区 → 打开右栏「计划」），点输入框不误触。
-//   B. 「忽略计划」= 搁置：把 __ignore__ 发给后端，且卡片不做乐观移除（仍留在原处）。
+//   B. 「取消计划」把 __ignore__ 发给后端，且卡片不做乐观移除（仍留在原处）。
 //   C. 右栏默认选中：上次看过/选过旧版（V1）时，**新提交的待审批计划（V2）不被旧版遮住**。
 //   D. 对话流里的计划卡（plancard）：没有按钮、只有一行提示、整张卡可点，
 //      点击带上这条提交的序号（用于把右栏定位到这一份）。
@@ -139,8 +139,8 @@ try {
       hint: (el.querySelector('.q-plan-hint') || {}).textContent || '',
     };
   })()`);
-  check('A1. 审批卡动作是「忽略计划 / 批准并开始执行」（修改在输入行）',
-    card && card.acts.includes('忽略计划') && card.acts.includes('批准并开始执行') && card.btns.includes('修改'), card && card.btns);
+  check('A1. 审批卡动作是「取消计划 / 批准并开始执行」（修改在输入行）',
+    card && card.acts.includes('取消计划') && card.acts.includes('批准并开始执行') && card.btns.includes('修改'), card && card.btns);
   check('A2. 不再有「查看计划」按钮',
     card && !card.btns.some((b) => b.indexOf('查看计划') >= 0), card && card.btns);
   check('A3. 整张卡标记为可点，并写明「除输入框与按钮外都能点」',
@@ -161,7 +161,7 @@ try {
   const hidden = await read(c, `document.getElementById('rpanel').classList.contains('hidden')`);
   check('A5. 点输入框不会误触打开右栏', hidden === true, { rpanelHidden: hidden });
 
-  // B. 忽略计划：发 __ignore__、卡片留在原处
+  // B. 取消计划：发 __ignore__、卡片留在原处
   await read(c, `(() => {
     window.__ignored = [];
     const real = window.__realFetch;
@@ -184,9 +184,9 @@ try {
     stillPending: state.questions.some((q) => q.id === 'q-v2'),
     cardThere: !!document.querySelector('#ask-bar .q-card.plan'),
   }))()`);
-  check('B1. 「忽略计划」把 __ignore__ 发给后端',
+  check('B1. 「取消计划」把 __ignore__ 发给后端',
     igr.calls.length === 1 && igr.calls[0].body.indexOf('__ignore__') >= 0, igr.calls);
-  check('B2. 「忽略计划」后卡片不消失（搁置）', igr.stillPending === true && igr.cardThere === true,
+  check('B2. 「取消计划」后卡片不消失（计划仍留着待处置）', igr.stillPending === true && igr.cardThere === true,
     { stillPending: igr.stillPending, cardThere: igr.cardThere });
 
   // D. 对话流计划卡：无按钮、整张卡可点、点开带定位

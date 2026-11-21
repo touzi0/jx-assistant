@@ -1,4 +1,4 @@
-//go:build windows
+﻿//go:build windows
 // +build windows
 
 package webview2
@@ -108,6 +108,18 @@ func NewWithOptions(options WebViewOptions) WebView {
 	w.mainthread, _, _ = w32.Kernel32GetCurrentThreadID.Call()
 	if !w.CreateWithOptions(options.WindowOptions) {
 		return nil
+	}
+
+	// 补丁（VoiceTypeGo 2026-11-21）：默认背景设为全透明。悬浮窗的外形靠
+	// SetWindowRgn 裁剪，region 是无抗锯齿的整数阶梯；默认的不透明白底会从
+	// region 阶梯与网页抗锯齿圆角之间的缝隙里露出来，视觉上就是"边缘发白、
+	// 圆角像锯齿"。透明后网页的透明像素直接透到桌面，可见边缘完全由网页
+	// border-radius 的抗锯齿曲线决定。旧运行时（<1.0.1155）拿不到 Controller2，
+	// 静默跳过＝维持原白底行为，不影响启动。
+	if ctl := chromium.GetController(); ctl != nil {
+		if c2 := ctl.GetICoreWebView2Controller2(); c2 != nil {
+			_ = c2.PutDefaultBackgroundColor(edge.COREWEBVIEW2_COLOR{A: 0, R: 0, G: 0, B: 0})
+		}
 	}
 
 	// 补丁：设置项失败只记日志降级（原版 log.Fatal 杀整进程——建窗期一次
@@ -306,27 +318,37 @@ func (w *webview) CreateWithOptions(opts WindowOptions) bool {
 		windowHeight = 480
 	}
 
-	var posX, posY uint
-	if opts.Center {
-		// get screen size
-		screenWidth, _, _ := w32.User32GetSystemMetrics.Call(w32.SM_CXSCREEN)
-		screenHeight, _, _ := w32.User32GetSystemMetrics.Call(w32.SM_CYSCREEN)
-		// calculate window position
-		posX = (uint(screenWidth) - windowWidth) / 2
-		posY = (uint(screenHeight) - windowHeight) / 2
-	} else {
-		// use default position
-		posX = w32.CW_USEDEFAULT
-		posY = w32.CW_USEDEFAULT
-	}
-
+	// 补丁（VoiceTypeGo 2026-11-16）：建窗不再出现在屏幕上——修「白色方块闪一下」。
+	//
+	// 原版行为：WS_OVERLAPPEDWINDOW 640×480 → ShowWindow(SWShow) → UpdateWindow →
+	// SetFocus。用户看到的是屏幕正中一块白窗闪一下（此刻 WebView2 还没画出内容，
+	// 随后宿主才把它改造成胶囊并隐藏）；SetFocus 还会在用户打字时抢一次焦点。
+	//
+	// 现在的做法（两层保险，任一成立就不会看见白块）：
+	//   · 样式直接给 **WS_POPUP**（无边框；改造后本来也是这个样式），尺寸取调用方
+	//     要的（宿主传 200×88，与胶囊窗口一致，省一次 resize）；
+	//   · 位置放到屏幕外 (-32000,-32000)，用 SW_SHOWNOACTIVATE 显示，不 UpdateWindow、
+	//     不 SetFocus。
+	// **必须仍然"显示"（只是屏外）**：WebView2 的合成表面在窗口可见时才建立，
+	// 用隐藏建窗（或给子进程加 STARTF_USESHOWWINDOW+HIDE）会让胶囊以后一片空白
+	// ——组件里 voicetype_spawn_windows.go 有这条实测教训。屏外显示既有合成表面，
+	// 又没有任何像素落在工作区里。
+	const (
+		wsPopup          = 0x80000000
+		swShowNoActivate = 4
+	)
+	// 屏外坐标：CreateWindowExW 的位置参数是 uintptr，负数用二进制补码表示
+	//（-32000 → 0xFFFF...8300），这样窗口建在屏幕左上方很远处，任何显示器都看不到。
+	offX := int(^int32(31999)) // -32000
+	offY := offX
+	// opts.Center 不再生效：窗口一律建在屏幕外，由宿主改造成胶囊后再决定显示位置。
 	w.hwnd, _, _ = w32.User32CreateWindowExW.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowName)),
-		0xCF0000, // WS_OVERLAPPEDWINDOW
-		uintptr(posX),
-		uintptr(posY),
+		wsPopup,
+		uintptr(offX),
+		uintptr(offY),
 		uintptr(windowWidth),
 		uintptr(windowHeight),
 		0,
@@ -336,9 +358,7 @@ func (w *webview) CreateWithOptions(opts WindowOptions) bool {
 	)
 	setWindowContext(w.hwnd, w)
 
-	_, _, _ = w32.User32ShowWindow.Call(w.hwnd, w32.SWShow)
-	_, _, _ = w32.User32UpdateWindow.Call(w.hwnd)
-	_, _, _ = w32.User32SetFocus.Call(w.hwnd)
+	_, _, _ = w32.User32ShowWindow.Call(w.hwnd, swShowNoActivate)
 
 	if !w.browser.Embed(w.hwnd) {
 		return false
@@ -483,3 +503,5 @@ func (w *webview) Bind(name string, f interface{}) error {
 
 	return nil
 }
+
+

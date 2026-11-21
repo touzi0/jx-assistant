@@ -101,8 +101,8 @@ type Config struct {
 	// 手机等外部设备经网关的加密中继访问本服务；端到端 AES-256-GCM（密钥由
 	// pairKey 派生），网关只见密文。与聊天服务的 p2p.js 同协议，共用同一网关。
 	RemoteAccess RemoteAccessCfg `json:"remoteAccess"`
-	// 企业技能包 / 工作流 / 小程序平台服务器地址（域名/IP + 端口，如 https://example.com:2227）：
-	// 技能市场与小程序平台同一台 jxai-server，清单（/market/manifest.json）与 /sites
+	// 企业技能包 / 工作流 / 企业小程序服务器地址（域名/IP + 端口，如 https://jxaizz.com:2227）：
+	// 技能市场与企业小程序同一台 jxai-server，清单（/market/manifest.json）与 /sites
 	// 等后缀由程序自动拼（market.go 的 marketManifestURL），已带后缀的旧值同样兼容；
 	// 空 = 未配置（市场页提示并给出与中继网关同 host 的建议值）。
 	MarketURL string `json:"marketURL"`
@@ -124,13 +124,23 @@ type Config struct {
 	// 通道）原样保留，重新打开即恢复同步与向导。
 	WizardDone  bool   `json:"wizardDone"`
 	RegistryURL string `json:"registryURL"`
-	// 小程序平台不再有独立地址（2026-11-03 用户口径）：一律从市场地址（marketURL）
+	// 企业小程序不再有独立地址（2026-11-03 用户口径）：一律从市场地址（marketURL）
 	// 推导——内嵌走本端透明反向代理 /sites（sitesproxy.go），"在浏览器中打开"由
 	// 前端按市场 origin 拼 /sites。服务端也不再随公告/配置包下发 sitesURL。
 	WizardCompany      string `json:"wizardCompany,omitempty"`
 	WizardServer       string `json:"wizardServer,omitempty"`
 	WizardPublicServer string `json:"wizardPublicServer,omitempty"` // 服务端公网地址（仅由服务端公告/provision 下发，本地永不写死）：内网失联时改从它拉公告——公司通道配了外网地址就出公司也能用，否则自动停用
-	WizardRev          string `json:"wizardRev,omitempty"`          // 最近应用的服务端公告哈希（仅记录）
+	// WizardDeviceSecret 服务端签发的设备凭据（2026-11-13，与 provision.json
+	// 设备级记录里那份一致）：announce 自动携带——服务端只对带有效凭据的请求
+	// 下发个人额度快照与按人授权的外网通道。空串 = 老服务端未签发，不带凭据
+	// 头，行为与老版本一致。接入不设门槛（社区模式：key 照发、额度为零）。
+	WizardDeviceSecret string `json:"wizardDeviceSecret,omitempty"`
+	// PortalURL 门户充值入口（2026-11-13 充值组件）：服务端 portal 启用时随公告/
+	// provision 下发（=个人中心/充值页地址）。充值组件（组件/portal）的「充值 /
+	// 去充值」入口靠它显隐；空=门户未启用（或服务端已关），入口全部隐藏。
+	// 本端 /portal 反向代理（portalproxy.go）也以它为目标。
+	PortalURL string `json:"portalURL,omitempty"`
+	WizardRev string `json:"wizardRev,omitempty"` // 最近应用的服务端公告哈希（仅记录）
 	// CompanyQuota 公司内部通道的额度快照（服务端 /announce 与 /provision 下发，
 	// 客户端只存不算；回显在设置页公司通道卡片与模型菜单）。nil = 服务端没下发
 	// （老服务端或未配模型通道）——此时不显示额度。
@@ -162,6 +172,13 @@ type Config struct {
 	// 停表）时声光提醒——系统叮一声 + 全屏颜色闪烁 + 语音组件朗读 Text
 	//（组件停用时只叮不读）。Enabled=nil 表示未写过该键＝默认开启。
 	AskAlert AskAlertCfg `json:"askAlert,omitempty"`
+	// 经理代理通知（mgrnotify.go）：经理（dispatch_task / send_to_session）投递
+	// 开启的那一轮里，审批/提问卡挂出 AfterSec 秒（默认 30）仍无人处理时，自动
+	// 给长期助理主对话投一条通知（含 call_api 代批路径），决议随后回告并标注
+	// 来源。代批是轮次级授权：该轮收口或用户亲发消息即撤销，窗口外的卡不通知、
+	// 代决被拒。与上面的询问提醒并行，各管各：一个叫醒用户、一个叫醒经理。
+	// Enabled=nil 表示未写过该键＝默认开启。
+	MgrNotify MgrNotifyCfg `json:"mgrNotify,omitempty"`
 	// 「执行结束后自动续发排队消息」（设置·常规）：本轮回复完成后，排队队列里
 	// 的待发消息——真人消息 / 派发回报 / 派发需求 / 系统注入，**不分来源**——
 	// 自动逐条作为独立一轮发出。nil 表示未写过该键＝默认开启；显式 false 才关闭：
@@ -200,6 +217,35 @@ type AskAlertCfg struct {
 	Enabled  *bool  `json:"enabled,omitempty"`
 	AfterSec int    `json:"afterSec,omitempty"`
 	Text     string `json:"text,omitempty"`
+}
+
+// MgrNotifyCfg 经理代理通知配置段：Enabled=nil＝默认开启（false=关闭）；
+// AfterSec 触发秒数（默认 30，钳 10-600，0 会在加载时归一回默认——想关用
+// Enabled，不留「0=关闭」这第二个开关语义）。
+type MgrNotifyCfg struct {
+	Enabled  *bool `json:"enabled,omitempty"`
+	AfterSec int   `json:"afterSec,omitempty"`
+}
+
+// 经理代理通知的默认触发秒数（用户定调 30 秒：比声光提醒早得多——经理先看
+// 到多半就轮不到打扰用户）。
+const mgrNotifyDefaultSec = 30
+
+// mgrNotifyOn 经理代理通知是否开启（nil 接收器＝关：测试的裸 App 没有 Cfg）。
+func (c *Config) mgrNotifyOn() bool {
+	if c == nil {
+		return false
+	}
+	return c.MgrNotify.Enabled == nil || *c.MgrNotify.Enabled
+}
+
+// mgrNotifyAfterSec 通知触发秒数（解析后的生效值，10-600，默认 30）。
+func (c *Config) mgrNotifyAfterSec() int {
+	v := mgrNotifyDefaultSec
+	if c != nil && c.MgrNotify.AfterSec >= 10 && c.MgrNotify.AfterSec <= 600 {
+		v = c.MgrNotify.AfterSec
+	}
+	return v
 }
 
 // 询问提醒的默认朗读文案与触发秒数（含访问器的兜底，测试里 Cfg 为 nil 也安全）。
@@ -308,11 +354,15 @@ func DefaultConfig() *Config {
 		ws = v
 	}
 	return &Config{
-		Port:                8788,
-		BindHost:            "127.0.0.1",
-		BaseURL:             "https://api.deepseek.com/v1",
+		Port:     8788,
+		BindHost: "127.0.0.1",
+		// 出厂不预置任何模型通道（2026-11-13 用户口径）：新装打开就是彻底空的，
+		// 通道只来自「公司接入向导下发」或用户自己在 设置·模型 里添加。旧版出厂
+		// 把 DeepSeek 官方地址 + deepseek-chat 折成一个空 Key 通道挂在模型菜单里，
+		// 对公司客户就是一条不可用的噪音。
+		BaseURL:             "",
 		APIKey:              "",
-		Model:               "deepseek-chat",
+		Model:               "",
 		Workspace:           ws,
 		MaxSteps:            maxStepsDefault,
 		AllowShell:          true,
@@ -329,16 +379,21 @@ func DefaultConfig() *Config {
 		SnapshotEnabled:     nil, // 缺省开启；nil 表示"未配置"，按开处理
 		Experts:             defaultExperts(),
 		RemoteAccess: RemoteAccessCfg{
-			Enabled: false,
+			// 出厂默认开启（2026-11-18 用户口径）：新装打开设置就能看到手机扫码入口，
+			// 不用先去开关里点一下。默认开的只是「开关」——配对密钥/白名单那套鉴权
+			// 一个字没动，谁扫码都得凭配置文件里的配对凭据；网关连不上也只是后台
+			// 静默重试，不弹错、不挡启动。
+			Enabled: true,
 			Host:    "",             // 出厂不带默认网关：由公司服务端下发（向导/广播）或用户手配
 			Port:    2227,
 			MyID:    "",            // 留空：首次加载时为每台安装生成唯一设备号（多人安装互不冲突）
 			RegKey:  "chat_p2p_v1", // legacy 全局口令：仅兼容未升级的旧网关；注册凭据实际走 PairKey 派生的 auth（remoteaccess.go hubAuthKey）
 		},
 		RegistryURL: "https://jxaizz.com:2227", // 总服务器（公司名查询的入口）：内网发现超时后按公司名查它拿接入地址；"off"=禁用
-		UpdateURL:   "",                         // 更新源出厂不带默认值（装机时注入或用户手配）；空/"off"=不检查更新
+		UpdateURL:   "", // 更新源出厂不带默认值（装机时注入或用户手配）；空/"off"=不检查更新
 		UpdateMode:  "auto",
 		AskAlert:    AskAlertCfg{AfterSec: askAlertDefaultSec, Text: askAlertDefaultText},
+		MgrNotify:   MgrNotifyCfg{AfterSec: mgrNotifyDefaultSec},
 	}
 }
 
@@ -363,12 +418,8 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.Port == 0 {
 		cfg.Port = def.Port
 	}
-	if cfg.BaseURL == "" {
-		cfg.BaseURL = def.BaseURL
-	}
-	if cfg.Model == "" {
-		cfg.Model = def.Model
-	}
+	// baseURL/apiKey/model（旧三元组）不补默认：出厂就是空的，见 DefaultConfig
+	// 的注释。老配置里写过的值原样保留，供下面的折算判断用。
 	if cfg.Workspace == "" {
 		cfg.Workspace = def.Workspace
 	}
@@ -470,7 +521,7 @@ func LoadConfig(path string) (*Config, error) {
 	// 之前保持留空；设备号与配对密钥留空则为本机随机生成并立即落盘——每台安装
 	// 天然拿到互不冲突的设备号和独立密钥，多台电脑共用一个网关也不会互相顶掉。
 	// 一次性迁移（2026-10）：老部署的远程网关填的是 QNAP DDNS 域名，而 2227 上
-	// 的证书只覆盖 jxaizz.com——老域名生成的配对二维码/入口链接手机端必报
+	// 的证书只覆盖 jxaizz.com/.cn——老域名生成的配对二维码/入口链接手机端必报
 	// 证书错误。启动时静默迁移到自有域名（仅精确匹配本家老地址，不动其他公司的网关）。
 	remoteHostMigrated := false
 	if cfg.RemoteAccess.Host == "jxkj.mycloudnas.com" {
@@ -482,6 +533,23 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.RemoteAccess.RegKey == "" {
 		cfg.RemoteAccess.RegKey = def.RemoteAccess.RegKey
+	}
+	// 远程接入的开关：配置里**根本没有这个键**＝这台机器从没配过它（新装、或老
+	// 版本写下的只有地址/设备号），按新默认开启；写过 enabled=false 的是用户自己
+	// 关的（哪怕是老版本出厂默认写下的 false 也认作"已表态"），一律尊重、不翻。
+	// 关掉再开、开完再关都正常——设置页每次改动都会把这个键写实。
+	var remoteKeys map[string]json.RawMessage
+	if json.Unmarshal(data, &remoteKeys) == nil {
+		if raw, ok := remoteKeys["remoteAccess"]; ok {
+			var sub map[string]json.RawMessage
+			if json.Unmarshal(raw, &sub) == nil {
+				if _, hasEnabled := sub["enabled"]; !hasEnabled {
+					cfg.RemoteAccess.Enabled = true
+				}
+			}
+		} else {
+			cfg.RemoteAccess.Enabled = true
+		}
 	}
 	ensureRemoteIdentity(cfg, path)
 	// 一次性迁移（2026-10-25 明文停用）：存量配置里指向自家服务端的明文 http://
@@ -537,14 +605,28 @@ func LoadConfig(path string) (*Config, error) {
 	if strings.TrimSpace(cfg.AskAlert.Text) == "" {
 		cfg.AskAlert.Text = askAlertDefaultText
 	}
+	// 经理代理通知：老配置没有这一键时补默认 30 秒；越界的拉回范围（口径同
+	// 询问提醒，兜升级前手改配置文件的情况）。
+	if cfg.MgrNotify.AfterSec <= 0 {
+		cfg.MgrNotify.AfterSec = mgrNotifyDefaultSec
+	}
+	if cfg.MgrNotify.AfterSec < 10 {
+		cfg.MgrNotify.AfterSec = 10
+	}
+	if cfg.MgrNotify.AfterSec > 600 {
+		cfg.MgrNotify.AfterSec = 600
+	}
 	// 敏感字段透明解密（dpapi:v1: 密文 → 明文；旧版明文原样）。
 	// 首启迁移：明文照常读入，下一次 Save 自动转密文。
 	cfg.APIKey = unprotectSecret(cfg.APIKey)
 	for i := range cfg.Providers {
 		cfg.Providers[i].APIKey = unprotectSecret(cfg.Providers[i].APIKey)
 	}
-	// 老配置兼容：没有 Providers 时把旧的三元组折算成第一个 provider
-	if len(cfg.Providers) == 0 {
+	// 老配置兼容：没有 Providers 时把旧的三元组折算成第一个 provider。
+	// 只折算「用户真配过东西」的三元组（填了 Key，或地址/模型不是出厂默认值）：
+	// 出厂默认那组（官方 DeepSeek 地址 + deepseek-chat + 空 Key）不再折成通道——
+	// 全新安装与从没配过的机器保持 providers 为空，模型菜单里没有任何假通道。
+	if len(cfg.Providers) == 0 && legacyTripleConfigured(cfg) {
 		providers := DefaultProviders()
 		p := providers[0]
 		p.BaseURL = cfg.BaseURL
@@ -555,12 +637,20 @@ func LoadConfig(path string) (*Config, error) {
 		}
 		cfg.Providers = []ProviderCfg{p}
 	}
+	// 存量清理：早期版本把出厂三元组折成过一个 DeepSeek 占位通道（空 Key、
+	// 只有 deepseek-chat），从没配过的机器上它一直挂在模型菜单里。特征足够严
+	// （默认 id + 出厂地址 + 空 Key + 模型清单恰为出厂那一个）才删；用户自己
+	// 加过或配过 Key 的通道一律不动。
+	placeholderDropped := dropDefaultPlaceholderProvider(cfg)
 	// 步数上限从历次默认迁移过（旧默认 → 不限制）、压缩从百分比阈值迁移到
 	// 间隔制：立即落盘，让设置页读数、配置文件与运行时三者一致（免得用户看到
 	// 配置文件里还是旧键，以为没生效；其他补全都留给下一次保存）
-	if maxStepsBumped || remoteHostMigrated || compactMigrated || plainSelfMigrated {
+	if maxStepsBumped || remoteHostMigrated || compactMigrated || plainSelfMigrated || placeholderDropped {
 		if err := cfg.Save(path); err != nil {
 			log.Printf("回写配置迁移失败: %v", err)
+		}
+		if placeholderDropped {
+			log.Printf("已删除旧版留下的出厂占位通道（DeepSeek 空 Key / deepseek-chat）：新版本出厂不预置通道，通道只来自公司接入或用户自己添加")
 		}
 	}
 	cfg.syncLegacyFields()
@@ -569,8 +659,55 @@ func LoadConfig(path string) (*Config, error) {
 
 // legacyPlainHosts 自家服务端的已知地址——存量配置里可能以明文 http:// 记录
 //（历史网关域名、内网 IP、外网域名），明文停用后统一收敛到正式域名。
-//（jxaizz.cn 已弃用下线，不再列内；与内部开发线保持一致。）
+//（jxaizz.cn 已弃用下线，不再列内。）
 var legacyPlainHosts = []string{"jxaizz.com", "jxkj.mycloudnas.com", "192.168.0.210"}
+
+// 旧版出厂三元组的默认值：全新安装写进 config.json 的就是这一组（空 Key）。
+// 它出现过就说明用户没手动改过，不该被当成「用户配过的通道」。
+const (
+	legacyDefaultBaseURL = "https://api.deepseek.com/v1"
+	legacyDefaultModel   = "deepseek-chat"
+)
+
+// legacyTripleConfigured 旧三元组（baseURL/apiKey/model）是否值得折算成通道：
+// 填了 Key，或地址/模型不是出厂默认值。全空或全是出厂默认 = 用户没配过，
+// 保持 providers 为空（模型菜单干净）。
+func legacyTripleConfigured(cfg *Config) bool {
+	if strings.TrimSpace(cfg.APIKey) != "" {
+		return true
+	}
+	if b := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/"); b != "" && b != legacyDefaultBaseURL {
+		return true
+	}
+	if m := strings.TrimSpace(cfg.Model); m != "" && m != legacyDefaultModel {
+		return true
+	}
+	return false
+}
+
+// dropDefaultPlaceholderProvider 删掉旧版出厂折出来的 DeepSeek 占位通道
+// （空 Key + 出厂地址 + 模型清单恰好只有 deepseek-chat）。用户填过 Key、
+// 改过地址或自己加过模型的 deepseek 通道不满足这几个条件，原样保留。
+func dropDefaultPlaceholderProvider(cfg *Config) bool {
+	kept := make([]ProviderCfg, 0, len(cfg.Providers))
+	dropped := false
+	for _, p := range cfg.Providers {
+		placeholder := p.ID == "deepseek" &&
+			strings.TrimSpace(p.APIKey) == "" &&
+			strings.TrimRight(strings.TrimSpace(p.BaseURL), "/") == legacyDefaultBaseURL &&
+			len(p.Models) == 1 && p.Models[0].ID == legacyDefaultModel
+		if placeholder {
+			dropped = true
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if !dropped {
+		return false
+	}
+	cfg.Providers = kept
+	return true
+}
 
 // migrateLegacyPlainURL 把「http://<自家host>[:任意端口]<路径…>」迁到
 // https://jxaizz.com:2227<路径…>（端口无关：2227/2228 是服务端口、3000/3001 是

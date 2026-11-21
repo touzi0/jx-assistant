@@ -41,7 +41,9 @@ import (
 
 // androidDeliveryDir 手机端交付出口：公有目录「下载」下的专属子目录
 //（targetSdk 28 走 legacy storage，WRITE_EXTERNAL_STORAGE 运行时权限即可直写）。
-const androidDeliveryDir = "/sdcard/Download/坚祥数字助理"
+// 2026-11-19 随产品 exe 改名（坚祥数字助理GO → AI数字助理）同步改为新名
+//（用户口径：安卓运行版没人用过，不考虑旧目录兼容；jx-link 手机壳不动）。
+const androidDeliveryDir = "/sdcard/Download/AI数字助理"
 
 func deliverResultTool() Tool {
 	// 手机端：交付出口固定为公有目录下载文件夹（不需要上传记录；目录建不出
@@ -49,7 +51,7 @@ func deliverResultTool() Tool {
 	if isAndroidRuntime {
 		return Tool{
 			Spec: toolSpec("deliver_result",
-				"登记本轮的最终交付文件并交付到手机的「下载」目录（/sdcard/Download/坚祥数字助理/，用户在系统文件管理器里直接可见）：每个文件先登记成交付卡片，本轮对话结束后系统再把它移动到下载目录，搬运成功后卡片自动改指下载目录里的成品。目标处若有同名文件会先快照备份到工作区 .jxai/delivery-backups/ 再替换，执行结果以系统注记进入后续对话。"+
+				"登记本轮的最终交付文件并交付到手机的「下载」目录（/sdcard/Download/AI数字助理/，用户在系统文件管理器里直接可见）：每个文件先登记成交付卡片，本轮对话结束后系统再把它移动到下载目录，搬运成功后卡片自动改指下载目录里的成品。目标处若有同名文件会先快照备份到工作区 .jxai/delivery-backups/ 再替换，执行结果以系统注记进入后续对话。"+
 					"用户要求「把文件发给我/放到下载目录」或产出成果文件时用本工具；工作区内常规写出不需要交付。若返回存储权限错误，请向用户说明：需要在系统弹窗或设置里允许本应用访问文件，然后重试。"+
 					"调用本工具不会结束对话（对话结束的判定仍是：只输出思考和正文、没有工具调用），所以应在调用本工具之后再输出给用户的正文总结。",
 				objSchema(map[string]any{

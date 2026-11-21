@@ -64,9 +64,9 @@ MD查看器 —— 双击 .md 文件，独立窗口渲染打开（单文件版�
   坚祥数字助理\md-viewer\（产物只有 MD查看器.exe + 使用说明.txt）。
 - WebView2 托管程序集经 AssemblyResolve 从嵌入资源加载；原生 Loader 释放到
   %LOCALAPPDATA%\Jianxiang\MdViewer\；查看器模板同样内嵌，运行时无需任何伴生文件。
-- 查看器模板 viewer-template.html 由 tools\assemble-template.js 组装生成：
-  样式与交互在 viewer-template.src.html 里改，marked 渲染库固定取自
-  viewer-template.legacy.html，改完跑 `node tools\assemble-template.js`
-  （自带渲染冒烟测试）再 build.ps1。
+- 查看器模板 viewer-template.html 里 marked 只有 /*__MARKED__*/ 占位符：
+  marked 渲染库全仓唯一一份在 坚祥数字助理\web\marked.lib.js，主程序
+  （mdview.go）启动时注入，本目录 build.ps1 构建时注入同一份。模板的样式
+  与交互直接改 viewer-template.html 本身即可。
 - 单实例：命名互斥体 Local\JianxiangMdViewerHost + 命名管道
   JianxiangMdViewerPipe（长度前缀 UTF-8 路径，"\u0001welcome" 打开说明页）。

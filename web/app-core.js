@@ -17,7 +17,9 @@ function applyBrandTexts() {
   document.title = window.brandName();
   const sb = document.querySelector('.brand b'); if (sb) sb.textContent = window.brandName();
   const wz = $('wz-title'); if (wz) wz.textContent = '欢迎使用' + window.brandName();
-  const ab = document.querySelector('#set-pane-about .about-block b'); if (ab) ab.textContent = window.brandName(); // 关于页只显示品牌名（「（GO版）」技术栈后缀 2026-10-30 起不再展示）
+  // 设置·关于页不在品牌应用范围（2026-11-19 用户口径）：关于页是软件自身的
+  // 基础信息介绍，名称与 LOGO 都不随服务端品牌变化——名称写死在 index.html
+  // （软件正式名「坚祥数字助理」），LOGO 走 /logo-default.png（只出内置默认图）。
   const hh = document.querySelector('.home .hero h1'); if (hh) hh.textContent = window.brandHero();
   const ha = document.querySelector('.home .hero img'); if (ha) ha.alt = window.brandName();
 }
@@ -142,6 +144,99 @@ const JX = {
     }
   },
 };
+
+/* ---------- 界面插槽（标准定位格式）：组件只「申请一个格子」，排版归插槽 ----------
+   规矩：组件不拼条目 DOM、不写条目的布局样式，只交「图标 + 名字 + 序号 + 点击」。
+   骨架、排序、以及同一份条目在电脑/手机两套形态下的排版都归插槽（CSS 在
+   style.css 的插槽段，形态由插槽按屏幕决定，组件两套都不用管）。
+   第一个插槽 sidebar.foot ＝ 左侧栏底部入口格：
+   · 序号 order 小的排在最下面（紧贴设置行），大的往上叠；同序号先注册的更靠下。
+     实现＝DOM 按 order 降序排——桌面竖排从上往下读就是序号大的在上，手机三列
+     网格行优先铺格，序号小的自然落最后一行；
+   · 内置「回收站」是第一位使用者（order 1，app-left.js 注册），组件从 2 起往上叠。
+   加新插槽＝在 SLOT_HOSTS 里登记容器与条目类名 + 在 style.css 写它的两套形态。 */
+const SLOT_HOSTS = {
+  'sidebar.foot': {
+    host: () => $('foot-apps') || document.querySelector('.sidebar-foot .foot-grid'),
+    itemClass: 'foot-btn',
+    labelClass: 'foot-btn-label',
+  },
+};
+const slotReg = {};   // 插槽名 -> Map(条目 key -> {def, el, seq})
+let slotSeq = 0;      // 全局注册序号：同 order 时先注册的排更下（DOM 更靠后）
+
+// 插槽排序（唯一实现，组件不再各写一份）：order 降序 → 注册序号降序
+function slotSort(host) {
+  [...host.children].sort((a, b) => {
+    const oa = parseFloat(a.dataset.order || '50');
+    const ob = parseFloat(b.dataset.order || '50');
+    if (oa !== ob) return ob - oa;
+    return parseFloat(b.dataset.slotSeq || '0') - parseFloat(a.dataset.slotSeq || '0');
+  }).forEach((el) => host.appendChild(el));
+}
+
+JX.slot = function (name) {
+  const def0 = SLOT_HOSTS[name];
+  if (!def0) throw new Error('未知界面插槽：' + name);
+  const reg = slotReg[name] || (slotReg[name] = new Map());
+  return {
+    /* add：申请一个条目 → {el, setActive(on), remove()}。
+       图标传内联 svg 字符串，标签是纯文本（插槽自己包成 .foot-btn-label——
+       裸文本节点拿不到"最多两行、超出裁断"的规则）；owner 只用于自检展示。
+       同 key 重挂会先撤旧的（组件热开关/热重载会走到这条路）。 */
+    add(def) {
+      const host = def0.host();
+      if (!host) return null; // 容器缺席（异常加载序）：静默跳过，不炸组件
+      const key = String(def.key);
+      if (reg.has(key)) reg.get(key).el.remove();
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = def0.itemClass;
+      if (def.id) btn.id = def.id;
+      if (def.title) btn.title = def.title;
+      btn.dataset.order = String(def.order == null ? 50 : def.order);
+      const seq = ++slotSeq;
+      btn.dataset.slotSeq = String(seq);
+      btn.innerHTML = (def.icon || '') + '<span class="' + def0.labelClass + '"></span>';
+      btn.querySelector('.' + def0.labelClass).textContent = def.label || '';
+      if (typeof def.onClick === 'function') btn.onclick = def.onClick;
+      host.appendChild(btn);
+      slotSort(host);
+      reg.set(key, { def, el: btn, seq });
+      return {
+        el: btn,
+        setActive(on) { btn.classList.toggle('active', !!on); },
+        remove() {
+          btn.remove();
+          const cur = reg.get(key);
+          if (cur && cur.el === btn) reg.delete(key);
+        },
+      };
+    },
+    /* list：插槽现状，按显示顺序（序号小的在前＝更靠下）列出 */
+    list() {
+      return [...reg.entries()]
+        .map(([key, v]) => ({
+          key,
+          order: parseFloat(v.el.dataset.order),
+          seq: v.seq,
+          label: v.el.querySelector('.' + def0.labelClass).textContent,
+          owner: v.def.owner || '',
+          active: v.el.classList.contains('active'),
+        }))
+        .sort((a, b) => a.order - b.order || a.seq - b.seq);
+    },
+  };
+};
+
+/* 自检：控制台敲 JX.slots() 看"每个插槽里有哪些条目、谁注册的、序号多少"
+   （排查"界面上看着在那儿、背后是谁注册的"用） */
+JX.slots = function () {
+  const out = {};
+  Object.keys(slotReg).forEach((name) => { out[name] = JX.slot(name).list(); });
+  return out;
+};
+
 window.JX = JX;
 
 const state = {
@@ -154,6 +249,7 @@ const state = {
   abort: null,
   pendingSteer: [], // 执行中已插话的消息（服务端为准）：模型调用中被立即打断生效；工具执行中等下一步调用模型注入
   pendingQueue: [], // 执行中排队的消息：本轮结束后自动作为独立一轮发送
+  pendingVer: 0,    // 已应用的待生效队列快照版本（服务端随快照递增）：晚到的旧快照回放会被丢弃，防幽灵虚线框
   queuePaused: false, // 排队是否暂停（服务端为准，随 pending 快照下发）
   queueHeld: false,   // 执行结束后队列仍有保留（停止/出错/暂停完一轮）：横幅给「继续」入口
   defaultWs: '',    // 默认工作区（文件夹），来自 /api/status
@@ -446,19 +542,20 @@ if (narrowMq) {
 
 window.addEventListener('resize', leaveNarrowIfNeeded);
 
-/* ---------- Markdown 渲染（围栏代码块、标题、列表、表格、行内样式、链接） ---------- */
-
-// 行内格式：代码 span → 粗体 → 链接（[文字](url) 与裸 http(s) URL）→ 文件路径。
-// 链接带 ext-link 类，点击由 app-chat.js 的委托处理器接管——在内嵌浏览器
-// （右栏面板）打开而非整页跳转；Ctrl/中键放行浏览器默认行为。
-// 转义次序：代码 span 先摘出占位（其中 URL 不做链接化），其余文本逐段 esc
-// 后拼链接，保证不破坏现有 XSS 防线。
+/* ---------- Markdown 渲染（marked v12 词法 + 自研白名单渲染器） ---------- */
 
 // 文件路径识别（对话中途输出的文件地址 → file-link，点击右栏预览）：
 // 盘符绝对路径或带分隔符的相对路径，且以字母开头的扩展名结尾（分隔符是
 // 硬条件——不然 "Node.js" 这类词全会被误判）；空白与中西文标点断开。
 // 含空格的路径在正文里无法安全判界（会吞掉后面的文字），只在反引号里认。
-const FILE_PATH_RE = /(?:[A-Za-z]:)?(?:[^\s`'"<>|:,，。；（）【】《》「」]*[\\/])+[^\s`'"<>|:,，。；（）【】《》「」]*[A-Za-z0-9\u4e00-\u9fff_]\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w.])/g;
+//
+// 分段里的字符类**必须排除分隔符**（下面第一个 [^…\\/]）。分段与分隔符共用同一
+// 字符类时，(?:[^…]*[\\/])+ 就是嵌套量词——分隔符既能被 * 吃掉又能被 [\\/] 吃掉，
+// 于是「多段斜杠、结尾没有扩展名」的正文（计划里的目录清单最常见）会指数级回溯：
+// 实测 a/b/c/…/z（25 段）单次扫描 13 秒、一份 1KB 的计划正文要 8.5 秒，右栏计划
+// 全文一渲染整个前端就卡死（gui-test/ask-fold-freeze.mjs 有前后对比）。分段与
+// 分隔符互斥后匹配结果一字不差，耗时降到 0.3ms 量级。
+const FILE_PATH_RE = /(?:[A-Za-z]:)?(?:[^\s`'"<>|:,，。；（）【】《》「」\\/]*[\\/])+[^\s`'"<>|:,，。；（）【】《》「」]*[A-Za-z0-9\u4e00-\u9fff_]\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w.])/g;
 
 // 反引号内容整体是否一个文件路径（模型习惯把产物路径用反引号包起来）：
 // 有分隔符 → 允许空格（反引号就是边界），只要以扩展名结尾且无引号/竖线；
@@ -487,99 +584,153 @@ function pathLinks(seg) {
   return out + esc(seg.slice(last));
 }
 
-function inlineFmt(s) {
-  const codes = [];
-  let t = s.replace(/`([^`\n]+)`/g, (_, c) => {
-    codes.push(c);
-    return '\x00' + (codes.length - 1) + '\x00';
-  });
-  // 裸 URL 只认 ASCII URL 字符：中文与全角标点（如句号逗号）处截断，避免把后面的正文吞进链接
-  const linkRe = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[A-Za-z0-9\-._~:\/?#\[\]@!$&'*+,;=%]+)/g;
-  let out = '', last = 0, m;
-  while ((m = linkRe.exec(t))) {
-    out += pathLinks(t.slice(last, m.index));
-    const href = m[1] !== undefined ? m[2] : m[0];
-    const text = m[1] !== undefined ? m[1] : m[0];
-    out += '<a class="ext-link" href="' + esc(href) + '" rel="noopener">' + esc(text) + '</a>';
-    last = m.index + m[0].length;
+// 解析交给 marked（web/marked.lib.js，GFM + breaks），HTML 由下面的 render 函数
+// 自己拼——这是安全边界：只产出这里写死的白名单标签与属性，源文本里的标签
+// 不可能原样出去（html token 一律 esc 成文字；链接/图片只放行 http(s)，其余
+// 协议整段按原文转义显示）。esc() 与 marked 自带的转义（codespan 内容、
+// escape 字符、图片 alt 已转义，直接用）是全部 HTML 出口。
+// 视觉契约与旧自研渲染器保持一致：标题 h2 起步、段落内单换行=br（breaks:
+// true）、链接 ext-link 类、行内代码路径识别（codeSpanIsPath→file-link）、
+// 裸 URL 只吞 ASCII URL 字符（marked 会把后随中文也吞进链接，renderLink 里
+// 切回来）。
+const MD_OPTS = { gfm: true, breaks: true };
+const MD_HTTP = /^https?:\/\//i; // 链接/图片唯一放行的协议
+const MD_URL_TAIL = /^[A-Za-z0-9\-._~:\/?#\[\]@!$&'*+,;=%]+/; // ASCII URL 字符集（旧渲染器口径）
+
+function extLink(href, text) {
+  return '<a class="ext-link" href="' + esc(href) + '" rel="noopener">' + text + '</a>';
+}
+
+function renderLink(t) {
+  // 裸 URL 自动链接的 token raw 以协议/www 开头；[文字](url) 与 <url> 形态以 [ / < 开头。
+  // GFM 自动链接允许 URL 含任意非空白字符——中文语境里 URL 后紧跟的正文/标点
+  // 会被一并吞进链接，这里按 ASCII 字符集把尾巴切下来还原成正文。
+  if (/^(?:https?:\/\/|www\.)/i.test(t.raw)) {
+    const m = t.raw.match(MD_URL_TAIL);
+    const url = m ? m[0] : t.raw;
+    const href = /^https?:/i.test(url) ? url : 'http://' + url;
+    return extLink(href, esc(url)) + (m ? pathLinks(t.raw.slice(m[0].length)) : '');
   }
-  out += pathLinks(t.slice(last));
-  out = out
-    .replace(/\x00(\d+)\x00/g, (_, i) => {
-      const c = codes[+i];
-      return codeSpanIsPath(c)
-        ? '<code><a class="file-link" data-path="' + esc(c) + '">' + esc(c) + '</a></code>'
-        : '<code>' + esc(c) + '</code>';
-    })
-    .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>');
+  if (!MD_HTTP.test(t.href || '')) return esc(t.raw); // 非白名单协议：整段原文转义
+  return extLink(t.href, renderInline(t.tokens));
+}
+
+function renderImage(t) {
+  if (!MD_HTTP.test(t.href || '')) return esc(t.raw);
+  // alt 已由 marked 转义；外链图懒加载且不带 referrer
+  return '<img src="' + esc(t.href) + '" alt="' + t.text + '" loading="lazy" referrerpolicy="no-referrer">';
+}
+
+// 行内 token → HTML（白名单：text/escape/codespan/strong/em/del/br/link/image）
+function renderInline(tokens) {
+  let out = '';
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'text': out += pathLinks(t.raw); break; // 纯文本：esc + 文件路径识别
+      case 'escape': out += esc(t.text); break;    // \* 反斜杠转义
+      case 'codespan': { // 内容 marked 已转义（&<>"' 全套）
+        const c = t.text;
+        out += codeSpanIsPath(c)
+          ? '<code><a class="file-link" data-path="' + c + '">' + c + '</a></code>'
+          : '<code>' + c + '</code>';
+        break;
+      }
+      case 'strong': out += '<strong>' + renderInline(t.tokens) + '</strong>'; break;
+      case 'em': out += '<em>' + renderInline(t.tokens) + '</em>'; break;
+      case 'del': out += '<del>' + renderInline(t.tokens) + '</del>'; break;
+      case 'br': out += '<br>'; break;
+      case 'link': out += renderLink(t); break;
+      case 'image': out += renderImage(t); break;
+      case 'html': out += esc(t.text); break; // 行内 HTML 不放行：按文字显示
+      default: out += pathLinks(String(t.raw != null ? t.raw : (t.text || ''))); break;
+    }
+  }
   return out;
 }
 
-function renderBlocks(seg) {
-  const lines = seg.split(/\r?\n/);
-  const out = [];
-  let i = 0;
-  const isTableSep = (l) => /^\s*\|[\s:|-]+\|\s*$/.test(l);
-  const isUl = (l) => /^\s*[-*]\s+\S/.test(l);
-  const isOl = (l) => /^\s*\d+[.、]\s+\S/.test(l);
-  const parseRow = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
-
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.trim()) { i++; continue; }
-
-    const h = line.match(/^(#{1,6})\s+(.*)$/);
-    if (h) {
-      const lv = Math.min(h[1].length + 1, 5); // 页面里 h2 起步
-      out.push(`<h${lv}>${inlineFmt(h[2])}</h${lv}>`);
-      i++; continue;
-    }
-
-    if (/^\s*\|.+\|\s*$/.test(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
-      const head = parseRow(line);
-      i += 2;
-      const rows = [];
-      while (i < lines.length && /^\s*\|.+\|\s*$/.test(lines[i])) rows.push(parseRow(lines[i++]));
-      let t = '<table><thead><tr>' + head.map((c) => `<th>${inlineFmt(c)}</th>`).join('') + '</tr></thead><tbody>';
-      for (const r of rows) t += '<tr>' + r.map((c) => `<td>${inlineFmt(c)}</td>`).join('') + '</tr>';
-      out.push(t + '</tbody></table>');
-      continue;
-    }
-
-    if (isUl(line) || isOl(line)) {
-      const ol = isOl(line) && !isUl(line);
-      const items = [];
-      while (i < lines.length && (ol ? isOl(lines[i]) : isUl(lines[i]))) {
-        items.push(lines[i].replace(ol ? /^\s*\d+[.、]\s+/ : /^\s*[-*]\s+/, ''));
-        i++;
+// 块级 token → HTML。inList：紧凑列表项内的裸文本不包 <p>（与 marked Parser
+// 的 loose 口径一致；顶层与松散列表包 <p>）。
+function renderBlocks(tokens, inList) {
+  let out = '';
+  for (const t of tokens || []) {
+    switch (t.type) {
+      case 'space': case 'def': break;
+      case 'heading': {
+        const lv = Math.min(t.depth + 1, 5); // 页面里 h2 起步（沿用旧渲染器）
+        out += '<h' + lv + '>' + renderInline(t.tokens) + '</h' + lv + '>';
+        break;
       }
-      out.push((ol ? '<ol>' : '<ul>') + items.map((it) => `<li>${inlineFmt(it)}</li>`).join('') + (ol ? '</ol>' : '</ul>'));
-      continue;
+      case 'paragraph': out += '<p>' + renderInline(t.tokens) + '</p>'; break;
+      case 'text': {
+        const inner = t.tokens ? renderInline(t.tokens) : pathLinks(String(t.text || ''));
+        out += inList ? inner : '<p>' + inner + '</p>';
+        break;
+      }
+      case 'code': out += '<pre><code>' + esc(t.text.replace(/\n$/, '')) + '</code></pre>'; break;
+      case 'blockquote': out += '<blockquote>' + renderBlocks(t.tokens) + '</blockquote>'; break;
+      case 'hr': out += '<hr>'; break;
+      case 'html': out += '<p>' + esc(t.text).replace(/\n/g, '<br>') + '</p>'; break; // 块级 HTML 按文字显示
+      case 'table': {
+        const cell = (c, align, head) => {
+          const tag = head ? 'th' : 'td';
+          const st = (align === 'center' || align === 'right') ? ' style="text-align:' + align + '"' : '';
+          return '<' + tag + st + '>' + renderInline(c.tokens) + '</' + tag + '>';
+        };
+        let h = '<table><thead><tr>';
+        t.header.forEach((c, i) => { h += cell(c, t.align[i], true); });
+        h += '</tr></thead><tbody>';
+        for (const row of t.rows) {
+          h += '<tr>';
+          row.forEach((c, i) => { h += cell(c, t.align[i], false); });
+          h += '</tr>';
+        }
+        out += h + '</tbody></table>';
+        break;
+      }
+      case 'list': {
+        const tag = t.ordered ? 'ol' : 'ul';
+        const start = t.ordered && t.start !== '' && t.start !== 1 ? ' start="' + parseInt(t.start, 10) + '"' : '';
+        let items = '';
+        for (const it of t.items) {
+          const loose = it.loose || t.loose;
+          let inner = renderBlocks(it.tokens, !loose);
+          if (it.task) {
+            const box = '<input type="checkbox" disabled' + (it.checked ? ' checked' : '') + '>';
+            inner = loose ? inner.replace('<p>', '<p>' + box + ' ') : box + ' ' + inner;
+          }
+          items += '<li>' + inner + '</li>';
+        }
+        out += '<' + tag + start + '>' + items + '</' + tag + '>';
+        break;
+      }
+      default:
+        out += t.tokens ? renderBlocks(t.tokens, inList)
+          : '<p>' + pathLinks(String(t.raw != null ? t.raw : '')) + '</p>';
     }
-
-    const para = [];
-    while (i < lines.length && lines[i].trim() &&
-      !/^#{1,6}\s/.test(lines[i]) && !/^\s*\|/.test(lines[i]) && !isUl(lines[i]) && !isOl(lines[i])) {
-      para.push(lines[i]); i++;
-    }
-    if (para.length) out.push(`<p>${inlineFmt(para.join('\n')).replace(/\n/g, '<br>')}</p>`);
-    else { out.push(`<p>${inlineFmt(line)}</p>`); i++; } // 兜底：流式输出中的半成品表格行走到这里，必须强制前进，否则外层循环死循环卡死页面
   }
-  return out.join('');
+  return out;
+}
+
+// 中文顿号序号（1、 2、）不是 GFM 列表语法（GFM 只认 1. / 1)），旧渲染器认。
+// 交给 marked 前原位换成「数字.」（围栏代码块内不动，只动缩进 ≤3 空格的行，
+// 避免碰缩进代码块）——列表标记不进渲染结果（<ol> 自己出号），无可见差异。
+function mdPre(src) {
+  if (!/、[ \t]/.test(src)) return src;
+  return src.split('```').map((p, i) =>
+    i % 2 === 1 ? p : p.replace(/(^|\n)([ \t]{0,3}\d+)、[ \t]+/g, '$1$2. ')
+  ).join('```');
 }
 
 function md(text) {
-  const parts = String(text ?? '').split('```');
-  let html = '';
-  parts.forEach((part, i) => {
-    if (i % 2 === 1) {
-      const code = part.replace(/^[a-zA-Z0-9_#+-]*\r?\n/, '');
-      html += `<pre><code>${esc(code)}</code></pre>`;
-    } else if (part.trim()) {
-      html += renderBlocks(part);
-    }
-  });
-  return html;
+  const src = String(text ?? '');
+  if (!src) return '';
+  const fallback = () => '<p>' + esc(src).replace(/\n/g, '<br>') + '</p>';
+  if (typeof marked === 'undefined') return fallback(); // marked 缺席：按纯文字，绝不抛错
+  try {
+    return renderBlocks(marked.lexer(mdPre(src), MD_OPTS), false);
+  } catch (e) {
+    return fallback(); // 解析异常：全文按文字，不让渲染错误打断界面
+  }
 }
 
 function relTime(s) {
@@ -812,7 +963,7 @@ const mainView = {  key: 'main',
 };
 const subState = {
   cur: null, msgs: [], streaming: false, abort: null,
-  streamText: '', streamThinking: '', pendingSteer: [], pendingQueue: [],
+  streamText: '', streamThinking: '', pendingSteer: [], pendingQueue: [], pendingVer: 0,
   queuePaused: false, queueHeld: false,
 };
 const subView = {
@@ -883,7 +1034,7 @@ function upsertSessionBrief(s) {
   renderSessionList();
 }
 
-/* ---------- 数字经理的版本（下拉选择，只在设置页一处） ----------
+/* ---------- 长期助理的版本（下拉选择，只在设置页一处） ----------
    主对话现在有多个「版本」（见 assistant_versions.go）：每一版都是独立的数字助理，
    老版本的历史 / 快照 / 交付原样留着，切回去接着聊。**入口只有一个**——版本不铺开成
    一串同样的条目，也不往侧栏塞控件：只在设置页「跟长期助理对话」那一节用一个下拉选

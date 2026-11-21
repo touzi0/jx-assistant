@@ -39,6 +39,7 @@ type App struct {
 	Plugins          *PluginRegistry      // DSH 插件兼容层实现（adapters.go：插件兼容层/ + adapter_*.go）
 	Layers           *PluginLayerRegistry // 插件兼容层注册表：主体发现的全部插件体系（pluginlayers.go）
 	Components       *ComponentRegistry
+	SessionCX        *sessionCXRegistry  // 会话级组件/插件开关覆盖（sessioncx.go：优先于全局开关，按会话存）
 	CCPlugins        *CCPluginRegistry   // Claude Code 插件兼容层实现（ccplugin*.go）
 	MCPServers       *MCPServersRegistry // 独立 MCP 服务器注册表（mcpservers*.go）：用户直连 MCP 服务
 	Todos            *todoScheduler      // 待办与定时任务：组件 组件/todo-scheduler 的宿主半边（todo.go）
@@ -54,8 +55,12 @@ type App struct {
 	sessLocks           map[string]*sync.Mutex
 	compactMu           sync.Mutex                   // 规则自动压缩的 token 用量基线锁（context.go）
 	compactUsage        map[string]*compactUsageMark // 会话id → 最近 usage 与压缩基线（间隔制 token 模式的触发依据，context.go）
+	compactRunMu        sync.Mutex                   // 手动模型摘要压缩的会话级互斥锁（server.go）
+	compactRunning      map[string]bool              // 会话id → 后台模型摘要进行中（拦截重复点火；前端「后台压缩中」状态同源）
 	runMu               sync.Mutex
-	runners             map[string]*sessionRun // 正在执行的会话（含后台派发）
+	runners             map[string]*sessionRun  // 正在执行的会话（含后台派发）
+	mgrTurns            map[string]mgrTurnGrant // 经理代批的轮次级授权（mgrnotify.go）：会话id → 授权的那一轮；runMu 保护
+	mgrTurnGen          map[string]int64        // 经理代批授权的撤销代数（mgrnotify.go）：用户亲发消息递增，晚到的旧授权作废；runMu 保护
 	permMu              sync.Mutex
 	grants              map[string]*Grant        // 授权凭证（perm.go）
 	approvals           map[string]*Approval     // 等待用户决定的越权审批（perm.go）
@@ -65,7 +70,10 @@ type App struct {
 	questions           map[string]*UserQuestion // 等待用户回答的提问/计划审批（interact.go）
 	jobsMu              sync.Mutex
 	jobs                map[string]*jobRun // 会话内后台作业（jobs.go）
-	protectPaths        []string           // 助手自身配置/数据目录，任何模式禁访问
+	bridgeMu            sync.Mutex
+	bridgeTokens        map[string]*bridgeToken // run_python 工具桥的一次性凭证（bridge.go）
+	bridgeWaits         map[string]*bridgeWait  // 桥派子任务的回报收集表（bridge.go）
+	protectPaths        []string                // 助手自身配置/数据目录，任何模式禁访问
 	skillsMu            sync.Mutex
 	skillsReady         bool   // 技能母本是否已释放（SkillsDir 首次解析后置位）
 	skillsDirOurs       string // 已解析的技能目录（App 级缓存，避免跨实例污染）
@@ -86,6 +94,7 @@ type App struct {
 	pendingSteer        map[string][]*PendingMsg // 执行中会话的插话（下一次调用模型前生效）
 	pendingQueue        map[string][]*PendingMsg // 执行中会话的排队（本轮结束后作为独立一轮发送）
 	queuePaused         map[string]bool          // 会话队列是否暂停（暂停后本轮结束不自动续发；恢复时空闲即接着发）
+	pendVer             map[string]int64         // 会话待生效队列的变更版本号（锁内递增，随快照下发）：前端据此丢弃晚到的旧快照，防「插话已排水、旧快照回放又画出虚线框」
 	errMu               sync.Mutex
 	runErrors           map[string]string // 会话最近一次失败原因（前端输入框上方报错条 + 重试）
 	stopWatchdog        time.Duration     // 停止看门狗：协作取消后等多久仍未收口就强制终结（runtime.go watchStop）
@@ -114,6 +123,12 @@ type App struct {
 	panelMainWnd  uintptr
 	panels        map[string]browserTarget // 键=browserProfileKey（""=共享面板，兼容无会话上下文的入口）
 	panelVisible  string
+	// panelOverlayYield HTML 浮层让位标记（atomic；handleBrowserPanelOverlay 写，
+	// 面板 applyRectOnUI/reassertTopOnUI 读）：桌面壳里 HTML 无法浮于原生浏览器
+	// 面板之上，设置等全屏 .modal 打开期间=1——面板 Z 序压到主 WebView2 之下，
+	// 浮层完整显示；关闭恢复提顶。App 级而非面板级：浮层开着时才惰性创建的面板
+	// 首次落位同样让位；前端热重启（panelFrontendReset）整体清零复位。
+	panelOverlayYield int32
 
 	// 远程帧镜像缓存（handleBrowserFrame）：右栏浏览器画面按会话缓存最后一帧
 	// （内容指纹去重 + 最小间隔节流），远程端轮询命中缓存就不再截图。
@@ -166,6 +181,13 @@ func NewApp(cfg *Config, cfgPath, webDir string) (*App, error) {
 		permNotes: map[string]string{},
 		questions: map[string]*UserQuestion{}, jobs: map[string]*jobRun{},
 		remotes: map[string]*remoteClient{}}
+	// 启动先结算「上次运行中因文件被占用而暂存的组件包」：此刻还没有任何组件
+	// worker / 语音输入法进程起来，组件目录没人占用，替换一次就成
+	// （见 update_blocks.go 的 ApplyPendingComponentBlocks）。必须排在 Bridge
+	// （worker 宿主）与 main 里的 spawnVoiceType 之前。
+	a.ApplyPendingComponentBlocks()
+	// 会话级组件/插件覆盖（sessioncx.go）：从各会话的附属数据载入
+	a.SessionCX = loadSessionCX(store)
 	a.Ctx = &ContextEngine{app: a} // 上下文引擎：所有会话经它组装与记事件
 	// Claude Code 插件兼容层：加载已安装插件，后台连接 MCP 服务器、装载 mods
 	// （失败记日志不阻断）
@@ -199,6 +221,9 @@ func NewApp(cfg *Config, cfgPath, webDir string) (*App, error) {
 	a.assertManagerChannel()
 	// 迁移任务（Flyway 式账本）：一次性清理/搬家在这里跑，执行过记账不再跑
 	a.runMigrations()
+	// 用户入口自愈（后台、幂等）：桌面/开始菜单快捷方式不依赖安装形态补齐
+	// （2026-11-20 换名事故：绿色目录机器换名后没有任何入口）
+	go ensureProductShortcuts()
 	a.recoverInterrupted()
 	// 交付队列崩溃残留兜底：上一进程若死在执行中（running），复位回 pending
 	// 并统一重放——登记过的交付不能因为重启就丢
@@ -287,6 +312,10 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "GET /api/voicetype/history/wav", a.handleVoicetypeHistoryWav, apiMeta{Summary: "第 i 条记录的原始语音（wav，试听）", Params: "i=序号", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/voicetype/history/reidentify", a.handleVoicetypeHistoryReidentify, apiMeta{Summary: "重新识别第 i 条记录", Params: "i=序号；输入法在跑则交它做（走完整分发）", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/models", a.handleModels, apiMeta{Summary: "模型清单（全部渠道）", Perm: permReadOnly})
+	// 用户记忆（组件 user-memory，usermemory.go）：设置页与长期助理（call_api
+	// 整文件通道）共用；未启用时 404。
+	a.apiRoute(mux, "GET /api/user-memory", a.handleUserMemoryGet, apiMeta{Summary: "读用户记忆（用户称呼/身份与喜好/AI 名字/AI 身份/对话气泡颜色）", Perm: permReadOnly})
+	a.apiRoute(mux, "POST /api/user-memory", a.handleUserMemorySet, apiMeta{Summary: "按字段保存用户记忆（未给出的字段保持不变，各字段上限 1000 字自动截断）", Params: "userName、userMemory、aiName、aiIdentity、bubbleColor 均可选", Perm: permWorkspace})
 	a.apiRoute(mux, "POST /api/llm/ask", a.handleLLMAsk, apiMeta{Summary: "独立单轮模型调用（一次请求一次输出，不进会话上下文）", Params: "system、user、session 可选（跟随该会话的模型）", Perm: permWorkspace})
 	a.apiRoute(mux, "GET /api/modes", a.handleChatModes, apiMeta{Summary: "工作模式清单（新建会话可选的模式）", Perm: permReadOnly}) // 工作模式清单（chatmodes.go）：模式下拉与 dispatch_task 的 mode 参数同一数据源
 	mux.HandleFunc("POST /api/providers", a.handleUpsertProvider)
@@ -297,6 +326,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "GET /api/sessions", a.handleListSessions, apiMeta{Summary: "会话列表", Params: "parent=按父会话查子对话", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/sessions", a.handleCreateSession, apiMeta{Summary: "新建会话", Params: "mode/workspace/title/provider/model/permission/planMode/parent/inheritContext 等", Perm: permWorkspace})
 	a.apiRoute(mux, "GET /api/sessions/{id}", a.handleGetSession, apiMeta{Summary: "会话详情（含运行态/排队/最近错误）", Perm: permReadOnly})
+	a.apiRoute(mux, "GET /api/sessions/{id}/inherit", a.handleSessionInherit, apiMeta{Summary: "子对话承接段的更早历史（懒加载，只读）", Params: "before_seq=父会话游标、limit≤500（缺省 200）", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/sessions/{id}/messages", a.handleSessionMessages, apiMeta{Summary: "会话消息轻量文本列表", Params: "role 过滤（如 user）、limit 从最新往回收", Perm: permReadOnly})
 	a.apiRoute(mux, "PATCH /api/sessions/{id}", a.handlePatchSession, apiMeta{Summary: "改会话设置", Params: "title/model/provider/permission/thinking/archived/unread 等", Perm: permWorkspace})
 	a.apiRoute(mux, "DELETE /api/sessions/{id}", a.handleDeleteSession, apiMeta{Summary: "删除会话（历史不可恢复）", Perm: permWorkspace, Danger: "删除会话及其全部历史，不可恢复"})
@@ -306,7 +336,10 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "POST /api/sessions/{id}/retry", a.handleRetry, apiMeta{Summary: "失败后带着上下文重试一轮", Perm: permWorkspace})
 	a.apiRoute(mux, "POST /api/sessions/{id}/interject", a.handleInterject, apiMeta{Summary: "执行中发消息（插话/排队）", Params: "content、mode=steer|queue", Perm: permWorkspace})
 	a.apiRoute(mux, "POST /api/sessions/{id}/pending", a.handlePending, apiMeta{Summary: "排队坞操作", Params: "action=remove|steer|move|pause|resume", Perm: permWorkspace})
-	a.apiRoute(mux, "POST /api/sessions/{id}/compact", a.handleCompact, apiMeta{Summary: "手动压缩会话历史为摘要", Params: "upTo=压缩到哪条", Perm: permWorkspace})
+	a.apiRoute(mux, "POST /api/sessions/{id}/compact", a.handleCompact, apiMeta{Summary: "手动压缩会话历史为摘要（模型摘要后台执行，立即返回）", Params: "upTo=压缩到哪条", Perm: permWorkspace})
+	// 右键上下文菜单「提前自动压缩」：对当前会话手动点火一次自动压缩线路
+	//（autoCompactKick），与上面的手动全量压缩是并存的两条线路。
+	a.apiRoute(mux, "POST /api/sessions/{id}/autocompact", a.handleAutoCompact, apiMeta{Summary: "提前自动压缩：不等阈值到点，按设置的保留字数手动点火一次自动压缩线路", Perm: permWorkspace})
 	// 设置 · 对话历史与压缩：数字助理主对话按「版本」管理（见 assistant_versions.go）。
 	// 当前是哪一版由库里的指针决定，前端只照版本清单显示与切换；压缩固定走
 	// 模型摘要；清空只作用于当前这一版（设置页已换成「新建一版」，接口留着）。
@@ -325,13 +358,14 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/events", a.handleEvents)
 	mux.HandleFunc("GET /api/p2p-shell", a.handleP2PShell)
 	mux.HandleFunc("GET /api/shell-hash", a.handleShellHash)
-	mux.HandleFunc("POST /api/shell-bump", a.handleShellBump)     // 「关于」页一键清远程端缓存：外壳代数 +1
+	mux.HandleFunc("POST /api/shell-bump", a.handleShellBump)     // 远程端缓存兜底清零：外壳代数 +1（原「关于」页按钮已撤，接口留着给 call_api/排障用）
 	mux.HandleFunc("POST /api/webrtc-offer", a.handleWebRTCOffer) // P2P 直连信令：SDP 换 answer（p2pdirect.go，DataChannel 鉴权另过 auth 帧）
 	mux.HandleFunc("POST /api/feedback", a.handleFeedbackCreate)
 	mux.HandleFunc("POST /api/open-folder", a.handleOpenFolder)
 	// 把主窗口顶到用户眼前（提醒触发时后端已直接调用同一实现；这个入口给
 	// 前端/自测用，flashOnly=true 只走任务栏闪烁 + 托盘通知那条兜底路径）
 	mux.HandleFunc("POST /api/desktop/front", a.handleDesktopFront)
+	mux.HandleFunc("POST /api/alert/screen", a.handleAlertScreenHide)
 	mux.HandleFunc("GET /api/pick-folder", a.handlePickFolder)
 	mux.HandleFunc("GET /api/pick-file", a.handlePickFile)
 	a.apiRoute(mux, "POST /api/sessions/{id}/fork", a.handleFork, apiMeta{Summary: "从某条消息分支新会话", Params: "seq=分支点", Perm: permWorkspace})
@@ -339,6 +373,10 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "POST /api/sessions/{id}/file-rewind", a.handleFileRewind, apiMeta{Summary: "把文件回退到某个历史版本", Params: "path、seq", Perm: permWorkspace})
 	a.apiRoute(mux, "GET /api/sessions/{id}/file-versions", a.handleFileVersions, apiMeta{Summary: "某文件的历史版本清单", Params: "path", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/sessions/{id}/file-version", a.handleFileVersion, apiMeta{Summary: "取某文件某个历史版本正文", Params: "path、seq", Perm: permReadOnly})
+	// 右栏「文件」视图的编辑模式（fileedit.go）：用户手势直通，不进 call_api 目录
+	//（写文件的能力留在人手——总控刻意不配写工具，不能从这里绕道拿到写入口）。
+	mux.HandleFunc("GET /api/sessions/{id}/file", a.handleFileContent)
+	mux.HandleFunc("POST /api/sessions/{id}/file", a.handleFileSave)
 	mux.HandleFunc("POST /api/sessions/{id}/delivery/open", a.handleDeliveryOpenFile)
 	mux.HandleFunc("POST /api/sessions/{id}/delivery/reveal", a.handleDeliveryReveal)
 	mux.HandleFunc("GET /api/sessions/{id}/delivery/download", a.handleDeliveryDownload)
@@ -357,7 +395,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.apiRoute(mux, "GET /api/approvals", a.handleListApprovals, apiMeta{Summary: "待决定的越权审批清单", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/approvals/{id}", a.handleResolveApproval, apiMeta{Summary: "审批决定", Params: "approved、always", Perm: permWorkspace})
 	a.apiRoute(mux, "GET /api/questions", a.handleListQuestions, apiMeta{Summary: "待回答的提问/计划审批清单", Perm: permReadOnly})
-	a.apiRoute(mux, "POST /api/questions/{id}", a.handleResolveQuestion, apiMeta{Summary: "回答提问/计划审批", Params: "answer（计划批准=__approve__、忽略=__ignore__）", Perm: permWorkspace})
+	a.apiRoute(mux, "POST /api/questions/{id}", a.handleResolveQuestion, apiMeta{Summary: "回答提问/计划审批", Params: "answer（计划批准=__approve__、取消=__ignore__）", Perm: permWorkspace})
 	a.apiRoute(mux, "POST /api/workspace/test", a.handleTestWorkspace, apiMeta{Summary: "测试 SSH 远程工作区连通性", Params: "remote 配置", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/workspace/ls", a.handleWorkspaceLs, apiMeta{Summary: "浏览远程工作区目录", Params: "remote、path", Perm: permReadOnly})
 	// 已登记远程工作区（remotelist.go）：工作目录面板的远程条目
@@ -375,8 +413,18 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/experts", a.handleUpsertExpert)
 	mux.HandleFunc("POST /api/experts/delete", a.handleDeleteExpert)
 	a.apiRoute(mux, "POST /api/sessions/{id}/remote", a.handleSetSessionRemote, apiMeta{Summary: "设置/解除 SSH 远程工作区", Params: "remote 配置或 clear=true", Perm: permWorkspace})
-	mux.HandleFunc("GET /api/plugins", a.handleListPlugins)
-	mux.HandleFunc("POST /api/plugins", a.handleSetPlugin)
+	// 插件兼容层统一清单与总开关（pluginlayers.go 的各层注册）：与组件同口径
+	// 开放给 call_api（?s= / session 的会话级覆盖一并可用）。
+	a.apiRoute(mux, "GET /api/plugins", a.handleListPlugins, apiMeta{
+		Summary: "插件清单（各兼容层的插件 + 层信息）；带 s=会话id 返回该会话的生效视图",
+		Params:  "s 可选（会话id＝会话级生效视图）",
+		Perm:    permReadOnly,
+	})
+	a.apiRoute(mux, "POST /api/plugins", a.handleSetPlugin, apiMeta{
+		Summary: "开关插件（带 session＝只改该会话的覆盖，全局开关不动）",
+		Params:  "id、enabled；layer 可选（层 id，缺省按 id 在全部层里唯一匹配）、session 可选（会话id＝会话级覆盖）",
+		Perm:    permWorkspace,
+	})
 	mux.Handle("GET /_plugins/", http.HandlerFunc(a.handlePluginAsset))
 	// Claude Code 插件兼容层（ccplugin*.go）：安装/开关/市场/命令清单
 	mux.HandleFunc("GET /api/cc-plugins", a.handleListCCPlugins)
@@ -394,8 +442,47 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/mcp/upload", a.handleUploadMCPServers)
 	mux.HandleFunc("GET /api/mcp/catalog", a.handleMCPCatalog)
 	mux.HandleFunc("POST /api/mcp/catalog/install", a.handleMCPCatalogInstall)
-	mux.HandleFunc("GET /api/components", a.handleListComponents)
-	mux.HandleFunc("POST /api/components", a.handleSetComponent)
+	// 组件两档（内置 组件/ 与用户 组件/user/）同一套接口：清单、开关（含会话级
+	// 覆盖 ?s= / session）、用户组件卸载。开放给 call_api 让长期助理能查能开关。
+	a.apiRoute(mux, "GET /api/components", a.handleListComponents, apiMeta{
+		Summary: "组件清单（内置组件 + 用户组件，builtin 标记归属）；带 s=会话id 返回该会话的生效视图",
+		Params:  "s 可选（会话id＝会话级生效视图）；rescan=1 可选（先重扫组件目录：平时清单是纯读，重扫只挂在打开设置页）",
+		Perm:    permReadOnly,
+	})
+	a.apiRoute(mux, "POST /api/components", a.handleSetComponent, apiMeta{
+		Summary: "开关组件（带 session＝只改该会话的覆盖，全局开关不动）",
+		Params:  "id、enabled；可选 session（会话id＝会话级覆盖）",
+		Perm:    permWorkspace,
+	})
+	a.apiRoute(mux, "POST /api/components/delete", a.handleDeleteComponent, apiMeta{
+		Summary: "卸载一个用户组件（组件/user/<id> 目录删除；内置组件拒绝，只能关开关）",
+		Params:  "id",
+		Perm:    permWorkspace,
+		Danger:  "删除用户组件目录与设置，不可恢复（重装需走市场或手动放回组件/user/）",
+	})
+	// 会话级组件配置（合并层，见 sessioncx.go 文件头）：会话独立时组件的存储
+	// 读写落在会话覆盖上，读取按「会话覆盖 > 全局值」合并——组件零改动。
+	a.apiRoute(mux, "GET /api/components/cfg", a.handleComponentCfgGet, apiMeta{
+		Summary: "某会话的组件配置视图（总开关 + 每组件「会话独立/跟随全局」与覆盖值）",
+		Params:  "s=会话id（必填）",
+		Perm:    permReadOnly,
+	})
+	a.apiRoute(mux, "POST /api/components/cfg", a.handleComponentCfgSet, apiMeta{
+		Summary: "写/删一条会话级组件配置覆盖（组件需在该会话处于「会话独立」）",
+		Params:  "session、id、key、value（缺省或 null＝删这条，回落到全局值）",
+		Perm:    permWorkspace,
+	})
+	a.apiRoute(mux, "POST /api/components/cfg/mode", a.handleComponentCfgMode, apiMeta{
+		Summary: "切换某组件在该会话是「会话独立」还是「跟随全局」（跟随＝删它的会话覆盖）",
+		Params:  "session、id、on（true=会话独立 / false=跟随全局）",
+		Perm:    permWorkspace,
+	})
+	a.apiRoute(mux, "POST /api/components/cfg/scope", a.handleComponentCfgScope, apiMeta{
+		Summary: "会话级组件设置总开关（一键切全场）：开＝本对话独立，关＝清空覆盖回落全局",
+		Params:  "session、on",
+		Perm:    permWorkspace,
+		Danger:  "关掉会清空该会话的全部组件配置覆盖（回落全局值），不可恢复",
+	})
 	// 组件浏览器半边资产挂在 /api/ 下（而非独立 /_components/ 前缀）：前端 cx.js
 	// 统一用 fetch 拿资产，远程模式下 /api/ 前缀经 remote-boot 的 fetch 劫持自动
 	// 走中继隧道——旧 /_components/ 标签相对网关 origin 解析必 404，远程组件全体消失
@@ -413,7 +500,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/market/publish-meta", a.handleMarketPublishMeta) // 已装技能的发布元信息推导（弹层预填）
 	mux.HandleFunc("POST /api/market/publish", a.handleMarketPublish)         // 发布已装技能到市场服务器：先装后传（market_publish.go）
 	mux.HandleFunc("POST /api/market/unpublish", a.handleMarketUnpublish)     // 下架自己发布的市场条目（归属校验在服务端）
-	// 小程序平台内嵌代理（sitesproxy.go）：路径与服务端平台页依赖一一对应，前端
+	// 企业小程序内嵌代理（sitesproxy.go）：路径与服务端平台页依赖一一对应，前端
 	// iframe 加载本地同源 /sites——证书校验由 companyTransport 接管，浏览器/WebView
 	// 自己的证书校验不再挡路（同企业技能市场的"前端不直连服务端"经验）。
 	// 必须带方法限定注册：仓库里已有 "GET /"（静态前端），不带方法的模式会与其
@@ -424,6 +511,14 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 		mux.HandleFunc(m+" /s/", a.handleSitesProxy)
 		mux.HandleFunc(m+" /api/sites/", a.handleSitesProxy)
 		mux.HandleFunc(m+" /api/whoami", a.handleSitesProxy)
+	}
+	// 个人中心（充值门户，portalproxy.go）内嵌代理：充值组件（组件/portal）的浮窗
+	// iframe 加载本地同源 /portal——路径与服务端门户一一对应（门户页自身就用
+	// /portal 前缀，API 全在 /portal/api/*），证书校验由 companyTransport 接管。
+	// 代理端点常驻主程序（组件开关只控制三处入口 UI，与 sites 代理同一口径）。
+	for _, m := range []string{"GET", "POST"} {
+		mux.HandleFunc(m+" /portal", a.handlePortalProxy)
+		mux.HandleFunc(m+" /portal/", a.handlePortalProxy)
 	}
 	// 公司接入向导（wizard.go）：局域网发现 + 总服务器查询 + 一键应用配置
 	mux.HandleFunc("POST /api/wizard/discover", a.handleWizardDiscover)
@@ -450,12 +545,17 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/device/poll", a.handleDevicePoll)
 	mux.HandleFunc("POST /api/device/result", a.handleDeviceResult)
 	mux.HandleFunc("GET /api/device/selftest", a.handleDeviceSelftest)
+
+	// run_python 工具桥（bridge.go）：脚本以本会话身份调白名单工具/派子任务。
+	// 与设备桥同款回环闸（仅 127.0.0.1 可达，LAN/远程 403）。
+	mux.HandleFunc("POST /api/bridge/tool", a.handleBridgeTool)
 	// 浏览器（browser_host.go / browser_panel_windows.go）：桌面右栏是原生
 	// WebView2 面板（前端经 panel-rect 上报占位区矩形），navigate/viewport/
 	// state 面向内嵌形态目标；open-view/view 是聊天链接与 html 交付文件点开
 	// 的入口（远程工作区的 html 经 view 流式渲染）。旧 MJPEG 帧流与输入镜像
 	// 端点已随镜像方案移除
 	mux.HandleFunc("POST /api/browser/panel-rect", a.handleBrowserPanelRect)
+	mux.HandleFunc("POST /api/browser/panel-overlay", a.handleBrowserPanelOverlay)
 	mux.HandleFunc("POST /api/browser/navigate", a.handleBrowserNavigate)
 	mux.HandleFunc("POST /api/browser/viewport", a.handleBrowserViewport)
 	mux.HandleFunc("GET /api/browser/state", a.handleBrowserState)
@@ -501,6 +601,8 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	a.Plugins.MountRoutes(a, mux)
 	// 品牌下发（brand_sync.go）：前端启动拉一次文字配置，brand 事件到达时重拉
 	mux.HandleFunc("GET /api/brand", a.handleBrand)
+	// 关于页固定 LOGO（brand_sync.go）：只出内置默认图，不吃品牌缓存
+	mux.HandleFunc("GET /logo-default.png", a.handleDefaultLogo)
 	mux.HandleFunc("GET /", a.handleStatic)
 }
 
@@ -555,6 +657,15 @@ func (a *App) handleListPlugins(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"layers": []LayerInfo{}, "plugins": []LayerPlugin{}})
 		return
 	}
+	// ?s=<会话id>：该会话的生效视图（会话覆盖优先于全局开关）+ sessionCustom 标记
+	if sid := strings.TrimSpace(r.URL.Query().Get("s")); sid != "" {
+		writeJSON(w, 200, map[string]any{
+			"layers":        a.Layers.Infos(),
+			"plugins":       a.cxoPluginList(sid),
+			"sessionCustom": a.SessionCX.custom(sid),
+		})
+		return
+	}
 	writeJSON(w, 200, map[string]any{"layers": a.Layers.Infos(), "plugins": a.Layers.AllPlugins()})
 }
 
@@ -563,6 +674,7 @@ func (a *App) handleSetPlugin(w http.ResponseWriter, r *http.Request) {
 		Layer   string `json:"layer"` // 来源体系（层 id；缺省=全部层里按 id 唯一匹配）
 		ID      string `json:"id"`
 		Enabled bool   `json:"enabled"`
+		Session string `json:"session"` // 会话id：带它＝只改本会话的覆盖，全局开关不动
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.ID) == "" {
 		writeErr(w, 400, "需要 id 与 enabled")
@@ -570,6 +682,23 @@ func (a *App) handleSetPlugin(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.Layers == nil {
 		writeErr(w, 500, "插件兼容层未初始化")
+		return
+	}
+	// 会话级覆盖：写入前先按同款规则定位插件（不存在＝404），再落覆盖记录
+	if sid := strings.TrimSpace(body.Session); sid != "" {
+		if _, err := a.Store.Get(sid); err != nil {
+			writeErr(w, 404, "会话不存在")
+			return
+		}
+		if !a.pluginGlobalKnown(body.Layer, body.ID) {
+			writeErr(w, 404, errPluginNotFound.Error())
+			return
+		}
+		a.cxoSetPlugin(sid, body.Layer, body.ID, body.Enabled)
+		writeJSON(w, 200, map[string]any{
+			"ok": 1, "plugins": a.cxoPluginList(sid),
+			"sessionCustom": a.SessionCX.custom(sid),
+		})
 		return
 	}
 	if err := a.Layers.SetEnabled(body.Layer, body.ID, body.Enabled); err != nil {
@@ -709,9 +838,15 @@ func likePattern(q string) string {
 	return "%" + r.Replace(q) + "%"
 }
 
-// 可搜索的会话范围基座 = 侧栏可见范围：非助理主对话、非子会话。
-// 归档与目录过滤由 searchScopeWhere 按 bin/ws 参数装配（都缺省时等价旧行为 archived = 0）。
-const searchableSessionsBaseSQL = `mode != 'assistant' AND parent_id = ''`
+// searchableBaseSQL 生成「可搜索的会话范围」基座：只排除**数字助理主对话本体**
+// （mode=assistant 且没有父）。不能按 mode 一刀切——子对话会继承父会话的 mode，
+// 从长期助理克隆出来的子对话 mode 也是 assistant，那样它们归档后连回收站都搜
+// 不到（2026-11-16 事故：4 条归档子对话既不在下拉、也不在回收站、还搜不到）。
+// 「子会话只在回收站出现」这件事由 searchScopeWhere 按 bin 装配（正常视图追加
+// parent_id = ''）。pfx 为列名前缀（内容搜索是 join 查询，要 "s."）。
+func searchableBaseSQL(pfx string) string {
+	return `NOT (` + pfx + `mode = 'assistant' AND ` + pfx + `parent_id = '')`
+}
 
 // searchScopeWhere 按请求参数组装会话范围条件（pfx 为列名前缀，如 "s."）：
 //
@@ -726,6 +861,10 @@ func searchScopeWhere(r *http.Request, pfx string) (string, []any) {
 	cond := pfx + "archived = 0"
 	if bin {
 		cond = pfx + "archived = 1"
+	} else {
+		// 正常视图只搜顶层会话：子会话（含继承 assistant 的子对话）挂在主对话的
+		// 右栏里，归档后才在回收站那一侧出现（与左栏列表口径一致）。
+		cond += " AND " + pfx + "parent_id = ''"
 	}
 	var args []any
 	readList := func(key string) []string {
@@ -775,7 +914,7 @@ func (a *App) handleSearchTitle(w http.ResponseWriter, r *http.Request) {
 	scope, scopeArgs := searchScopeWhere(r, "")
 	rows, err := a.Store.db.Query(
 		`SELECT id, title, updated_at FROM sessions
-		 WHERE `+searchableSessionsBaseSQL+` AND `+scope+` AND title LIKE ? ESCAPE '\'
+		 WHERE `+searchableBaseSQL("")+` AND `+scope+` AND title LIKE ? ESCAPE '\'
 		 ORDER BY updated_at DESC LIMIT 50`,
 		append(scopeArgs, likePattern(q))...)
 	if err != nil {
@@ -807,7 +946,7 @@ func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.Store.db.Query(
 		`SELECT m.session_id, s.title, m.seq, m.role, m.content, m.created_at
 		 FROM messages m JOIN sessions s ON s.id = m.session_id
-		 WHERE s.`+searchableSessionsBaseSQL+` AND `+scope+`
+		 WHERE `+searchableBaseSQL("s.")+` AND `+scope+`
 		   AND m.kind = 'chat' AND m.content IS NOT NULL
 		   AND (m.role = 'user'
 		        OR (m.role = 'assistant' AND (m.tool_calls IS NULL OR m.tool_calls = '')))
@@ -954,10 +1093,9 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		for _, m := range p.Models {
-			levels := m.ReasoningLevels
-			if len(levels) == 0 { // 老配置未存档位：按 ID 现场推断
-				levels = guessReasoningLevels(m.ID)
-			}
+			// 存储的档位若是旧版推断写死的（无手工编辑入口），跟随新版本刷新
+			//（推断按渠道协议+模型 ID，同一模型在不同协议下档位不同）
+			levels := effectiveReasoningLevels(p.Protocol, m.ID, m.ReasoningLevels)
 			items = append(items, modelItem{p.ID, p.Name, m.ID, m.Name, m.ContextWindow, levels, !p.IsSelectable(), via})
 		}
 	}
@@ -968,21 +1106,30 @@ func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
 		"defaultModel":    t.Model,
 		// 公司通道额度快照（模型菜单顶部显示；服务端下发才有，私人通道场景为空）
 		"companyQuota": a.Cfg.CompanyQuota,
+		// 门户充值入口（2026-11-13 充值组件）：充值组件拿它判入口显隐（报错条
+		//「去充值」等场景）；空=服务端没开门户，入口隐藏
+		"portalURL": a.Cfg.PortalURL,
 	})
 }
 
-// resolveProviderDraft 把请求里的 id/baseURL/apiKey 折算成一个可用的提供方：
-// 没存过的 id（或新增卡片）直接用请求里带来的地址与密钥，便于未保存先拉取/测试。
-func (a *App) resolveProviderDraft(id, baseURL, apiKey string) (*ProviderCfg, error) {
+// resolveProviderDraft 把请求里的 id/baseURL/apiKey/protocol 折算成一个可用的
+// 提供方：没存过的 id（或新增卡片）直接用请求里带来的地址与密钥，便于未保存
+// 先拉取/测试；预置模板的协议（如 Anthropic）在 id 命中预置时自动带上。
+func (a *App) resolveProviderDraft(id, baseURL, apiKey, protocol string) (*ProviderCfg, error) {
 	eff := &ProviderCfg{}
 	if p := a.providerByID(strings.TrimSpace(id)); p != nil {
 		*eff = *p
+	} else if preset, ok := PresetByID(strings.TrimSpace(id)); ok {
+		*eff = preset
 	}
 	if u := strings.TrimSpace(baseURL); u != "" {
 		eff.BaseURL = u
 	}
 	if k := strings.TrimSpace(apiKey); k != "" {
 		eff.APIKey = k
+	}
+	if v := strings.TrimSpace(protocol); v != "" {
+		eff.Protocol = v
 	}
 	if strings.TrimSpace(eff.BaseURL) == "" {
 		return nil, fmt.Errorf("缺少 API 地址")
@@ -993,15 +1140,16 @@ func (a *App) resolveProviderDraft(id, baseURL, apiKey string) (*ProviderCfg, er
 // handleFetchModels 从提供方服务拉取可用模型清单（服务端代理，避开浏览器跨域）。
 func (a *App) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID      string `json:"id"`
-		BaseURL string `json:"baseURL"`
-		APIKey  string `json:"apiKey"`
+		ID       string `json:"id"`
+		BaseURL  string `json:"baseURL"`
+		APIKey   string `json:"apiKey"`
+		Protocol string `json:"protocol"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "请求体不是合法 JSON")
 		return
 	}
-	p, err := a.resolveProviderDraft(body.ID, body.BaseURL, body.APIKey)
+	p, err := a.resolveProviderDraft(body.ID, body.BaseURL, body.APIKey, body.Protocol)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -1017,11 +1165,12 @@ func (a *App) handleFetchModels(w http.ResponseWriter, r *http.Request) {
 // handleUpsertProvider 新增或更新单个提供方（模型页卡片「保存」）。
 func (a *App) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		ID      string     `json:"id"`
-		Name    string     `json:"name"`
-		BaseURL string     `json:"baseURL"`
-		APIKey  string     `json:"apiKey"` // 空串 = 沿用已保存的 key
-		Models  []ModelCfg `json:"models"`
+		ID       string     `json:"id"`
+		Name     string     `json:"name"`
+		BaseURL  string     `json:"baseURL"`
+		APIKey   string     `json:"apiKey"` // 空串 = 沿用已保存的 key
+		Protocol string     `json:"protocol"`
+		Models   []ModelCfg `json:"models"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, 400, "请求体不是合法 JSON")
@@ -1029,6 +1178,17 @@ func (a *App) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimSpace(in.ID)
 	preset, isPreset := PresetByID(id)
+	// 协议类型校验：空串＝OpenAI 兼容（默认），预置方跟随模板（如 Anthropic）
+	protocol := strings.TrimSpace(in.Protocol)
+	switch protocol {
+	case "", "anthropic", "responses":
+	default:
+		writeErr(w, 400, "未知的渠道协议类型："+protocol)
+		return
+	}
+	if protocol == "" && isPreset {
+		protocol = preset.Protocol
+	}
 	baseURL := strings.TrimSpace(in.BaseURL)
 	if baseURL == "" {
 		if !isPreset {
@@ -1058,9 +1218,9 @@ func (a *App) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 		}
 		seen[mid] = true
 		m.ID = mid
-		// 思考档位未配置时按 ID 自动推断（添加/编辑模型即自动带上）
+		// 思考档位未配置时按协议+ID 自动推断（添加/编辑模型即自动带上）
 		if len(m.ReasoningLevels) == 0 {
-			m.ReasoningLevels = guessReasoningLevels(mid)
+			m.ReasoningLevels = guessReasoningLevels(protocol, mid)
 		}
 		models = append(models, m)
 	}
@@ -1069,7 +1229,7 @@ func (a *App) handleUpsertProvider(w http.ResponseWriter, r *http.Request) {
 	if isPreset && len(models) == 0 && len(preset.Models) > 0 {
 		models = append(models, preset.Models...)
 	}
-	pc := ProviderCfg{ID: id, Name: name, BaseURL: baseURL, Models: models}
+	pc := ProviderCfg{ID: id, Name: name, BaseURL: baseURL, Protocol: protocol, Models: models}
 	if key := strings.TrimSpace(in.APIKey); key != "" {
 		pc.APIKey = key
 	} else if old := a.providerByID(id); old != nil {
@@ -1158,16 +1318,17 @@ func (a *App) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 // handleTestProvider 对提供方目录里的所有模型做连通性测试（极小请求，限并发）。
 func (a *App) handleTestProvider(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		ID      string   `json:"id"`
-		BaseURL string   `json:"baseURL"`
-		APIKey  string   `json:"apiKey"`
-		Models  []string `json:"models"`
+		ID       string   `json:"id"`
+		BaseURL  string   `json:"baseURL"`
+		APIKey   string   `json:"apiKey"`
+		Protocol string   `json:"protocol"`
+		Models   []string `json:"models"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		writeErr(w, 400, "请求体不是合法 JSON")
 		return
 	}
-	p, err := a.resolveProviderDraft(in.ID, in.BaseURL, in.APIKey)
+	p, err := a.resolveProviderDraft(in.ID, in.BaseURL, in.APIKey, in.Protocol)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
@@ -1180,6 +1341,7 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		ID            string     `json:"id"`
 		Name          string     `json:"name"`
 		BaseURL       string     `json:"baseURL"`
+		Protocol      string     `json:"protocol,omitempty"` // 渠道协议：空＝OpenAI 兼容、anthropic、responses
 		APIKeyMasked  string     `json:"apiKeyMasked"`
 		Preset        bool       `json:"preset"`
 		PresetURL     string     `json:"presetURL,omitempty"`
@@ -1191,11 +1353,14 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		Via           string     `json:"via,omitempty"`           // 公司通道当前线路：lan/wan（配了外网地址才有值）
 		// Quota 公司通道的额度快照（服务端随公告下发；老服务端/私人通道为空）
 		Quota *CompanyQuotaCfg `json:"quota,omitempty"`
+		// PortalURL 门户充值入口（2026-11-13 充值组件，服务端 portal 启用才下发）：
+		// 公司通道卡片的「充值」按钮靠它显隐（组件/portal 读卡片挂载点的 dataset）。
+		PortalURL string `json:"portalURL,omitempty"`
 	}
 	providers := []providerView{}
 	for _, p := range a.Cfg.Providers {
 		pv := providerView{
-			ID: p.ID, Name: p.Name, BaseURL: p.BaseURL,
+			ID: p.ID, Name: p.Name, BaseURL: p.BaseURL, Protocol: p.Protocol,
 			APIKeyMasked: maskKey(p.APIKey), Models: p.Models,
 			Enabled: p.Enabled == nil || *p.Enabled, AutoDisabled: p.AutoDisabled,
 			Company: p.ID == wizardProviderID, PublicBaseURL: p.PublicBaseURL,
@@ -1209,6 +1374,7 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if pv.Company {
 			pv.Quota = a.Cfg.CompanyQuota // 额度快照只在公司通道上展示
+			pv.PortalURL = a.Cfg.PortalURL
 		}
 		if tpl, ok := PresetByID(p.ID); ok {
 			pv.Preset = true
@@ -1217,14 +1383,15 @@ func (a *App) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		providers = append(providers, pv)
 	}
 	type presetView struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		BaseURL string `json:"baseURL"`
-		Note    string `json:"note,omitempty"`
+		ID       string `json:"id"`
+		Name     string `json:"name"`
+		BaseURL  string `json:"baseURL"`
+		Protocol string `json:"protocol,omitempty"`
+		Note     string `json:"note,omitempty"`
 	}
 	presets := []presetView{}
 	for _, p := range DefaultProviders() {
-		presets = append(presets, presetView{ID: p.ID, Name: p.Name, BaseURL: p.BaseURL, Note: p.Note})
+		presets = append(presets, presetView{ID: p.ID, Name: p.Name, BaseURL: p.BaseURL, Protocol: p.Protocol, Note: p.Note})
 	}
 	t := a.DefaultTarget()
 	// 搜索服务的「当前生效地址」：交给前端原样显示（空/报错即「还打不出去」）
@@ -1445,7 +1612,7 @@ func (a *App) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 	if v := body.MarketURL; v != nil {
 		u := strings.TrimSpace(*v)
 		if u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
-			writeErr(w, 400, "企业技能包 / 工作流 / 小程序平台地址需为 http(s) 的服务器地址（如 https://example.com:2227，清单路径后缀自动拼）")
+			writeErr(w, 400, "企业技能包 / 工作流 / 企业小程序地址需为 http(s) 的服务器地址（如 https://jxaizz.com:2227，清单路径后缀自动拼）")
 			return
 		}
 		a.Cfg.MarketURL = u
@@ -1846,6 +2013,136 @@ func trimMessagesForUI(msgs []*StoredMessage) {
 	}
 }
 
+// olderInfo 是分批加载时「切点之前还有多少没下发」+ 前端 groupTurns 的接力
+// 基线：sys/tools 取切点前最后一条有效 prompt 快照（已被 trim 掏成 {} 的空壳
+// 跳过——它的基线本就是更早那条）——窗口内首条真变更的 prompt 据此显示
+// 「变更行」而非「首见」形态；envBoundary 是压缩摘要覆盖边界（模型已看不到
+// 的 env 快照，前端同样不显示，与切点无关、按全量取最大值）。
+type olderInfo struct {
+	Count       int             `json:"count"`
+	Sys         string          `json:"sys,omitempty"`
+	Tools       json.RawMessage `json:"tools,omitempty"`
+	EnvBoundary int64           `json:"envBoundary,omitempty"`
+}
+
+// isTurnStartMsg 判断某行是否回合起点（真实用户发言 / AI 发出的用户消息），
+// 口径与前端 lastTurnStart 一致。旧库残留的注入通知曾是 kind 空的 user 行，
+// 只能按正文前缀识别（规范 §5）——【 开头或 <goal_round> 的按通知处理，
+// 不作为回合边界。
+func isTurnStartMsg(m *StoredMessage) bool {
+	if m.Role != "user" {
+		return false
+	}
+	if m.Kind == "aiuser" {
+		return true
+	}
+	if m.Kind != "" && m.Kind != "chat" {
+		return false
+	}
+	txt := m.Text()
+	return !strings.HasPrefix(txt, "【") && !strings.HasPrefix(txt, "<goal_round>")
+}
+
+// sliceMsgWindow 在全量消息（已 trim、已并入摘要行）上切出 [lo,hi) 的分批加载
+// 窗口：lo 先按条数定，再**向前**对齐到回合起点（窗口扩大到含完整回合——若向
+// 右缩，起点之前的残段会被后续批次的对齐再次跳过，永远不被渲染）；切点停在
+// inherit 标记行之后时把标记行并入本批（继承段与其克隆历史不拆开）。
+func sliceMsgWindow(msgs []*StoredMessage, lo, hi int) ([]*StoredMessage, olderInfo) {
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > len(msgs) {
+		hi = len(msgs)
+	}
+	if hi <= lo {
+		return nil, olderInfo{Count: len(msgs)}
+	}
+	for i := lo; i >= 0; i-- {
+		if isTurnStartMsg(msgs[i]) {
+			lo = i
+			break
+		}
+	}
+	if lo == 1 && msgs[0].Kind == "inherit" {
+		lo = 0
+	}
+	info := olderInfo{Count: lo}
+	for i := 0; i < lo; i++ {
+		if msgs[i].Kind != kindPrompt || msgs[i].Text() == "{}" {
+			continue
+		}
+		var b promptBrief
+		if json.Unmarshal([]byte(msgs[i].Text()), &b) == nil {
+			info.Sys = b.Sys
+			info.Tools = append(json.RawMessage(nil), b.Tools...) // 自持副本（同 trim 的习惯）
+		}
+	}
+	for _, m := range msgs {
+		if m.Kind == "summary" && m.CoversUpTo > info.EnvBoundary {
+			info.EnvBoundary = m.CoversUpTo
+		}
+	}
+	return msgs[lo:hi], info
+}
+
+// handleSessionInherit 是子对话「承接自 <父标题> · 更早 N 条」的只读数据源：按
+// 承接锚点回父会话里取更早的一批历史（懒加载），不复制、不写库。
+//
+// 接口契约（前端与验收都按这份走）：
+//
+//	GET /api/sessions/{id}/inherit?before_seq=<父会话 seq>&limit=<n，缺省 200，上限 500>
+//	200 {"parentId":"…","parentTitle":"…",
+//	     "messages":[ {seq,role,kind,content,toolCalls?,createdAt,…}, …按 seq 升序 ],
+//	     "older":{"count": <这条批之前还剩多少条>}}
+//	400 该会话没有承接锚点（旧版子对话：完整历史本来就在会话里，没有更早的可加载）
+//	404 会话不存在；500 读库失败
+func (a *App) handleSessionInherit(w http.ResponseWriter, r *http.Request) {
+	m := a.sessionFromPath(w, r)
+	if m == nil {
+		return
+	}
+	raw, err := a.Store.InheritMark(m.ID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	var mark inheritMark
+	if x := strings.TrimSpace(raw); x != "" {
+		_ = json.Unmarshal([]byte(x), &mark)
+	}
+	if mark.Parent == "" || mark.From == 0 {
+		writeErr(w, 400, "该会话没有承接锚点：旧版子对话的完整历史已在会话内，没有更早的可加载")
+		return
+	}
+	before := mark.From
+	if v, perr := strconv.ParseInt(r.URL.Query().Get("before_seq"), 10, 64); perr == nil && v > 0 {
+		before = v
+	}
+	limit := 200
+	if v, perr := strconv.Atoi(r.URL.Query().Get("limit")); perr == nil && v > 0 {
+		limit = v
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, left, err := a.Store.InheritRowsBefore(mark.Parent, before, limit)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	trimMessagesForUI(rows) // 下发瘦身：库内原样，只削响应副本（同会话详情）
+	title := mark.Title
+	if title == "" {
+		if p, perr := a.Store.Get(mark.Parent); perr == nil {
+			title = p.Title
+		}
+	}
+	writeJSON(w, 200, map[string]any{
+		"parentId": mark.Parent, "parentTitle": title,
+		"messages": rows, "older": map[string]any{"count": left},
+	})
+}
+
 func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	m := a.sessionFromPath(w, r)
 	if m == nil {
@@ -1865,6 +2162,22 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		sort.Slice(msgs, func(i, j int) bool { return msgs[i].Seq < msgs[j].Seq })
 	}
 	trimMessagesForUI(msgs) // 下发瘦身：库内原样，只削响应副本（见函数注释）
+	// 分批加载（超长对话）：不带参数 = 全量下发（旧调用方零影响）。带 tail /
+	// before_seq 时切出最近一批（回合对齐，见 sliceMsgWindow），older 携带切点前
+	// 剩余条数与分组基线——前端据 older 显示「上面还有 N 条」并按需再取上一批
+	var olderPtr *olderInfo
+	if n, terr := strconv.Atoi(r.URL.Query().Get("tail")); terr == nil && n > 0 {
+		win, info := sliceMsgWindow(msgs, len(msgs)-n, len(msgs))
+		msgs, olderPtr = win, &info
+	} else if bs, berr := strconv.ParseInt(r.URL.Query().Get("before_seq"), 10, 64); berr == nil && bs > 0 {
+		lim := 0
+		if v, lerr := strconv.Atoi(r.URL.Query().Get("limit")); lerr == nil && v > 0 {
+			lim = v
+		}
+		hi := sort.Search(len(msgs), func(i int) bool { return msgs[i].Seq >= bs })
+		win, info := sliceMsgWindow(msgs, hi-lim, hi)
+		msgs, olderPtr = win, &info
+	}
 	// running 与 pending 以内存运行时为准：刷新页面后据此自动接上执行流、
 	// 恢复「已插话/已排队」的显示，不依赖刷新前的页面状态
 	cps, err := a.Store.CheckpointsAfter(m.ID, 0) // seq 从 1 起，>0 即全部
@@ -1883,13 +2196,17 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	// meta 一并带上钉住标记：title_worker 的预检读 meta.titlePinned——此前只有
 	// 顶层字段，预检永远落空，钉住会话每个节奏轮都白调一次模型再吃 409
 	m.TitlePinned = a.titlePinned(m.ID)
-	writeJSON(w, 200, map[string]any{
+	resp := map[string]any{
 		"meta": m, "messages": msgs,
 		"running": a.IsRunning(m.ID), "pending": a.pendingOf(m.ID),
 		"checkpoints": cps, "deliveries": dvs,
 		"error":       a.runError(m.ID), // 最近一次失败原因（输入框上方报错条 + 重试）
 		"titlePinned": m.TitlePinned,    // 手动命名钉住：AI 自动标题（组件 session-title）停改
-	})
+	}
+	if olderPtr != nil {
+		resp["older"] = *olderPtr // 分批加载：上面未下发的条数 + 分组基线（无此字段 = 全量）
+	}
+	writeJSON(w, 200, resp)
 }
 
 // messageTextOf 把消息正文文本化（轻量列表用）：字符串直取；分块数组拼 text 块；
@@ -2047,16 +2364,18 @@ func (a *App) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.Thinking != nil {
-		switch t := strings.TrimSpace(*body.Thinking); t {
-		case "", "enabled", "disabled", "low", "medium", "high":
-			old := m.Thinking
-			m.Thinking = t
-			if old != t {
-				notes = append(notes, ctxNote{ctxThinking, "思考档位：" + old + " → " + t})
-			}
-		default:
-			writeErr(w, 400, "thinking 档位必须是 enabled/disabled/low/medium/high 或空")
+		// 合法档位枚举单源在 validThinkingLevel（sessioncreate.go）：PATCH 改设置、
+		// 派发工具的 thinking 参数、人工建会话三处同一套（同一档位串在不同协议
+		// 渠道由协议层各自映射，见 llmproto.go）
+		t := strings.TrimSpace(*body.Thinking)
+		if !validThinkingLevel(t) {
+			writeErr(w, 400, "thinking 档位必须是 "+thinkingLevelsDoc+" 或空")
 			return
+		}
+		old := m.Thinking
+		m.Thinking = t
+		if old != t {
+			notes = append(notes, ctxNote{ctxThinking, "思考档位：" + old + " → " + t})
 		}
 	}
 	if body.PlanMode != nil {
@@ -2170,11 +2489,24 @@ func (a *App) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if m, err := a.Store.Get(id); err == nil {
 		oldWS = m.Workspace
 	}
+	// 正在执行的会话先停：否则删掉行之后运行协程还在往这个 id 写消息/广播事件，
+	// 既留下没有主人的行，也让前端收到指向已删会话的流式帧（2026-11-16 事故的
+	// 排查里实测到「删了还能继续对话」的表层观感之一）。停止走与「停止」按钮
+	// 同一套分级收口；随后最多等 3 秒让执行体真的收口再删，收不口就按强制终结
+	// 处理（forceStopRun 会把注册表摘掉，之后的写入由 wasKilled 拦住）。
+	if r0 := a.runOf(id); r0 != nil {
+		a.stopRunBy(id, stopActorUser, "会话已被删除")
+		deadline := time.Now().Add(stopWatchdogDefault + 2*time.Second)
+		for a.IsRunning(id) && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 	a.closeRemoteSession(id) // 断开该会话的 SSH 连接
 	if err := a.Store.Delete(id); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	a.SessionCX.forget(id) // 会话没了：它的组件/插件覆盖记录一并摘除
 	// 上传登记与待执行交付一并清掉：用户删会话即放弃这些（done/failed 的
 	// 历史作业行留着无妨，量小且可追溯）
 	_ = a.Store.DeleteUploadsForSession(id)
@@ -2287,15 +2619,133 @@ func (a *App) handleCompact(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": 1, "folded": folded})
 		return
 	}
-	summary, err := a.doSummarize(m, "manual", -1, body.UpTo)
+	// 模型摘要走后台：大历史的摘要要等模型流式输出一两分钟，挂在 HTTP 请求上
+	// 会把按钮吊在「压缩中…」（切走对话回来状态全丢，只能再点一次——又撞上
+	// 「该范围已压缩过」）。这里同步做完预检（点错位置/已压过立即报错）就返回
+	// 202，模型调用放 goroutine 悄悄跑，完成与失败都经 session_updated 广播，
+	// 前端不等待、切走对话不影响（CallSummarizer 本就用独立 context）。
+	if a.compactBusyOf(m.ID) {
+		writeErr(w, 409, "该会话正在后台压缩，完成或失败会自动通知")
+		return
+	}
+	raw, err := a.Store.RawMessagesAll(m.ID)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	if _, _, _, err := a.summarizePlan(raw, -1, body.UpTo); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
+	a.setCompactBusy(m.ID, true)
+	a.summarizeAsync(m, "manual", -1, body.UpTo)
+	writeJSON(w, 202, map[string]any{"ok": 1, "async": true})
+}
+
+// compactBusyOf / setCompactBusy 手动模型摘要压缩的会话级进行中标记：摘要走
+// 后台 goroutine，这里挡住同一会话的重复点火——连点两次不会并发跑两个摘要
+// 调用（第二个请求直接 409「正在后台压缩」）。
+func (a *App) compactBusyOf(id string) bool {
+	a.compactRunMu.Lock()
+	defer a.compactRunMu.Unlock()
+	return a.compactRunning[id]
+}
+
+func (a *App) setCompactBusy(id string, on bool) {
+	a.compactRunMu.Lock()
+	defer a.compactRunMu.Unlock()
+	if a.compactRunning == nil {
+		a.compactRunning = map[string]bool{}
+	}
+	if on {
+		a.compactRunning[id] = true
+	} else {
+		delete(a.compactRunning, id)
+	}
+}
+
+// summarizeAsync 把一次模型摘要放到后台执行（手动压缩的「悄悄压缩」形态）：
+// 先广播 compact_started 让前端进入「后台压缩中」状态，goroutine 里完成摘要
+// 与落库（doSummarize 成功时自带 reason=compact 广播）；失败广播 compact_failed。
+// 调用方必须已置位 compactRunning（先 set 再调，防两个请求同时穿过忙检查）。
+func (a *App) summarizeAsync(sess *SessionMeta, origin string, keepTail int, upTo int64) {
+	a.broadcast(Event{Type: "session_updated", SessionID: sess.ID, Data: map[string]any{"reason": "compact_started"}})
+	go func() {
+		defer a.setCompactBusy(sess.ID, false)
+		if _, err := a.doSummarize(sess, origin, keepTail, upTo); err != nil {
+			a.broadcast(Event{Type: "session_updated", SessionID: sess.ID, Data: map[string]any{"reason": "compact_failed", "error": err.Error()}})
+		}
+	}()
+}
+
+// handleAutoCompact 右键上下文菜单「提前自动压缩」：对当前会话手动点火一次
+// **自动压缩线路**（autoCompactKick）——按设置的保留字数从最新一轮往前数、
+// 装得下的整轮保留，更早的压缩；规则折叠还是模型摘要按当前配置选路。与
+// 消息操作条上的「压缩」（handleCompact 手动全量：从指定轮往上全压）和设置页
+// 「压缩数字助理主对话」（固定模型摘要）是三个并存、各自明确的入口。
+// 执行中拒绝（409）；PreCompact 插件 hook 与其他压缩入口同一口径（可被阻断）。
+func (a *App) handleAutoCompact(w http.ResponseWriter, r *http.Request) {
+	m := a.sessionFromPath(w, r)
+	if m == nil {
+		return
+	}
+	if a.IsRunning(m.ID) {
+		writeErr(w, 409, "该会话正在执行，稍后再压缩")
+		return
+	}
+	if a.CCPlugins != nil && a.CCPlugins.hasAnyHooks() {
+		if oc := a.ccEmitHookEvent(r.Context(), m, "PreCompact", "", nil, nil); oc.Block {
+			writeErr(w, 403, "压缩被插件 hook 拒绝："+oc.Reason)
+			return
+		}
+	}
+	folded, async, err := a.autoCompactKick(m)
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	if async { // 模型摘要放后台（同 handleCompact：立即返回，事件驱动刷新）
+		writeJSON(w, 202, map[string]any{"ok": 1, "scope": "auto", "async": true})
+		return
+	}
 	a.broadcast(Event{Type: "session_updated", SessionID: m.ID})
-	writeJSON(w, 200, map[string]any{"ok": 1, "summary": truncateRunes(summary, 300)})
+	writeJSON(w, 200, map[string]any{"ok": 1, "scope": "auto", "folded": folded})
 }
 
+// autoCompactKick 提前点火一次自动压缩线路（通道选择、先后顺序、调用参数与
+// 阈值触发一字不差，只是不做「到没到阈值」的判定）：规则通道零模型调用、
+// 同步折完即返回；模型摘要通道返回 async=true 由调用方放后台（同一会话级
+// 互斥与事件通知，见 summarizeAsync）。规则通道折到内容即止（与自动线路
+// 同样提前返回，不再试摘要）；两通道都没启用时报错，通道启用但预算内没东西
+// 可压的报错由下层透传（没有可折叠的回合 / 没有可压缩的区间）。
+func (a *App) autoCompactKick(m *SessionMeta) (folded int, async bool, err error) {
+	if a.Cfg.CompactInterval > 0 {
+		if folded = a.ruleCompactAuto(m, -1); folded > 0 {
+			return folded, false, nil
+		}
+		if a.Cfg.CompactLlmPct <= 0 {
+			return 0, false, fmt.Errorf("没有可折叠的回合（保留最近约 %d 字）", a.Cfg.KeepChars)
+		}
+	}
+	if a.Cfg.CompactLlmPct <= 0 {
+		return 0, false, fmt.Errorf("自动压缩未启用：在 设置 · 对话历史与压缩 里把「规则压缩间隔」或「模型摘要阈值」设为大于 0")
+	}
+	if a.compactBusyOf(m.ID) {
+		return 0, false, fmt.Errorf("该会话正在后台压缩，完成或失败会自动通知")
+	}
+	raw, err := a.Store.RawMessagesAll(m.ID)
+	if err != nil {
+		return 0, false, err
+	}
+	if _, _, _, err := a.summarizePlan(raw, -1, 0); err != nil {
+		return 0, false, err
+	}
+	a.setCompactBusy(m.ID, true)
+	a.summarizeAsync(m, "auto", -1, 0)
+	return 0, true, nil
+}
+
+// 数字助理主对话现在有多个「版本」（设置 · 对话历史与压缩），当前是哪一版
 // 数字助理主对话现在有多个「版本」（设置 · 对话历史与压缩），当前是哪一版
 // 由库里的指针说了算——a.currentAssistant()，见 assistant_versions.go。
 // 以前这里是「会话列表按更新时间倒序取第一个」，多版本下会错位（切回老版本
@@ -2360,12 +2810,12 @@ func (a *App) handleAssistantClear(w http.ResponseWriter, r *http.Request) {
 // handleAssistantCompact 立即压缩数字助理主对话**当前这一版**（设置 · 对话历史
 // 与压缩 · 压缩按钮）。固定走上下文压缩里「AI 模型压缩」那条路（doSummarize）：无视
 // Cfg.CompactMode（规则/关闭都不看），保留窗口与区间划分原样沿用现有实现
-//（keepRoundsByBudget：从最近一轮往上数，保留「保留字数」预算内装得下的
+// （keepRoundsByBudget：从最近一轮往上数，保留「保留字数」预算内装得下的
 // 完整轮；最近一轮自身超预算时摘要覆盖全部历史，不硬保这一轮）。
 // 设计目的：数字助理主对话平时也会自动压缩，默认走规则引擎（规则折叠）；等
 // 规则引擎也压不动、上下文仍然过长时，用户才会来点这个按钮——所以这里到点
 // 一定是模型压缩。origin=manual 与对话里消息级「压缩」按钮的 llm 分支同款
-//（独立叠加、永不重压）；没东西可压时透传现有错误文案，不另造话术。
+// （独立叠加、永不重压）；没东西可压时透传现有错误文案，不另造话术。
 // 执行中拒绝（409）；PreCompact 插件 hook 与手动压缩同一口径（可被阻断）。
 // 压完在对话区补一条【已压缩】系统通知：摘要行只是上下文材料、不进普通
 // 消息流，用户在对话里见不到它（通知同时是模型可见的 user 消息，下一轮模型
@@ -2664,10 +3114,18 @@ func (a *App) handleInterject(w http.ResponseWriter, r *http.Request) {
 		origin = "interject" // 插话来源标记：随消息落库，AI 自动标题等场景据此把插话与正常轮次区分开
 	}
 	pm := a.pushPending(m.ID, mode, strings.TrimSpace(body.Content), kindChat, origin)
+	// 用户亲发消息＝接管：插话注入的正是经理正在跑的那一轮，经理代批资格立即
+	// 撤销（mgrnotify.go，轮次级授权）；排队（本轮结束后发）也照撤——用户已
+	// 表态接管，经理在当前轮剩余时间里不再代决。
+	a.revokeManagerTurn(m.ID)
 	if !a.IsRunning(m.ID) && !a.queuePausedOf(m.ID) {
 		a.kickQueue(m) // 本轮已经结束：排队消息自己开一轮，不依赖用户再点一次（暂停时只排队不拉起）
 	}
-	writeJSON(w, 200, map[string]any{"accepted": true, "id": pm.ID, "mode": mode})
+	// 响应带上此刻的待生效快照：steer 的 kick 排水极快（打断→注入可在响应写回
+	// 前完成），前端若按 mode 盲回显会把已生效的插话重新画成「插话中」虚线框，
+	// 且摘框事件早已发过、无人再收——慢链路/远程中继下必现幽灵框。快照是真值：
+	// 已排走就不画，还在队里就照画。
+	writeJSON(w, 200, map[string]any{"accepted": true, "id": pm.ID, "mode": mode, "pending": a.pendingOf(m.ID)})
 }
 
 // handlePending 处理排队坞上的操作：删除（remove）、提前为插话（steer）、
@@ -2769,19 +3227,11 @@ func (a *App) handleFork(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "分支点之前没有可复制的历史")
 		return
 	}
-	// 指定分支点时前缀在执行中也稳定（seq 只增不改），无需再截断
-	if body.UpTo <= 0 && a.IsRunning(m.ID) {
-		last := -1
-		for i, x := range msgs {
-			if x.Role == "assistant" && len(x.ToolCalls) == 0 && strings.TrimSpace(x.Text()) != "" {
-				last = i
-			}
-		}
-		if last >= 0 {
-			msgs = msgs[:last+1]
-		}
-	}
-	// 源会话若带继承标记行，分支复制后条目数可能被上面的截断改小，
+	// 落库即完成：库里有的都是已完成的小步，整份复制即可（不判断"整轮"）。
+	// 唯一不能带走的是尾部未闭合的工具调用组（模型输出完就落库、工具结果还没回来
+	// 的那一组，对模型请求不合法）——与子对话继承同一个函数，两个分支入口都过一遍。
+	msgs = trimOpenToolGroup(msgs)
+	// 源会话若带继承标记行，分支复制后条目数可能被上面的剥尾巴改小，
 	// 重写标记里的计数——子对话前端靠它切分继承段，数字不对会错位
 	if len(msgs) > 0 && msgs[0].Kind == inheritKind {
 		var im inheritMark
@@ -3300,22 +3750,27 @@ func (a *App) handleSessionOpenOrReveal(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
 
-// handleClipboardRead 读系统剪贴板（桌面壳右键「粘贴」的兜底：WebView2 里
-// navigator.clipboard.readText 会永久挂起，权限态停在 prompt 且没有授权 UI，
-// 见 clipboard_windows.go 头注）。返回 {text} 与可选 {png}（截图，base64）。
+// handleClipboardRead 读系统剪贴板（桌面壳右键「粘贴」的实现底座：WebView2 里
+// navigator.clipboard.readText 会永久挂起、execCommand('paste') 一律被拒，见
+// clipboard_windows.go 头注）。返回 {text} 与可选 {png}（图片 PNG 字节，base64）、
+// {files}（资源管理器复制的文件真实路径列表）。三样可能同在，前端按 Ctrl+V 的
+// 口径分流（文件>图片>文本，app-ctxmenu.js 的 pasteIntoTarget）。
 // 剪贴板属敏感数据：仅回环可达（loopbackOnly，与设备桥同闸），LAN/远程一律 403。
 func (a *App) handleClipboardRead(w http.ResponseWriter, r *http.Request) {
 	if !loopbackOnly(w, r) {
 		return
 	}
-	text, png, err := readClipboardWindows()
+	text, png, files, err := readClipboardWindows()
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	resp := map[string]string{"text": text}
+	resp := map[string]any{"text": text}
 	if len(png) > 0 {
 		resp["png"] = base64.StdEncoding.EncodeToString(png)
+	}
+	if len(files) > 0 {
+		resp["files"] = files
 	}
 	writeJSON(w, 200, resp)
 }
@@ -3397,6 +3852,17 @@ func (a *App) handleResolveApproval(w http.ResponseWriter, r *http.Request) {
 		Always   bool `json:"always"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 经理代理（mgrnotify.go）：经理自己经 call_api 代批的请求带调用者会话头，
+	// 先标注来源再登记决定——等待方醒来读到的就是已标注的值。代批是轮次级
+	// 授权：卡片所属会话的经理那一轮已收口（或从不是经理轮）就拒绝——绝不
+	// 代决不属自己那一轮的卡片（通知侧窗口外本就不投，这里挡主动翻清单的）。
+	if managerResolveCaller(a, r) {
+		if !a.managerResolveAllowed(true, r.PathValue("id")) {
+			writeErr(w, 403, "这张卡不属于经理投递开启且正在执行的那一轮（经理代批是轮次级授权），请留给用户处理")
+			return
+		}
+		a.markApprovalByManager(r.PathValue("id"))
+	}
 	if err := a.resolveApproval(r.PathValue("id"), body.Approved, body.Always); err != nil {
 		writeErr(w, 404, err.Error())
 		return
@@ -3423,6 +3889,15 @@ func (a *App) handleResolveQuestion(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"ok": "1"})
 		return
 	}
+	// 经理代理（mgrnotify.go）：经理自己经 call_api 代答的请求带调用者会话头，
+	// 先标注来源再登记决定（口径同审批；代批窗口判定也同审批——轮次级授权）。
+	if managerResolveCaller(a, r) {
+		if !a.managerResolveAllowed(false, r.PathValue("id")) {
+			writeErr(w, 403, "这张卡不属于经理投递开启且正在执行的那一轮（经理代批是轮次级授权），请留给用户处理")
+			return
+		}
+		a.markQuestionByManager(r.PathValue("id"))
+	}
 	if err := a.resolveQuestion(r.PathValue("id"), body.Answer); err != nil {
 		writeErr(w, 404, err.Error())
 		return
@@ -3439,6 +3914,7 @@ func (a *App) handleGetProgress(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"progress": progressListOf(a, m.ID),
 		"running":  runningChildrenOf(a, m.ID), // 「运行中的程序」：本会话在跑的子进程（child.go）
+		"asks":     a.asyncPendingOf(m.ID),     // 「后台等待项」：挂着等用户处理的询问/审批/计划
 	})
 }
 
@@ -3696,6 +4172,9 @@ func (a *App) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "该会话正在执行中，请稍候再发")
 		return
 	}
+	// 用户亲发消息＝接管：经理代批资格撤销（mgrnotify.go，轮次级授权——用户
+	// 发起的这一轮不属于经理，即使它由经理轮排队/插话衔接而来）
+	a.revokeManagerTurn(m.ID)
 	um := TextMessage("user", body.Content)
 	sm := a.appendMessage(m, um)
 	opening := []Event{{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindChat}}
@@ -3776,6 +4255,7 @@ func (a *App) handleRetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"started": false, "reason": "该会话正在执行中"})
 		return
 	}
+	a.revokeManagerTurn(m.ID) // 用户点重试＝接管：经理代批资格撤销（轮次级授权）
 	a.clearRunError(m.ID)
 	a.serveRun(w, r, m, run, []Event{{Type: "retry"}})
 }

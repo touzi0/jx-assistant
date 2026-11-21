@@ -18,7 +18,8 @@ package main
 //   - 全部请求带 X-Jxai-User 头（值=发布者姓名，没设就不带）——服务端用它记
 //     下载/安装明细（market_events.jsonl）与条目归属 owner；
 //   - 发布/下架见 market_publish.go（用户端点 /api/market/publish、/api/market/unpublish，
-//     归属校验在服务端；下架=进服务端回收站）。
+//     这两个端点除 X-Jxai-User 外还带 X-Jxai-Device 设备头——服务端三要素审计
+//     「用户名+设备名+IP」，缺设备头 403；归属校验在服务端；下架=进服务端回收站）。
 
 import (
 	"bytes"
@@ -73,6 +74,10 @@ type marketEntryOut struct {
 	Installed        bool   `json:"installed"`
 	InstalledVersion string `json:"installedVersion,omitempty"`
 	Update           bool   `json:"update"`
+	// BuiltIn 只对组件有意义：该 id 在本机是内置组件（随包分发、随静默更新
+	// 升级）。前端据此不给「安装/卸载」（市场不该覆盖内置组件），只提示去
+	// 设置 → 组件 关开关。
+	BuiltIn bool `json:"builtin,omitempty"`
 }
 
 // marketMe 本机发布者身份（用于前端显隐「更新发布 / 删除」按钮的 UX 比对；
@@ -162,7 +167,7 @@ func (a *App) removeMarketRec(typ, id string) {
 }
 
 // marketManifestURL 市场地址规范化（2026-11-03 用户口径）：设置里只填服务器地址
-// （域名/IP + 端口，如 https://example.com:2227），路径后缀由程序自动拼——
+// （域名/IP + 端口，如 https://jxaizz.com:2227），路径后缀由程序自动拼——
 // /market/manifest.json；已带后缀或反代子路径（如 /jxai）的旧值原样兼容。
 func marketManifestURL(raw string) string {
 	raw = strings.TrimSpace(raw)
@@ -309,6 +314,7 @@ func (a *App) decorateEntries(typ string, in []marketEntryIn, recs map[string]ma
 				_, ok = a.Components.Manifest(rec.Key) // 发布方 -id 与组件清单 id 不一致时按记账找
 			}
 			o.Installed = ok
+			o.BuiltIn = a.Components.IsBuiltin(e.ID) || (rec.Key != "" && a.Components.IsBuiltin(rec.Key))
 			if o.Installed {
 				o.InstalledVersion = rec.Version
 			}
@@ -457,8 +463,11 @@ func (a *App) installMarketSkillZip(entry marketEntryIn, zipPath string) (*userS
 	return ent, nil
 }
 
-// installMarketComponent 把组件目录装进 组件/<id>/ 并重扫；id 以组件自己的
-// manifest.id 为准（缺省用条目 id），返回记账。
+// installMarketComponent 把市场组件装进**用户组件区** 组件/user/<id>/ 并重扫；
+// id 以组件自己的 manifest.id 为准（缺省用条目 id）。
+// 两档分明：内置组件（组件/<id>）由程序携带、随静默更新热更新，市场不得覆盖
+// ——同名一律拒绝，要停用去设置 → 组件 关开关；用户组件与主程序升级无关，
+// 不进打包、不上 git、不参与热更新，装/卸/开关都在设置 → 组件 里。
 func (a *App) installMarketComponent(e marketEntryIn, root string) (marketInstallRec, error) {
 	id := ""
 	var m ComponentManifest
@@ -468,15 +477,18 @@ func (a *App) installMarketComponent(e marketEntryIn, root string) (marketInstal
 	if id == "" {
 		id = e.ID
 	}
-	if strings.ContainsAny(id, `\/:*?"<>|`) || id == "." || id == ".." {
+	if strings.ContainsAny(id, `\/:*?"<>|`) || id == "." || id == ".." || id == userComponentsSubdir {
 		return marketInstallRec{}, fmt.Errorf("组件 id 不能当目录名: %s", id)
+	}
+	if a.Components.IsBuiltin(id) {
+		return marketInstallRec{}, fmt.Errorf("「%s」是内置组件（随包分发、随程序静默更新升级），不能从市场安装覆盖；不需要时在 设置 → 组件 里关掉开关", id)
 	}
 	// 先杀该组件的 worker：exe 形态的 worker 占着目录时 RemoveAll 直接失败，
 	// py 形态会继续用旧代码服务到进程死亡——两种形态都先杀干净再换目录
 	if a.Bridge != nil {
 		a.Bridge.KillComponent(id)
 	}
-	dst := filepath.Join(a.Components.Dir(), id)
+	dst := filepath.Join(a.Components.UserDir(), id)
 	if err := os.RemoveAll(dst); err != nil {
 		return marketInstallRec{}, err
 	}
@@ -493,19 +505,25 @@ func (a *App) installMarketComponent(e marketEntryIn, root string) (marketInstal
 	return marketInstallRec{Version: e.Version, Key: id, InstalledAt: time.Now().Format(time.RFC3339)}, nil
 }
 
-// uninstallMarketComponent 只允许卸载市场装的组件（按记账），内置组件不动。
+// uninstallMarketComponent 卸载用户组件区里的组件；内置组件不动（市场装不了
+// 也就无从卸起，兜底再拒一次）。
 func (a *App) uninstallMarketComponent(e marketEntryIn, rec marketInstallRec) error {
 	id := rec.Key
 	if id == "" {
 		id = e.ID
 	}
+	if a.Components.IsBuiltin(id) {
+		return fmt.Errorf("「%s」是内置组件，不能卸载；不需要时在 设置 → 组件 里关掉开关", id)
+	}
 	if _, ok := a.Components.Manifest(id); !ok {
 		return nil // 已不在（手动删过）：直接收尾
 	}
-	if err := os.RemoveAll(filepath.Join(a.Components.Dir(), id)); err != nil {
+	if a.Bridge != nil {
+		a.Bridge.KillComponent(id)
+	}
+	if err := a.Components.Remove(id); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	a.Components.Rescan()
 	return nil
 }
 
@@ -692,7 +710,7 @@ func (a *App) handleMarketUninstall(w http.ResponseWriter, r *http.Request) {
 		}
 	case "component":
 		if !hasRec {
-			writeErr(w, 400, "内置或手动放入的组件不通过市场卸载（设置 · 内置组件 里没有删除项，请手动删除目录）")
+			writeErr(w, 400, "该组件不是市场安装的：内置组件只能开关（设置 → 组件），手动放入 组件/user/ 的组件在同一页删除")
 			return
 		}
 		if err := a.uninstallMarketComponent(marketEntryIn{ID: body.ID}, rec); err != nil {

@@ -1,7 +1,8 @@
 ﻿<#
   restart-assistant.ps1 —— 数字助理「自重启」脚本
 
-  做什么：把正在运行的桌面版（默认 坚祥数字助理GO.exe）关掉，等几秒，再把它重新拉起来。
+  做什么：把正在运行的桌面版（默认 AI数字助理.exe，改名前的旧名坚祥数字助理GO.exe
+  仍会探测）关掉，等几秒，再把它重新拉起来。
 
   为什么不能简单地「杀掉自己再启动」：
     引擎启动时会创建并挂入一个 kill-on-close 的 Job Object
@@ -15,7 +16,7 @@
     restart-assistant.ps1 -DelaySec 20                       延迟 20 秒再关
     restart-assistant.ps1 -KillStray                         连无窗口的 -port/-noopen 实例一起关
     restart-assistant.ps1 -DryRun                            只演练，不真关不真起
-    restart-assistant.ps1 -ExePath "D:\...\坚祥数字助理GO.exe"  指定别的可执行文件
+    restart-assistant.ps1 -ExePath "D:\...\AI数字助理.exe"    指定别的可执行文件
 
   日志：<同目录>\.jxai\tmp\restart-assistant.log
 #>
@@ -24,7 +25,7 @@ param(
     [int]$DelaySec        = 5,      # 脚本启动后先等多久再动手（给在途请求/回复留时间）
     [int]$KillWaitSec     = 3,      # 关掉旧实例后等多久再拉起新的
     [int]$ReadyTimeoutSec = 30,     # 等待新实例窗口就绪的上限
-    [string]$ExePath      = '',     # 默认按脚本同目录探测：AI数字助理.exe → 坚祥数字助理GO.exe（文件名切换期双名）
+    [string]$ExePath      = '',     # 默认按脚本同目录探测：AI数字助理.exe → 坚祥数字助理GO.exe（旧名回退）
     [switch]$KillStray,             # 同时关闭无窗口的调试实例（命令行带 -port / -noopen）
     [switch]$DryRun                 # 演练模式：只打印计划，不关也不起
 )
@@ -35,7 +36,7 @@ $ErrorActionPreference = 'Continue'
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $ExePath) {
-    # exe 文件名切换期（坚祥数字助理GO → AI数字助理）：新名优先，本机哪个在用哪个
+    # exe 已切新名（AI数字助理，2026-11-19）：新名优先，旧名回退（迁移前的存量机器）
     $try = Join-Path $root 'AI数字助理.exe'
     if (-not (Test-Path -LiteralPath $try)) { $try = Join-Path $root '坚祥数字助理GO.exe' }
     $ExePath = $try

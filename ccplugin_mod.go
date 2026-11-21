@@ -550,6 +550,12 @@ func ccModToolArgs(tool string, args json.RawMessage) map[string]any {
 
 // ccModCommandList 汇总 mod 注册的命令（斜杠命令弹层用）。
 func (r *CCPluginRegistry) ccModCommandList() []map[string]any {
+	return r.ccModCommandListFiltered(nil)
+}
+
+// ccModCommandListFiltered 同上，带插件过滤器（会话级插件覆盖：会话把某插件
+// 关了，它的 mod 命令不出场；filter 为 nil＝不过滤）。
+func (r *CCPluginRegistry) ccModCommandListFiltered(filter func(pluginKey string) bool) []map[string]any {
 	out := []map[string]any{}
 	if r == nil {
 		return out
@@ -563,6 +569,9 @@ func (r *CCPluginRegistry) ccModCommandList() []map[string]any {
 	sort.Strings(keys)
 	for _, k := range keys {
 		h := r.modHosts[k]
+		if filter != nil && !filter(h.plugin.Key) {
+			continue
+		}
 		h.mu.Lock()
 		names := make([]string, 0, len(h.commands))
 		for n := range h.commands {
@@ -613,6 +622,10 @@ func (a *App) ccModRunCommand(ctx context.Context, sess *SessionMeta, name, args
 	}
 	a.CCPlugins.modMu.RUnlock()
 	if host == nil {
+		return "", false
+	}
+	// 会话级插件覆盖：本对话把这个插件关了，它的 mod 命令不执行
+	if sess != nil && !a.cxoPluginEnabled(sess.ID, "claude", host.plugin.Key) {
 		return "", false
 	}
 	host.mu.Lock()

@@ -9,8 +9,10 @@
 1. 双击 `启动输入法.bat`（或 `voicetype_go.exe`）。单实例：已经在跑时再启动会自己退出
    （两个实例＝两套键盘钩子 + 两个悬浮窗 + 抢同一个 ASR 端口，会粘两遍）
 2. 默认热键：**Alt 按住说话（两侧都算，≥300ms 才开麦），松开上屏**
-   - `main`：主热键，如 `["alt"]`、`["ctrl","f2"]`、`["mouse-side"]`（鼠标侧键）
-     —— 修饰键写 `alt`/`ctrl` 表示**两侧都算**（与产品设置一致）；也可以只写一侧 `lalt`/`ralt`
+   - `main`：主热键，如 `["alt"]`、`["ctrl","f2"]`、`["mouse-side"]`（鼠标侧键，前后两枚都算）
+     —— 也可只绑某一枚：`["mouse-side-1"]`（侧键1·后退位）/ `["mouse-side-2"]`（侧键2·前进位），
+     没绑的那枚完全放行（原生前进/后退照常）；修饰键写 `alt`/`ctrl` 表示**两侧都算**
+     （与产品设置一致）；也可以只写一侧 `lalt`/`ralt`
    - `sub`：副热键（与主键并存触发），留空 `[]` 停用
    - `mode`：`tap`=点一下开始、再点一下结束（**点按上限 `tapMs`，默认 1000ms**：
  按住不超过它就算"点按"；超过也照样切换，只在日志里标注"按住较久"，不留死区）；
@@ -32,7 +34,8 @@
 ```
 
 - **来源优先级**：环境变量 → 本目录 `voicetype.json` → `..\坚祥数字助理GO\voicetype.json`
-  → `D:\123\坚祥数字助理GO\voicetype.json` → 本目录 `hotkeys.json` → 内置默认
+  → `D:\123\AI数字助理\voicetype.json` → `D:\123\坚祥数字助理GO\voicetype.json`
+  → 本目录 `hotkeys.json` → 内置默认
   - 环境变量：`VT_VOICETYPE_JSON`（文件路径）、`VT_HOTKEY`/`VT_SUB_HOTKEY`（如 `alt`、`ctrl+f2`）、
     `VT_ACCENT`、`VT_TEXT_COLOR`、`VT_HOLD_MS` —— 组件模式下主程序拉起 worker 时直接注入最可靠
 - **热加载**：两个文件（`hotkeys.json` / `voicetype.json`）每秒看 mtime，改完 1 秒内生效
@@ -82,6 +85,55 @@
 300ms 内按别的键会把按键还给前台，所以菜单栏、Alt+Tab、Ctrl 组合全都照常；只有在
 "按住 Alt 超过 300ms 说话"这段时间里 Alt 不会弹菜单（这正是我们要的）。
 
+## 纪律：本组件「不按下 Alt」（2026-11-16 定）
+
+用户原始诉求：语音悬浮窗会**偶尔不释放左 Alt**，之后键盘输入失灵；因为难复现，
+所以要求从根上消除——「就不要有按下这个动作，它就不容易再出现没释放的情况」。
+
+因此以下三条是硬规则，改代码时**不得**破例（破例前先读这段）：
+
+1. **永不注入 Alt**：`vtSendKeyEvent` 对 `VK_LMENU 0xA4 / VK_RMENU 0xA5 / VK_MENU 0x12`
+   直接拒发（打一条 `按纪律拒绝注入 Alt` 日志就返回）。所有注入路径（点按回放、组合键
+   还原、漏 up 自愈、注入围栏）都从这一个出口走，所以加了新代码也绕不过去。
+   代价：热键若是 Alt，(a) 短按不再"补一下菜单"，(b) 组合键介入时不再补发 Alt down
+   （极端时机下右 Alt+Tab 之类会少半截）。用户明确选这条：宁可不完整，不要卡键。
+2. **永不吞左 Alt**：`vtHookConsume` 里 `lalt` 一律 `return false, true`——事件原样给
+   前台（菜单/Alt+Tab 正常），只当热键监听（照样能触发录音）。左 Alt 从此不进
+   `consumed` 账本，也就不存在"down 被吞、up 丢失 → 系统认为它一直按着"。
+   若硬把 `lalt` 配成热键，表现是"按左 Alt 会同时弹一下菜单栏"——这是有意的取舍。
+3. **一个键都不许留在按下状态**：`vtReleaseInjectedKeys` 只释放**我们补发过 down 的
+   非 Alt 键**，调用点覆盖录音结束、取消本轮、悬浮窗收起、钩子重装、看门狗定时检查、
+   进程退出（`vtShutdown`，`os.Exit` 不走 defer 所以要显式调）。这些调用全部投递到
+   钩子线程执行（`vtAskKeySweep` → `vtWmKeySweep`），因为账本 map 只在钩子回调线程维护。
+
+回归用例：`TestNoAltInjectionEver`（Alt 一个事件都不许发）、`TestReplayHeldDownNeverPressesAlt`、
+`TestLeftAltNeverConsumed`、`TestReleaseInjectedKeys`（见 `vt_hotkey_windows_test.go`）。
+
+自检办法：`trigger.txt` 写 `state` 打一条修饰键快照（物理状态 + 三份账本 +
+`armVK` + 是否在录音）。要报"Alt 又卡了"，先看这条日志——账本里没有它，就不是本组件造成的。
+
+## 白色方块窗口为什么没有了
+
+WebView2 库建窗时先 `CreateWindowExW(WS_OVERLAPPEDWINDOW, 640×480)` 再
+`ShowWindow(SWShow)`（用户看到屏幕正中白方块闪一下），随后我们才把它改造成胶囊。
+`go-webview2/webview.go` 已打补丁：**用 `WS_POPUP`、胶囊尺寸、建在屏幕外 (-32000,-32000)、
+`SW_SHOWNOACTIVATE` 显示、不 `SetFocus`**。注意窗口必须仍然"显示"（只是屏外）——
+WebView2 的合成表面在窗口可见时才建立，隐藏建窗会让胶囊以后一片空白
+（`voicetype_spawn_windows.go` 里 `STARTF_USESHOWWINDOW + HIDE` 那条教训同源）。
+
+## 圆角为什么不锯齿了（2026-11-21）
+
+胶囊外形 = 网页 `border-radius` 画的抗锯齿圆角 ∩ Go 侧 `SetWindowRgn` 裁出的
+点击命中区。以前两者边界完全重合，可见边缘落在 region 的整数阶梯上（系统
+region 无抗锯齿），加上 WebView2 默认**不透明白底**从阶梯缝隙里露出来，
+就是"侧边像锯齿"的由来。现在：① `webview.go` 补丁把
+`DefaultBackgroundColor` 设为全透明（白底不再露缝）；② `vtOverlayModeRegion`
+的 region 各边外扩 2px（半径同步 +2），可见边缘变成网页自己的抗锯齿曲线，
+region 只负责点击命中（多出的 2px 透明边不可见、不影响穿透）。
+气泡的 `box-shadow` 同步删除——它一直被 region 裁在可见区外，外扩后只会
+显出一条被硬裁 2px 的残边。实机像素验证：旧版圆弧处灰→蓝一步硬切，
+新版两档渐变（25%/75% 覆盖率），见当日排查报告。
+
 ## 连按不再像"有冷却期"
 
 每轮录音开始自增**会话代数**（`vtSessionGen`），所有延时回调（结果提示 700ms、
@@ -106,7 +158,7 @@
 | 0 | 前台窗口属于本进程（悬浮窗自己） | 否 |
 | 1 | explorer 的桌面/图标列表（Progman / WorkerW / SHELLDLL_DefView / SysListView32） | 否 |
 | 2 | `GetGUIThreadInfo` 有 caret（含 rcCaret 尺寸非 0） / 原生可编辑控件类名（Edit / RichEdit* / Scintilla / _WwG） | 是 |
-| 3 | UIA 焦点元素：Edit、ComboBox 且启用非只读 → 是；Document/Custom/Group/Pane 带**可写** ValuePattern → 是；带 ValuePattern 但**只读**（网页正文就是这种）→ 否；Chromium 窗口里键盘可聚焦且不是按钮/菜单/滚动条一类 → 是 | 视情况 |
+| 3 | UIA 焦点元素：Edit、ComboBox 且启用非只读 → 是；Document/Custom/Group/Pane 带**可写** ValuePattern → 是；带 ValuePattern 但**只读**（网页正文就是这种）→ 否；Chromium 窗口里键盘可聚焦、**带 TextPattern** 且不是按钮/菜单/滚动条一类 → 是（contenteditable 富文本如 ql-editor 就是这种；滚动容器无 TextPattern，不放行） | 视情况 |
 | 4 | 进程名兜底（只给 UIA 给不出信号的 Qt 自绘应用，如微信 4.x） | 是 |
 
 为什么必须留着第 0 层和第 3 层（Go 版相对 Electron 版的两处差异，都是实测坑）：
@@ -119,7 +171,7 @@
   那两条判据在浏览器里等于恒真，于是"没输入框也粘"。UIA 能区分：网页正文是
   `Document` + ValuePattern 只读，网页 textarea / WebView2 输入框是 `Edit` + 可写。
 
-实测对照（2026-11-03，本机）：
+实测对照（2026-11-03，本机；最后一行 2026-11-11 补）：
 
 | 场景 | 判定 | 结果 |
 |---|---|---|
@@ -129,6 +181,12 @@
 | Edge 网页里的 textarea | `uia_editable` | 注入 |
 | 数字助理输入框（WebView2） | `uia_editable` | 注入 |
 | 微信 4.x（Qt，UIA 无信号） | `process_allowlist` | 注入 |
+| 网页滚动容器（DeepSeek 点空白处，焦点落 ds-virtual-list：Group、无 ValuePattern、**无 TextPattern**） | `no_signal` | 只复制 |
+| contenteditable 富文本（ql-editor：Group、无 ValuePattern、**有 TextPattern**） | `chromium_optimistic` | 注入 |
+
+> Group/Pane 无 ValuePattern 时，TextPattern 是 contenteditable（可输入）与滚动容器
+> （不可输入）的唯一区分度——两者同为「分组 + 可聚焦」，2026-11-11 同机同页实测
+> 确认。滚动容器放进剪贴板就是它落到 `no_signal`（浏览器刻意不在进程兜底名单）。
 
 判定实现只有一份：`vt_target_windows.go` 的 `vtEditabilityGate`（别处不要再写
 bool 版，两份判据迟早漂移）。`vt.log` 每次都会记一行 `目标判定: gate=... | 现场`，
@@ -192,11 +250,26 @@ $env:VT_PROBE_HWND="<hwnd>"; go test -run TestCaptureForeground -v   # 指定窗
 
 ## python 依赖
 
-启动时按顺序探测解释器：本目录 `runtime\python\python.exe` →
-数字助理共享运行时（`D:\123\坚祥数字助理GO\技能\_runtime\python\python.exe`、
-开发目录同款）→ PATH。需要包：`sherpa-onnx numpy onnxruntime`
-（数字助理的共享运行时已带）。端口 8320 上已有服务时不会再拉一个（主程序被强杀
-时子进程会留下孤儿，复用比再拉一份省 500MB 内存，也避免"日志说着就绪、其实用旧进程"）。
+悬浮窗是独立进程，**自举探测**解释器（不依赖主程序注入——语音组件保持独立，
+主程序不为某个组件加专属逻辑，2026-11-14 用户口径）：本目录
+`runtime\python\python.exe` → exe 上三级的 `技能\_runtime\python`（安装形态
+`<安装目录>\组件\voice\voicetype\` 上三级即安装目录；开发形态上三级即仓库根，
+两态都命中；目标与主程序组件桥 `{python}` 占位符指向**同一份**共享运行时，
+改落位时两边同步）→ 两台开发机的仓库路径（历史兼容）→ PATH；一个都没有时
+把候选列表写进 vt.log。需要包：`sherpa-onnx numpy`（缺 sherpa-onnx/numpy 时
+启动自动从清华镜像装齐，**版本锚定** `sherpa-onnx==1.13.8`/`numpy==2.5.4`——
+pip 默认最新 2.x 与链路配套不符；不带 `--no-deps`，onnxruntime 由依赖补齐）。
+端口 8320 上已有服务时不会再拉一个（主程序被强杀时子进程会留下孤儿，
+复用比再拉一份省 500MB 内存，也避免"日志说着就绪、其实用旧进程"）。
+
+## 识别超时
+
+一轮识别（含等服务就绪、HTTP 重试）有按时长动态调整的总超时：**语音时长 1:1 +
+8s 缓冲，下限 15s，不设上限**（本地推理 RTF 实测 <0.3，1:1+8s 非常宽裕；真实
+场景有 210s/270s 的超长语音，超时随时长线性同步、绝不提前打断）。到点必然给出
+三态之一（已输入/已复制/**识别超时，请重试**）并收窗，可立即再次触发——绝不会
+停在"识别中"（2026-11-14 线上：识别服务起不来的机器上，旧逻辑干等 60s+120s，
+用户看到的就是永久"识别中"）。
 
 ## 编译
 

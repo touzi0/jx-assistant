@@ -13,7 +13,7 @@ const CCP_COMPONENT_LABELS = {
   hooks: 'Hooks', mods: 'Mods', mcp: 'MCP',
 };
 
-function ccpPluginRow(p) {
+function ccpPluginRow(p, opts) {
   const row = document.createElement('div');
   row.className = 'plugin-row';
   // 基本信息行 + 能力徽章
@@ -28,10 +28,13 @@ function ccpPluginRow(p) {
   if (p.mcp) badges.push('MCP');
   info.innerHTML =
     `<div class="pr-line"><b>${esc(p.displayName || p.name)}</b><span class="pr-ver">${esc(p.version || '')}</span>` +
-    `<span class="pr-ver">@${esc(p.marketplace)}</span></div>` +
+    `<span class="pr-ver">@${esc(p.marketplace)}</span>` +
+    (p.override ? '<span class="pr-ovr" title="本对话覆盖了全局开关（点击恢复跟随全局）">已覆盖</span>' : '') + '</div>' +
     (badges.length ? `<div class="ccp-badges">${badges.map(b => `<span class="ccp-badge">${esc(b)}</span>`).join('')}</div>` : '') +
     `<p>${esc(p.description || '')}</p>`;
-  // 总开关（走统一 /api/plugins：与各体系后端逻辑一致）
+  // 总开关（走统一 /api/plugins：与各体系后端逻辑一致；带 opts.session＝
+  // 按对话开关浮窗的会话级覆盖，全局开关不动）
+  const sessMode = !!(opts && opts.session);
   const tg = document.createElement('label');
   tg.className = 'pr-toggle';
   const cb = document.createElement('input');
@@ -40,9 +43,16 @@ function ccpPluginRow(p) {
   cb.onchange = async () => {
     cb.disabled = true;
     try {
-      await api('/api/plugins', { method: 'POST', body: JSON.stringify({ layer: p.layer, id: p.id, enabled: cb.checked }) });
-      note.textContent = '已更新，新会话生效';
-      await renderPluginList();
+      const body = { layer: p.layer, id: p.id, enabled: cb.checked };
+      if (sessMode) body.session = opts.session;
+      await api('/api/plugins', { method: 'POST', body: JSON.stringify(body) });
+      note.textContent = sessMode
+        ? (cb.checked ? '本对话已启用（其他对话不受影响）' : '本对话已停用，命令等即时跟随（其他对话不受影响）')
+        : '已更新，新会话生效';
+      // 会话模式重挂按对话浮窗的清单（顺带更新覆盖徽标与 sessionCustom）；
+      // 全局模式维持原路径：重挂设置页清单
+      if (sessMode && typeof cxsRenderPluginList === 'function') await cxsRenderPluginList();
+      else await renderPluginList();
     } catch (e) { alert('切换失败：' + e.message); cb.checked = !cb.checked; cb.disabled = false; }
   };
   tg.appendChild(cb);
@@ -52,6 +62,8 @@ function ccpPluginRow(p) {
   const note = document.createElement('div');
   note.className = 'pr-note';
   row.appendChild(note);
+  // 会话模式不带执行型组件开关/配置/卸载（都是全局性操作，归设置页管）
+  if (sessMode) return row;
   // 组件级行：执行型组件（hooks/mods/mcp）单独放行
   const execRow = document.createElement('div');
   execRow.className = 'ccp-comps';
@@ -221,17 +233,23 @@ function bindCCPluginPanel() {
 
 /* ---------- 斜杠命令弹层 ---------- */
 
-let ccCmdCache = null;       // 命令清单缓存（fetch 一次）
+let ccCmdCache = null;       // 命令清单缓存（fetch 一次；切会话时作废——清单按会话生效集过滤）
 let ccCmdPopup = null;       // 当前弹层 DOM
 let ccCmdItems = [];         // 过滤后的候选
 let ccCmdActive = -1;        // 高亮项
 
 async function ccCommands() {
   if (ccCmdCache) return ccCmdCache;
-  try { ccCmdCache = (await api('/api/cc-plugins/commands')).commands || []; }
+  // 带当前会话：后端按该会话的插件生效集过滤（会话把某插件关了，它的命令不出场）
+  const sid = (typeof state !== 'undefined' && state.cur && state.cur.id) || '';
+  const q = sid ? '?s=' + encodeURIComponent(sid) : '';
+  try { ccCmdCache = (await api('/api/cc-plugins/commands' + q)).commands || []; }
   catch (e) { ccCmdCache = []; }
   return ccCmdCache;
 }
+
+// 会话切换 → 命令清单重新拉（不同对话的插件生效集可能不同）
+if (window.JX && JX.on) JX.on('session:open', () => { ccCmdCache = null; });
 
 function ccCloseCmdPopup() {
   if (ccCmdPopup) { ccCmdPopup.remove(); ccCmdPopup = null; ccCmdItems = []; ccCmdActive = -1; }

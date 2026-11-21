@@ -26,5 +26,19 @@ if ($LASTEXITCODE -ne 0) { throw "go build 失败（旧实例已关闭且未重�
 Write-Host ("完成：" + (Join-Path $root "jx-assistant.exe"))
 
 # 3) 按原参数形态重启（-noopen：不自动开本机浏览器，远程端/本机自己连）
-Start-Process -FilePath (Join-Path $root "jx-assistant.exe") -ArgumentList "-noopen" -WorkingDirectory $root
+#    2026-11-14 起两道防护：
+#    a) 产物自检——二进制必须含 ".migrations.json"（账本同域修复，2026-11-10
+#       提交 7d237d71e1）。不含 = 旧逻辑 exe（会在技能目录重跑三条迁移并删技能，
+#       2026-11-12 promo 事故实证），拒绝启动。旧版 jx-assistant.exe 与
+#       坚祥数字助理GO.exe.prev 已归档到 D:\智能体工作区\数字助理GO\obsolete\，
+#       禁止拷回仓库根使用。
+#    b) JX_SKIP_MIGRATIONS=1——网页形态开发实例整体跳过迁移（不碰技能目录），
+#       正式版不设此变量、行为不变。
+$engineExe = Join-Path $root "jx-assistant.exe"
+$probe = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($engineExe))
+if (-not $probe.Contains('.migrations.json')) {
+  throw "产物二进制不含账本同域修复（.migrations.json）——这是旧逻辑 exe，会在技能目录重跑迁移并删技能，拒绝启动。旧版已归档至 D:\智能体工作区\数字助理GO\obsolete\，勿拷回。"
+}
+$env:JX_SKIP_MIGRATIONS = "1"
+Start-Process -FilePath $engineExe -ArgumentList "-noopen" -WorkingDirectory $root
 Write-Host "已重启引擎。远程端稍等自动重连；下次打开页面自动拉取新外壳（无需手动清缓存）。"

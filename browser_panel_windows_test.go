@@ -41,7 +41,7 @@ func armPanel(p *browserPanel) {
 	p.hwnd = 0 // 不给真窗口句柄：阶段三拆窗口会跳过（测试不碰 Win32）
 	p.ctl, p.wv = nil, nil
 	p.chrome = edge.NewChromium() // 纯 Go 结构，不触发原生调用
-	p.newWinToken, p.titleToken = 11, 22
+	p.titleToken = 22
 	p.url, p.title = "https://example.com/", "Example Domain"
 	p.stateMu.Unlock()
 }
@@ -73,8 +73,8 @@ func TestPanelDetachClearsStateAndIsIdempotent(t *testing.T) {
 	if parts.chrome == nil {
 		t.Fatal("绑定库实例没被取走（拆完就没人保活它了：原生侧还握着它的回调裸指针）")
 	}
-	if parts.newWinTok != 11 || parts.titleTok != 22 {
-		t.Fatalf("事件 token 没被取走（反注册要用）：%d/%d", parts.newWinTok, parts.titleTok)
+	if parts.titleTok != 22 {
+		t.Fatalf("事件 token 没被取走（反注册要用）：%d", parts.titleTok)
 	}
 	select {
 	case <-navCh:
@@ -83,7 +83,7 @@ func TestPanelDetachClearsStateAndIsIdempotent(t *testing.T) {
 	}
 	p.stateMu.Lock()
 	leaked := p.ctl != nil || p.wv != nil || p.hwnd != 0 || p.chrome != nil ||
-		p.navCh != nil || p.newWinHandler != nil || p.started || !p.closing
+		p.navCh != nil || p.started || !p.closing
 	p.stateMu.Unlock()
 	if leaked {
 		t.Fatal("detach 后仍留着旧值（重建会沿用已释放的控件/句柄）")

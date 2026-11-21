@@ -10,27 +10,71 @@
         android:layout_height="match_parent" />
 
     <!-- 应用级首页浮条：原生胶囊浮在网页之上、屏幕水平绝对居中（top|center_horizontal），
-         不参与网页布局——网页顶栏爱怎么排怎么排，浮条只负责盖在中间。点击回首页 -->
-    <TextView
+         不参与网页布局——网页顶栏爱怎么排怎么排，浮条只负责盖在中间。
+         三格：左＝回首页｜中＝设备名（过长省略）｜右＝刷新（重连 + 补拉，见
+         DeviceActivity.refreshRemote）。按钮与胶囊同高同圆角，触控目标 34×34dp；
+         设备名可省略但不会被按钮挤没（maxWidth 兜住总宽，浮条始终比屏窄）。 -->
+    <LinearLayout
         android:id="@+id/home_chip"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|center_horizontal"
         android:background="@drawable/bg_home_chip"
-        android:drawableStart="@drawable/ic_home"
-        android:drawablePadding="5dp"
         android:elevation="4dp"
-        android:ellipsize="end"
-        android:gravity="center"
-        android:maxWidth="200dp"
-        android:minHeight="30dp"
-        android:paddingStart="13dp"
-        android:paddingEnd="13dp"
-        android:singleLine="true"
-        android:text="设备名"
-        android:textColor="#FFFFFF"
-        android:textSize="13sp"
-        android:textStyle="bold" />
+        android:gravity="center_vertical"
+        android:minHeight="34dp"
+        android:orientation="horizontal"
+        android:paddingStart="6dp"
+        android:paddingEnd="6dp">
+
+        <!-- 回首页：整个胶囊左格，点了 finish() 回设备列表 -->
+        <ImageButton
+            android:id="@+id/chip_home"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:background="@drawable/bg_chip_btn"
+            android:contentDescription="回首页"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_home" />
+
+        <!-- 设备名：唯一的弹性项，过长按省略号收尾（不与两侧按钮抢位置） -->
+        <TextView
+            android:id="@+id/chip_name"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxWidth="132dp"
+            android:singleLine="true"
+            android:text="设备名"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:textStyle="bold" />
+
+        <!-- 刷新后的短暂回执（「已刷新」）：1 秒后自己收起，不常驻占位 -->
+        <TextView
+            android:id="@+id/chip_status"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="5dp"
+            android:singleLine="true"
+            android:textColor="#8CE0B0"
+            android:textSize="11sp"
+            android:visibility="gone" />
+
+        <!-- 刷新：重连事件流 + 接回执行流 + 补拉消息（失败/长按、连点两次＝整页重载） -->
+        <ImageButton
+            android:id="@+id/chip_refresh"
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:layout_marginStart="2dp"
+            android:background="@drawable/bg_chip_btn"
+            android:contentDescription="重新连接并补拉消息"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_refresh" />
+    </LinearLayout>
+
 
     <!-- 加载失败浮层：网关不可达/长时间打不开时给出口 -->
     <LinearLayout

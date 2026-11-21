@@ -1,7 +1,9 @@
 <!DOCTYPE html>
 <!-- VoiceType 悬浮窗 —— 窗口恒定 200×88，可见区由 Go 侧 region 切换
      （region 外窗口不存在，点击穿透，无黑边无 bounds 滞后）。
-     布局用绝对坐标，与 vt_windows.go 的 region 常量严格对齐（勿单独改）：
+     布局用绝对坐标，与 vt_windows.go 的 region 常量严格对齐（勿单独改）；
+     region 比各元素外扩 2px（WebView2 背景透明），可见边缘=本页圆角的
+     抗锯齿曲线，region 只管点击命中：
        胶囊   x34~166 y52~88（132×36 圆角18，沉底居中）
        气泡   x5~195  y8~48 （190×40 圆角14）
        小胶囊 x59~141 y4~26 （82×22 圆角11）
@@ -17,7 +19,6 @@
        --fg      = 主程序的主题文字色（浅色主题 #1f2328 / 深色 #e6e8eb）
        没取到时用主程序默认点缀色 + 按亮度自动挑的对比色 */
     --accent: #4D6BFE;
-    --accent-shadow: rgba(38,62,180,.35);
     --fg: #ffffff;
     --fg-dim: rgba(255,255,255,.72);
   }
@@ -53,13 +54,14 @@
   body:not(.recording) .caps { display: none; }
   body:not(.recording) .status { display: flex; }
 
-  /* 气泡：x5 y8 190×40（与 region 对齐） */
+  /* 气泡：x5 y8 190×40（与 region 对齐）。
+     无 box-shadow：阴影整个落在 region 外被裁掉（以前白底+精确 region 时不可见），
+     region 外扩+透明背景后只会显出一条被硬裁的 2px 残边，索性去掉。 */
   .bubble { position: absolute; left: 5px; top: 8px; width: 190px; height: 40px;
             background: var(--accent); color: var(--fg); border-radius: 14px;
             display: flex; align-items: center; justify-content: center;
             font-size: 12px; line-height: 1; white-space: nowrap; overflow: hidden;
-            text-overflow: ellipsis; opacity: 0; transition: opacity .25s;
-            box-shadow: 0 4px 14px var(--accent-shadow); }
+            text-overflow: ellipsis; opacity: 0; transition: opacity .25s; }
   body.streaming .bubble { opacity: 1; }
 </style>
 </head>
@@ -156,8 +158,6 @@ window.vt = {
     const root = document.documentElement.style;
     if (accent) {
       root.setProperty('--accent', accent);
-      const [r, g, b] = hexRGB(accent);
-      root.setProperty('--accent-shadow', `rgba(${Math.round(r * .35)},${Math.round(g * .35)},${Math.round(b * .7)},.38)`);
     }
     if (text) {
       // 主程序给的「主题文字色」优先，但要过一道可读性闸：底色是点缀色，

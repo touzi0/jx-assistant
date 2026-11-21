@@ -138,7 +138,7 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   transform-box: fill-box; transform-origin: center;   /* 以图标自身盒中心为轴心，扭动不跑偏 */
   /* 图标颜色不单独设：currentColor 跟随按钮文字色（浅色主题黑、深色主题浅，自适应） */
 }
-/* 三个入口图标比全局默认（16px）稍放大；数字经理的小人是视觉主角，再大一号 */
+/* 三个入口图标比全局默认（16px）稍放大；长期助理的小人是视觉主角，再大一号 */
 #sidebar .actions .side-btn > svg { width: 18px; height: 18px; }
 #sidebar .actions #btn-new-assistant .doll-wrap svg { width: 20px; height: 20px; }
 #sidebar .actions .side-btn.wig > svg,
@@ -301,24 +301,32 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   display: flex; flex-direction: column; gap: 3px;
   padding: 4px 10px 12px;
 }
-/* 底部按钮格（组件入口格 #foot-apps / 内置格 .foot-grid）：桌面 display:contents
-   完全透明，按钮仍是 .sidebar-foot 的直接行；手机端窄屏媒体查询里整个
-   .sidebar-foot 切三栏网格（两个格容器都透明，market/sites/回收站同吃一行三格）。
-   组件往底部加按钮 append 进 #foot-apps（回收站上方）即可，不锚定兄弟按钮
-   （契约见 index.html 同名注释） */
+/* ---------- 界面插槽：左侧栏底部入口格（JX.slot('sidebar.foot')） ----------
+   「标准定位格式」之一。组件只交「图标 + 名字 + 序号 + 点击」
+   （JX.slot('sidebar.foot').add({key,label,icon,order,title,onClick})），
+   条目骨架、排序、两套形态的排版全归插槽，组件一行布局 CSS 都不写。
+   · 电脑：本条 .sidebar-foot 竖排，每个条目整行（下面的 .foot-btn 规则）；
+   · 手机：窄屏媒体查询里整条切三列均分网格（3 个一行，4~6 个自动两行）；
+   · 序号 order 小的在最下面（紧贴设置行），大的往上叠——排序在 app-core.js 的
+     插槽实现里做（DOM 按序号降序，桌面从上往下读就是大的在上）；内置「回收站」
+     是第一位使用者（order 1），组件从 2 起往上叠。
+   .foot-grid 桌面/手机都 display:contents：容器自己不参与排版，条目直接参与
+   .sidebar-foot 的行/网格——所以两套形态的规则只写在这一个地方。 */
 .foot-grid { display: contents; }
 /* 连接状态胶囊：嵌在设置行右侧、紧跟反馈胶囊（行内居中由 flex 的 align-items:center
    保证；右对齐交给 .foot-feedback 的 margin-left:auto 这一个锚点） */
 .foot-btn .pill { margin-left: 0; flex: none; }
-/* 底部整行按钮（回收站/设置）：无边框，悬停/选中整行落一层胶囊底（仿参考站） */
+/* 插槽条目 / 设置行（.foot-btn）：无边框，悬停/选中整行落一层胶囊底（仿参考站）。
+   手机上同一批 .foot-btn 变三栏网格里的格子（尺寸与标签行数见窄屏媒体查询） */
 .foot-btn {
   display: flex; align-items: center; gap: 8px;
   width: 100%; height: 42px; padding: 0 10px;
   background: none; border: none; border-radius: 12px;
   color: var(--text); font-size: 14px; cursor: pointer; text-align: left;
 }
-/* 按钮文字（市场入口过渡期长名「企业技能包 / 工作流」）：桌面整名放得下；
-   窄屏三栏格照旧截断（省略号），不换行撑破 42px 按钮高 */
+/* 条目标签（.foot-btn-label）：电脑单行、放不下出省略号；手机上最多两行、
+   超出直接裁掉（见窄屏媒体查询）。条目里的文字一律装在这个 span 里——
+   裸文本节点拿不到行数/裁断规则，会在三栏格里自由换行把格子挤变形 */
 .foot-btn-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .foot-btn svg { color: var(--text-2); }
 .foot-btn:hover { background: var(--hover); }
@@ -331,18 +339,24 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 .pill.warn { color: var(--amber); background: var(--amber-bg); }
 .pill.gray { color: var(--text-2); background: var(--gray-bg); }
 
-/* 手机远程访问图标（正常态顶替绿色胶囊）：强调色小图标，点击直达网络访问分区；
-   与左侧「反馈」胶囊同高（26px）、同全圆角，凑成一排右对齐的控件组。
+/* 手机远程访问胶囊（正常态顶替绿色胶囊）：图标 +「手机」两字，点击直达网络访问
+   分区（二维码/配对就在那一页）。2026-11-18 用户口径：图标不变，加两个字让人
+   一眼看出这是手机接入的入口——所以它从 26px 的圆图标长成与左侧反馈胶囊同高
+   （26px）、同全圆角的小胶囊，横向按内容撑开、绝不换行撑高。
    .half=已开启但网关未连上；.off=未开启（线条仍走主题强调色，只用不透明度区分状态） */
 .foot-phone {
   flex: none;
   display: inline-flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px; border-radius: 999px;
+  height: 26px; min-width: 26px; padding: 0 9px; gap: 4px;
+  border-radius: 999px;
+  font-size: 11.5px; line-height: 1; white-space: nowrap;
   color: var(--accent);
   background: var(--accent-bg, rgba(77, 107, 254, .12));      /* 兼容老内核的兜底 */
   background: color-mix(in srgb, var(--accent) 14%, transparent); /* 跟着主题色走 */
   cursor: pointer;
 }
+/* 文字部分：不可收缩（宁可挤掉边上别的控件，也保证「手机」二字完整可见） */
+.foot-phone-label { flex: none; }
 /* 描边跟定主题强调色：.foot-btn svg 的灰色（--text-2）是给「回收站/设置」定的，
    这里按元素把颜色继承回来——否则手机图标与反馈图标都会被刷成灰线 */
 .foot-phone svg, .foot-feedback svg { color: inherit; }
@@ -442,6 +456,23 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   box-shadow: 0 6px 24px rgba(0,0,0,.12); font-size: 13px;
 }
 .app-toast.hidden { display: none; }
+
+/* 关于页「联系我们」：邮箱 + 微信二维码。二维码必须白底——深色主题下与背景
+   混在一起就扫不出来，所以白底卡片不跟随主题变量。
+   排版（2026-11-18 用户口径）：**靠左**；三行文字（邮箱/微信/备注）一段，
+   二维码单独一行放在文字下面，不跟文字并排。 */
+.contact-card { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; }
+.contact-lines { display: flex; flex-direction: column; gap: 8px; font-size: 13px; max-width: 100%; }
+.contact-line { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.contact-k { color: var(--text-3); flex-shrink: 0; }
+.contact-card a { color: var(--accent); text-decoration: none; word-break: break-all; }
+.contact-card a:hover { text-decoration: underline; }
+.contact-tip { margin: 2px 0 0; }
+.contact-qr {
+  flex: none; padding: 8px; border-radius: 10px;
+  background: #fff; border: 1px solid var(--border, #e2e4e9);
+}
+.contact-qr img { display: block; max-width: 180px; height: auto; border-radius: 4px; }
 
 /* 关于页问题反馈 */
 .fb-kinds { display: flex; gap: 8px; margin-bottom: 8px; }
@@ -573,8 +604,10 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
    且不分会话/视图——主对话、工作任务会话、右栏子对话一致）。 */
 .msg.user.ai { align-items: flex-start; }
 .msg.user.ai .bubble {
-  background: var(--chip);
-  --fold-bg: var(--chip);                 /* 折叠渐隐终点 = 气泡自身底色 */
+  /* 背景可被「用户记忆」组件改色：--ai-bubble 由组件 client.js 按设置注入
+     （缺省不设 = 跟随主题灰），见 组件/user-memory/client.js。 */
+  background: var(--ai-bubble, var(--chip));
+  --fold-bg: var(--ai-bubble, var(--chip));       /* 折叠渐隐终点 = 气泡自身底色 */
   border-radius: 14px 14px 14px 4px;      /* 尾巴朝左下 */
 }
 /* aiuser 正文按 Markdown 渲染（2026-11-05 拍板方向 A，JS 给气泡挂 .md 类）：
@@ -711,16 +744,21 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
    13~18% 铺底 + 行号列左缘 3px 竖条（inset box-shadow，不占布局），红绿从
    --green/--danger 派生，深/浅主题各自可读（暗色 --danger 已提亮）。 */
 #rp-view-file { background: var(--bg); }
+/* 顶栏：路径 + 统计 + 一排按钮。可折行——右栏常被拖窄（窄屏整屏也是窄），
+   按钮是 flex:none 撑不开，折到第二行比被裁掉好（「编辑」被挤出去就等于没入口）。 */
 .fvw-bar {
-  flex-shrink: 0; display: flex; align-items: center; gap: 8px;
+  flex-shrink: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 8px 10px 8px 14px; border-bottom: 1px solid var(--border-2);
 }
 .fvw-path {
-  flex: 1; min-width: 0; font-family: Consolas, \"Courier New\", monospace;
+  flex: 1 1 10em; min-width: 0; font-family: Consolas, \"Courier New\", monospace;
   font-size: 12.5px; font-weight: 600; color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.fvw-stat { flex: none; font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
+.fvw-stat {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  font-size: 11.5px; color: var(--text-3); white-space: nowrap;
+}
 .fvw-stat .gs { color: var(--green); font-weight: 600; }
 .fvw-stat .rs { color: var(--danger); font-weight: 600; }
 .fvw-ico {
@@ -772,6 +810,50 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 @media (max-width: 640px) {
   .fdiff-table { font-size: 12px; }
 }
+
+/* ---------- 右栏「文件」视图的编辑模式（顶栏「编辑」→ 最新全文 textarea） ----------
+   编辑区放的是文件当前完整内容（不是 diff、不是历史版本）；保存 / 取消在底部
+   独立一条。字号不写死 px：外层取 --chat-fs（设置里「字体大小」的同一基准），
+   textarea 内部按 em 相对值收一点，与右侧栏其余正文同步变化。 */
+.fvw-note.ok { color: var(--green); background: color-mix(in srgb, var(--green) 8%, var(--bg)); }
+.fvw-ico:disabled { opacity: .45; cursor: default; }
+.fvw-ico:disabled:hover { color: var(--text-2); border-color: var(--border); }
+.fvw-edit-wrap {
+  flex: 1; min-height: 0; display: flex; background: var(--code-bg);
+  font-size: var(--chat-fs); /* 编辑器字号基准（内部一律 em） */
+}
+.fvw-edit-wrap.hidden { display: none; }
+.fvw-editor {
+  flex: 1; min-width: 0; min-height: 0; resize: none; margin: 0;
+  border: 0; outline: none; border-radius: 0;
+  background: var(--code-bg); color: var(--text);
+  font-family: Consolas, "Courier New", monospace;
+  font-size: .93em; line-height: 1.6; tab-size: 4;
+  padding: 10px 14px; white-space: pre; overflow: auto;
+}
+.fvw-editor.wrap { white-space: pre-wrap; word-break: break-all; }
+.fvw-editor:disabled { opacity: .7; }
+.fvw-edit-bar {
+  flex-shrink: 0; display: flex; align-items: center; gap: 8px;
+  padding: 7px 12px; border-top: 1px solid var(--border-2); background: var(--bg);
+  font-size: var(--chat-fs);
+}
+.fvw-edit-bar.hidden { display: none; }
+.fvw-edit-hint {
+  flex: 1; min-width: 0; font-size: .93em; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fvw-btn {
+  flex: none; font: inherit; font-size: .93em; cursor: pointer;
+  padding: 4px 14px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); color: var(--text-2);
+}
+.fvw-btn:hover { color: var(--text); border-color: var(--text-3); }
+.fvw-btn.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+.fvw-btn.primary:hover { filter: brightness(1.08); color: #fff; }
+.fvw-btn:disabled { opacity: .5; cursor: default; }
+.fvw-btn:disabled:hover { color: var(--text-2); border-color: var(--border); }
+.fvw-btn.primary:disabled:hover { color: #fff; border-color: var(--accent); }
 
 /* 交付成果卡片：deliver_result 登记的最终交付文件。
    每行动作按访问位置自适应（app-chat.js 的 isRemoteClientEnv）：本机「打开 /
@@ -884,6 +966,21 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 .md th, .md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
 .md th { background: var(--code-bg); font-weight: 600; }
 .md b, .md strong { font-weight: 600; }
+/* marked 渲染器新增语法（引用块/分隔线/任务列表/嵌套列表/图片）：字号一律
+   继承 .msg-col 的 --chat-fs（em/浏览器默认相对值），不引入第二套字号体系 */
+.md blockquote {
+  margin: 8px 0; padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border-2); color: var(--text-2);
+}
+.md blockquote > :first-child { margin-top: 0; }
+.md blockquote > :last-child { margin-bottom: 0; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md li > ul, .md li > ol { margin: 3px 0; }
+.md input[type="checkbox"] {
+  width: .95em; height: .95em; margin: 0 6px 0 0;
+  vertical-align: middle; accent-color: var(--accent);
+}
+.md img { max-width: 100%; }
 
 /* ---------- 回合折叠条与过程行（思考/工具统一折叠体系，对齐 DSH） ---------- */
 
@@ -922,6 +1019,17 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   border-left: 2px solid var(--border-2);
   margin: 12px 0 0 9px; padding: 2px 0 2px 15px;
 }
+
+/* 承接段的「更早 N 条」：只带必要上下文之后，更早的父会话历史按需懒加载
+   （GET /api/sessions/{id}/inherit），点一次取一批，取完自己消失 */
+.tf-sec.inherit > .inherit-more {
+  display: block; width: 100%; margin: 0 0 6px;
+  border: 1px dashed var(--border); border-radius: 8px;
+  background: none; padding: 5px 10px; color: var(--text-3);
+  font-size: .9em; font-family: inherit; text-align: left; cursor: pointer;
+}
+.tf-sec.inherit > .inherit-more:hover:not(:disabled) { color: var(--text-2); background: var(--hover); }
+.tf-sec.inherit > .inherit-more:disabled { cursor: default; opacity: .7; }
 
 /* 过程行：思考行与工具行统一样式（单行标题，点开看详情） */
 .proc-row { margin: 0; font-size: 1em; } /* 基准＝对话区基准：过程行/工具行/文件改动行与正文同大，行内次要信息 -1 档（.93em） */
@@ -1063,6 +1171,9 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
   color: var(--amber); background: rgba(214, 158, 46, .12);
   border: 1px solid rgba(214, 158, 46, .4);
 }
+/* 审批结论徽章：已通过（绿，与「完成未查看」绿点同口径）；未通过/已取消沿用琥珀提醒色 */
+.pc-badge.ok { color: var(--green, #3fa66a); background: rgba(63, 166, 106, .12); border-color: rgba(63, 166, 106, .4); }
+.plan-card.approved { border-color: rgba(63, 166, 106, .4); border-left-color: var(--green, #3fa66a); }
 .pc-body { padding: 8px 12px 0; }
 .pc-title { margin: 0; font-weight: 600; }
 .pc-desc { margin: 4px 0 0; color: var(--text-2); line-height: 1.6; }
@@ -1600,7 +1711,7 @@ body.rp-open .w-handle { display: none; }
 
 /* 设置页：上下文压缩 */
 .compact-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-/* 设置 · 对话历史与压缩：数字经理主对话按版本管理（新建一版为主入口，压缩次之）。
+/* 设置 · 对话历史与压缩：长期助理主对话按版本管理（新建一版为主入口，压缩次之）。
    版本**不铺开成一串卡片**：一个紧凑下拉选当前用哪一版（设置页唯一入口，见
    app-core.js 的 renderAssistantVersionPicker），动作按钮放在下拉下面。 */
 .cs-sub { font-size: 12px; color: var(--text-2); margin: 16px 0 8px; }
@@ -1614,7 +1725,7 @@ body.rp-open .w-handle { display: none; }
 .compact-actions .set-act:disabled { opacity: .55; cursor: default; }
 .compact-actions .set-act.primary { color: var(--accent); border-color: rgba(77, 107, 254, .45); font-weight: 600; }
 
-/* 数字经理版本下拉（只在设置页「跟数字经理对话」那一节一处）。按钮是一枚细条
+/* 长期助理版本下拉（只在设置页「跟长期助理对话」那一节一处）。按钮是一枚细条
    （写「第 N 版」），点开**就地展开**列出全部版本：每项「第几版 + 消息数 · 最后
    更新时间」，当前版打勾高亮。菜单不浮层——设置页所在的 .set-pane 是滚动容器，
    浮层会被它的滚动边界裁掉（这里是唯一的入口，按就地展开写即可）。 */
@@ -1701,7 +1812,7 @@ body.rp-open .w-handle { display: none; }
   background: transparent;
   /* 内容自适应高度交给浏览器原生（Chromium≥123）：不再由 JS「写 auto→读
      scrollHeight→写回」量高——那条路径每次按键强制同步布局，在几百条消息的
-     超大对话（数字经理主对话）上是逐键卡顿的主凶。不支持的内核（如 iOS
+     超大对话（长期助理主对话）上是逐键卡顿的主凶。不支持的内核（如 iOS
      Safari）由 app-core.js 的 autoGrow 兜底量高。max/min-height 照常生效：
      高度被钳住时超出部分走 textarea 自带滚动。 */
   field-sizing: content;
@@ -1843,6 +1954,21 @@ body.rp-open .w-handle { display: none; }
 }
 .chat-loading .cl-retry:hover { border-color: var(--accent); color: var(--accent); }
 
+/* 分批加载顶条（超长对话）：初始只加载最近一批，上方未加载的历史在此提示
+   （上翻自动预取，点击立即取）；加载中显示转圈。贴消息列顶部、不占常驻空间 */
+.load-older {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 8px 0 6px; color: var(--text-3); font-size: .88em; cursor: pointer;
+  user-select: none;
+}
+.load-older:hover { color: var(--accent); }
+.load-older .cl-spin {
+  flex: none; width: 13px; height: 13px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: st-spin .9s linear infinite;
+}
+.load-older.loading { cursor: default; color: var(--text-3); }
+
 /* ---------- 居中弹窗（.modal）：层级一律走 :root 的 --z-* 阶梯 ---------- */
 /* 默认业务弹窗带（--z-dialog）：一切弹窗永远在一切页面（--z-page 及以下）之上 */
 .modal {
@@ -1910,6 +2036,12 @@ body.rp-open .w-handle { display: none; }
   font-size: 11px; color: var(--amber); border: 1px solid currentColor;
   border-radius: 999px; padding: 0 8px; line-height: 17px;
 }
+/* 「已覆盖」徽标：本对话把该项拨离了全局开关（按对话组件/插件浮窗）；
+   组件页里可点击＝拨回全局值恢复跟随 */
+.plugin-row .pr-ovr {
+  font-size: 11px; color: var(--accent); border: 1px solid currentColor;
+  border-radius: 999px; padding: 0 8px; line-height: 17px; cursor: default;
+}
 .plugin-row p { margin: 3px 0 0; font-size: 12px; color: var(--text-3); }
 .plugin-row .pr-note { flex-basis: 100%; font-size: 11px; color: var(--green, #2ea043); min-height: 0; }
 /* 苹果式开关：轨道 42×25、白圆钮带投影，选中滑向右侧并染强调色 */
@@ -1933,6 +2065,28 @@ body.rp-open .w-handle { display: none; }
 .pr-toggle input:checked + span::after { left: 19px; }
 .pr-toggle input:disabled + span { opacity: .4; cursor: not-allowed; }
 .pr-toggle input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* 按对话浮窗：每行两个开关（上＝本对话启停，下＝该组件设置「会话独立/跟随全局」），
+   竖排 + 10px 说明字；两个开关等比缩一档（42×25 在两行里太占高度） */
+.pr-toggles {
+  display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; align-items: center;
+}
+.pr-toggles .cxs-tg { display: flex; align-items: center; gap: 6px; }
+.pr-toggles .cxs-tg em {
+  font-style: normal; font-size: 10.5px; line-height: 1; color: var(--text-3);
+  min-width: 22px; text-align: left;
+}
+.pr-toggles .pr-toggle span { width: 36px; height: 21px; }
+.pr-toggles .pr-toggle span::after { width: 17px; height: 17px; }
+.pr-toggles .pr-toggle input:checked + span::after { left: 17px; }
+/* 底部总开关行（本对话使用独立的组件设置）：左标题+说明，右开关 */
+.cxs-scope-row {
+  display: flex; align-items: center; gap: 12px; justify-content: space-between;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;
+}
+.cxs-scope-row .cxs-scope-txt { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.cxs-scope-row .cxs-scope-txt b { font-size: 13px; }
+.cxs-scope-row .cxs-scope-txt .tip { margin: 0; font-size: 11.5px; }
 .jx-section { margin-top: 4px; }
 #plugin-composer-controls { display: inline-flex; align-items: center; gap: 6px; }
 
@@ -2242,6 +2396,37 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 .ap-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
 .ap-head b { font-size: 13px; }
 .ap-head span { font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 头部右侧成组（倒计时 / 停表 / 折叠按钮）：整组靠右，折叠按钮永远在最后一位。
+   成组是为了不跟倒计时胶囊各抢一份 margin-left:auto（两个 auto 会把空档对半分，
+   倒计时就不贴右了） */
+.ap-head-right { margin-left: auto; align-self: center; display: flex; align-items: center; gap: 6px; flex: none; }
+/* 卡片右上角的「折叠成一行」按钮：观感对齐右下角角标堆的折叠按钮（.ask-dock-btn），
+   但尺寸压到 16px 免得把标题行顶高（默认态外观必须与改动前一致，见 .ap-head 的 17px） */
+.ap-fold-btn {
+  flex: none; cursor: pointer; font: inherit; font-size: 12px; line-height: 1;
+  padding: 1px 7px; border: 1px solid var(--border); border-radius: 7px;
+  background: var(--bg); color: var(--text-2);
+}
+.ap-fold-btn:hover { color: var(--accent); border-color: rgba(77, 107, 254, .4); }
+/* 折叠态：整张卡只留一行（类型 + 摘要 + 展开箭头），让出高度给上面的正文输出。
+   折叠是纯视觉——卡里的按钮与输入框只是 display:none 不显示，计时/提交/角标照旧；
+   没折叠过就完全走原来的样式（.ap-fold 平时不参与布局，零占位） */
+.ap-fold { display: none; }
+.ap-card.folded { padding: 6px 10px; }
+.ap-card.folded > *:not(.ap-fold) { display: none !important; }
+.ap-card.folded > .ap-fold { display: flex; }
+.ap-fold {
+  width: 100%; box-sizing: border-box; align-items: center; gap: 6px;
+  margin: 0; padding: 0; border: none; background: none;
+  font: inherit; font-size: 12.5px; line-height: 20px; color: var(--text);
+  text-align: left; white-space: nowrap; cursor: pointer;
+}
+.ap-fold .ap-fold-kicker { flex: none; font-weight: 600; }
+.ap-fold .ap-fold-sum { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-2); }
+.ap-fold .ap-fold-hint { flex: none; font-size: 11.5px; color: var(--text-3); }
+.ap-fold .ap-fold-go { margin-left: auto; flex: none; font-size: 14px; color: var(--text-3); }
+.ap-fold .q-count { margin-left: 0; padding: 0 6px; font-size: 11px; line-height: 16px; } /* 折叠行里倒计时紧跟摘要后，且不把这一行撑高 */
+.ap-fold:hover .ap-fold-go, .ap-fold:hover .ap-fold-hint { color: var(--accent); }
 /* 提问卡倒计时（ask_user_question 的 timeout_sec）：mm:ss 胶囊推到标题行右侧，
    ≤10 秒变红；停表后显示「∞ 不限时」；旁边的停止按钮一键停表（悬停/触碰卡片同效） */
 .q-count {
@@ -2522,6 +2707,14 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 .pv-head.off .pv-name { text-decoration: line-through; text-decoration-thickness: 1px; text-decoration-color: var(--text-3); }
 .pv-toggle { flex-shrink: 0; }
 .pv-edit { margin-left: auto; font-size: 12px; color: var(--text-3); }
+/* 组件插槽（公司通道卡片的标题行）：组件往里放按钮，主程序只认这个抓手。
+   空插槽不占位——组件没装/没开、或服务端没开门户时，标题行不多出空档。 */
+.pf-card-slot { display: inline-flex; align-items: center; gap: 0.4em; }
+.pf-card-slot:empty { display: none; }
+/* 设置行的账号胶囊挂载点（上面那套插槽的第二个用处，index.html 里在反馈胶囊旁）：
+   注入「账号」胶囊时反馈胶囊被隐藏，右对齐锚点（.foot-feedback 的 margin-left:auto）
+   随位置转到这里——胶囊仍紧贴右边的手机胶囊，整排控件不掉到行中间。 */
+.pf-card-slot[data-cx-slot="account-pill"] { margin-left: auto; }
 .pv-dirty { font-size: 11px; color: var(--amber); border: 1px solid currentColor; border-radius: 999px; padding: 0 8px; line-height: 17px; flex-shrink: 0; }
 .pv-form { padding: 4px 14px 14px; border-top: 1px solid var(--border); }
 .pf-label { font-size: 12px; color: var(--text-3); margin: 10px 0 4px; }
@@ -2773,6 +2966,20 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
   .pg-run.live .pg-run-elapsed { visibility: hidden; }
 }
 .pg-run.live .pg-run-time { color: var(--accent); }
+/* 后台等待项（挂出去等人的询问/审批/计划）：与「运行中的程序」同一套版式，
+   但按钮是「查看」（点它把那一条的卡弹到输入框上方），所以按钮常显、不需要
+   悬停才现身——它是这一行唯一可点的东西。时长文字（已等 N）与它并列排开。 */
+.pg-ask .pg-run-time { display: inline-flex; align-items: baseline; gap: 8px; }
+.pg-ask .pg-ask-open {
+  padding: 0; border: none; background: none; color: var(--accent);
+  font-size: .93em; font-weight: 600; cursor: pointer;
+}
+.pg-ask .pg-ask-open:hover { text-decoration: underline; }
+.pg-ask .pg-ask-open.is-open { color: var(--text-3); font-weight: 400; }
+.pg-ask-dot {
+  display: inline-block; width: 6px; height: 6px; margin-right: 4px;
+  border-radius: 50%; background: #e5a100;
+}
 .pg-run-dot {
   display: inline-block; width: 6px; height: 6px; margin-right: 4px;
   border-radius: 50%; background: var(--accent); animation: pgPulse 1.4s ease-in-out infinite;
@@ -2828,6 +3035,8 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
   /* 亮色琥珀 #9a6700 在暗底上发暗：运行中转圈/状态字（.st-icon、⟳ 运行中等
      一整族琥珀色元素）暗色下统一提亮，同 .s-time.wait 手写的 #e8a33d */
   --amber: #e8a33d;
+  /* 亮色绿 #1f9d55 在暗底发暗：审批通过徽章/计划卡绿边（.pc-badge.ok 等）暗色下提亮 */
+  --green: #4ac07d;
   --gray-bg: #22252c;
   --danger: #ff9d8f;
   /* 暗色主题：用户气泡不能加白（否则亮底配亮字），改成「主题色调暗」的同色系深色 */
@@ -2956,7 +3165,7 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 .session-item .s-time.wait { color: var(--amber); font-weight: 600; }
 :root[data-theme='dark'] .session-item .s-time.wait { color: #e8a33d; }
 
-/* 技能面板：行样式复用「内置组件/插件」的 plugin-row + pr-toggle，仅补本页专属组件 */
+/* 技能面板：行样式复用「组件/插件」的 plugin-row + pr-toggle，仅补本页专属组件 */
 /* 分组标题的弱化后缀（自带技能 · 常开 等） */
 .sec-sub { font-size: 11px; font-weight: 400; color: var(--text-3); margin-left: 6px; }
 /* 自带技能的「常开」徽章：与插件页 pr-badge 同款胶囊，中性灰 */
@@ -2980,7 +3189,7 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
   font-size: 12px; color: var(--text-3); text-align: center;
 }
 
-/* 子对话专家面板：卡片行排版与「内置组件」的 plugin-row 完全同款
+/* 子对话专家面板：卡片行排版与「组件」的 plugin-row 完全同款
    （名称 13px 粗、描述 12px 灰、元信息 11px），仅容器换成可展开卡片 */
 .ex-head-info { flex: 1; min-width: 0; cursor: pointer; }
 .ex-head-info .pr-line { display: flex; align-items: center; gap: 8px; }
@@ -3087,11 +3296,32 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
     min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
 
-  /* 底部框架：设置行不变；组件入口（#foot-apps 格）/回收站（.foot-grid 格）的
-     按钮同吃一个三栏网格——网格上移到 .sidebar-foot，两个格容器保持
-     display:contents（桌面侧同款），设置行 grid-column 整行独占最底 */
-  .sidebar-foot { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; }
+  /* 底部入口格（插槽 sidebar.foot）：设置行不变；条目（组件入口 + 内置回收站）
+     同吃一个三列网格——网格在 .sidebar-foot 上，格容器保持 display:contents，
+     设置行 grid-column 整行独占最底。
+     三列用 minmax(0, 1fr) 而不是 1fr：1fr 的实际下限是 auto，即每个格子的
+     min-content，「企业技能包 / 工作流」这种长名会把第一列撑开、后两列被挤成
+     竖排（2026-11-06 用户报的现象）。minmax(0,…) 去掉内容下限＝真正三格均分、
+     宽度不可调；再靠条目 min-width:0 + 固定格高 + 标签最多两行截断收住内容。
+     条目多了自动换行：3 个一行，4~6 个自动两行（序号小的排下一行，见插槽排序） */
+  .sidebar-foot { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; }
   #btn-settings { grid-column: 1 / -1; }
+  /* 窄屏设置行（手机横排一行）：手机胶囊再收紧一点，字号略缩保住「手机」二字 */
+  .foot-phone { padding: 0 7px; gap: 3px; font-size: 10.5px; }
+  .sidebar-foot .foot-btn {
+    min-width: 0; width: 100%; height: var(--foot-cell-h, 46px);
+    padding: 4px 8px; gap: 6px; align-items: center; overflow: hidden;
+  }
+  /* 标签最多两行，多出来的直接裁掉（不用省略号、也不换行撑破格子）。
+     断行按「词/空格」走（keep-all）：中文长名在空格处断开——
+     「企业技能包 / 工作流」断成「企业技能包」＋「/ 工作流」两行，
+     而不是从中间任意一个字切成「企业技能包 / 工」＋「作流」；
+     单个词长到一行放不下时再由 overflow-wrap 兜底任意断 */
+  .sidebar-foot .foot-btn-label {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    white-space: normal; word-break: keep-all; overflow-wrap: anywhere; overflow: hidden;
+    font-size: 11.5px; line-height: 1.25;
+  }
 
   /* 输入工具栏（用户敲定的排布）：左组（加号+权限）恒为标准形状不参与收缩，
      权限右侧留 8px 固定间距（与其他按钮间距一致）后紧跟右组；右组是整体
@@ -3292,7 +3522,7 @@ html.electron-shell .bpw-hint { display: none; }
 .ccp-cmd-hint { font-weight: 400; opacity: .55; font-size: 11px; }
 .ccp-cmd-desc { font-size: 11px; opacity: .65; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 市场视图、小程序平台视图的样式已随组件化迁入各自组件目录
+/* 市场视图、企业小程序视图的样式已随组件化迁入各自组件目录
    （组件/skill-market/client.css、组件/sites-platform/client.css）。 */
 
 
@@ -3313,6 +3543,38 @@ html.electron-shell .bpw-hint { display: none; }
 .wz-either { font-size: 12.5px; color: var(--text-2); padding: 2px 0 0; }
 .wz-either b { color: var(--text); font-weight: 600; }
 .wz-form label.strong { color: var(--text); font-weight: 600; } /* 姓名标签：黑字加粗，与二选一提示行同款强调 */
+/* 向导左侧防误触带：输入公司名/人名时拖选文字惯性往左滑，滑出输入区点到遮罩会
+   误关向导——带子与弹窗包在同一个壳里（.wz-shell 承担圆角/阴影/裁剪），两者同高
+   零缝隙拼接成一块：点带子 target 不是遮罩即不关窗，滑过拼缝也不会踩到遮罩
+   （app-wizard.js 的按下起点判定是第二道防线） */
+.wz-shell {
+  display: flex; align-items: stretch;
+  max-width: calc(100vw - 32px); max-height: 88vh;
+  /* 壳本身不铺底色：只有卡片有实底，防误触带是真半透明、透出后面的遮罩 */
+  border-radius: 14px; overflow: hidden;
+  box-shadow: 0 8px 30px rgba(16, 20, 26, .12);
+}
+.wz-guard {
+  flex: 0 1 auto; width: 220px; min-width: 0; overflow: hidden; /* 窄窗口时先让带子收窄，卡片不缩 */
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 16px; background: rgba(255, 255, 255, .5);
+  backdrop-filter: blur(12px); /* 磨砂：半透明透出底色，又不让身后页面的文字/按钮透上来 */
+  user-select: none; cursor: default;
+}
+.wz-guard::before, .wz-guard::after {
+  content: ''; width: 1px; flex: 0 0 56px; background: rgba(15, 18, 22, .3);
+}
+.wz-guard span {
+  writing-mode: vertical-rl; letter-spacing: .45em; padding-inline-start: .45em; /* 末字空隙补偿视觉居中 */
+  font-size: 12.5px; color: rgba(15, 18, 22, .42);
+}
+:root[data-theme='dark'] .wz-shell { box-shadow: 0 8px 30px rgba(0, 0, 0, .5); }
+:root[data-theme='dark'] .wz-guard { background: rgba(255, 255, 255, .07); }
+:root[data-theme='dark'] .wz-guard::before, :root[data-theme='dark'] .wz-guard::after { background: rgba(255, 255, 255, .25); }
+:root[data-theme='dark'] .wz-guard span { color: rgba(255, 255, 255, .42); }
+/* 壳内的卡片去掉自己的圆角/边框/阴影（外壳负责），也不参与收缩：拼缝只剩色差、没有多余竖线 */
+.wz-shell .welcome-card { flex: 0 0 auto; border-radius: 0; border: none; box-shadow: none; }
+@media (max-width: 639.98px) { .wz-guard { display: none; } } /* 窄屏空间不足：卡片占满屏宽，带子放不下 */
 
 /* ============================================================
    MCP 服务器（app-ccplugins.js 的 MCP 分区：手动添加行 + 设计软件

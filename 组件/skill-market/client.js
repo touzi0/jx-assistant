@@ -10,7 +10,11 @@
  * .foot-grid、视图插在 #main 顶栏后、弹层挂 body 尾），dispose 完整撤销
  * （关视图、清定时器与监听、删 DOM 与 window 接口、注销设置区）。
  * 技能/组件/插件/MCP 四 tab + 搜索 + 一键安装/更新/卸载；装/卸后调
- * CX.refresh() 热加载/热卸载组件，不刷新页面。样式在 client.css（mk-*）。 */
+ * CX.refresh() 热加载/热卸载组件，不刷新页面。样式在 client.css（mk-*）。
+ * 上传（先装后传）覆盖技能/组件/插件三类：本机已装清单里选一个 → 后端从
+ * 安装目录现场打包（组件/插件剔除运行时产物）→ 转发市场服务器 /api/market/
+ * publish；服务端开审核时弹「等待管理员审核」文案（message 服务器下发）。
+ * MCP 条目不走客户端上传（管理员在服务端管理页/CLI 发布）。 */
 (function () {
   if (!window.CX) return;
 
@@ -21,7 +25,8 @@
   let mkTab = 'skill';      // 当前 tab：skill | component | plugin | mcp
   let mkLoading = false;    // 清单在途（防抖动重复渲染）
   let mkAutoTimer = 0;      // 市场页开着时的 60s 静默复查
-  let btnEl = null, viewEl = null, modalEl = null; // 本组件注入的三个节点
+  let btnEl = null, btnEntry = null, viewEl = null, modalEl = null; // 本组件注入的节点（btnEntry＝插槽条目句柄）
+  let legacyHost = false;  // 老前端硬编码形态（组件化之前的产品）：按钮/视图是 index.html 硬编码的，本组件整体让位
   const docKeys = [];       // document keydown 监听（dispose 逐个解绑）
 
   /* ---------- 小工具（$ / esc 自带，api / confirmCenter / openSettings 用主程序全局） ---------- */
@@ -32,32 +37,45 @@
   ));
   const addDocKey = (fn) => { document.addEventListener('keydown', fn); docKeys.push(fn); };
 
-  /* 挂载点内组件按钮按 data-order 稳定排序：组件注入先后由资产加载竞速决定
-   * （不可依赖），同挂载点的组件按钮以 data-order 约定相对位置——排的是
-   * 「同为组件的兄弟」，不锚定内置按钮（AGENT.md 挂载规矩）。 */
-  function sortMounts(grid) {
-    [...grid.children]
-      .sort((a, b) => (parseFloat(a.dataset.order || 50) - parseFloat(b.dataset.order || 50)))
-      .forEach((el) => grid.appendChild(el));
-  }
-
   /* ---------- DOM 注入（HTML 原样来自原 index.html，id/class 不变） ---------- */
 
   function injectDOM() {
-    // 侧栏入口：往组件入口格 #foot-apps（回收站上方的分区挂载点）末尾 append
-    // （组件挂载规矩：不锚定其他按钮的 DOM 位置）
-    const grid = document.getElementById('foot-apps') || document.querySelector('.sidebar-foot .foot-grid');
-    if (grid) {
+    // 侧栏入口：向底部插槽申请一个条目（order 2，排在回收站 1 之上；组件注入
+    // 先后由资产加载竞速决定，位置只认插槽的序号排序）。骨架、排序、电脑竖排 /
+    // 手机三列网格全归插槽——见 app-core.js 的 JX.slot 与 AGENT.md「界面插槽」
+    btnEntry = (window.JX && JX.slot) ? JX.slot('sidebar.foot').add({
+      key: 'skill-market', id: 'btn-market', order: 2, owner: '组件 skill-market',
+      title: '企业技能包 / 工作流：安装/更新 技能、组件与插件',
+      label: '企业技能包 / 工作流',
+      icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14l-1.2 12a1.5 1.5 0 0 1-1.5 1.4H7.7A1.5 1.5 0 0 1 6.2 19z"/><path d="M8.5 10V6a3.5 3.5 0 0 1 7 0v4"/></svg>',
+    }) : null;
+    if (btnEntry) {
+      btnEl = btnEntry.el;
+    } else {
+      // 旧 engine 没有插槽（组件块先于 engine 静默换装生效的窗口期：用户还没
+      // 重启）。先辨形态（与 sites-platform 同一套，细节见它那边注释）：
+      // · 老前端硬编码形态——index.html 自带 btn-market 与 #market-view，再注入
+      //   就是重复条目（id 撞车、入口翻倍），整体让位，重启到新 engine 自动归位；
+      // · 中间形态（有 #foot-apps、无插槽）——退回旧版直接注入，入口不因时序
+      //   消失（2026-11-06 客户事故的症状）。重注入先清自己上次的按钮；容器
+      //   认准 #foot-apps，不兜底 .foot-grid（那是硬编码按钮的家）。
+      if (document.getElementById('btn-market')) { legacyHost = true; return; }
+      const grid = document.getElementById('foot-apps');
+      if (!grid) return;
+      grid.querySelector('[data-cx-mount="' + ID + '"]')?.remove();
       btnEl = document.createElement('button');
       btnEl.id = 'btn-market';
+      btnEl.dataset.cxMount = ID;
       btnEl.className = 'foot-btn';
-      btnEl.dataset.order = '10'; // 挂载点内组件按钮的稳定排序（见下方 sortMounts）
+      btnEl.dataset.order = '10';
       btnEl.title = '企业技能包 / 工作流：安装/更新 技能、组件与插件';
       btnEl.innerHTML =
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7h14l-1.2 12a1.5 1.5 0 0 1-1.5 1.4H7.7A1.5 1.5 0 0 1 6.2 19z"/><path d="M8.5 10V6a3.5 3.5 0 0 1 7 0v4"/></svg>' +
         '<span class="foot-btn-label">企业技能包 / 工作流</span>';
       grid.appendChild(btnEl);
-      sortMounts(grid);
+      [...grid.children]
+        .sort((a, b) => (parseFloat(a.dataset.order || 50) - parseFloat(b.dataset.order || 50)))
+        .forEach((el) => grid.appendChild(el));
     }
     // 市场视图：#main 顶栏之后（与原 index.html 同位；.hidden 全局类控制显隐）
     const main = $('main');
@@ -70,7 +88,7 @@
         '<div class="mk-head">' +
         '<div class="mk-title">' +
         '<h2>企业技能包 / 工作流</h2>' +
-        '<span id="mk-server" class="mk-server" title="企业技能包 / 工作流 / 小程序平台地址（设置 · 网络访问 可改）"></span>' +
+        '<span id="mk-server" class="mk-server" title="企业技能包 / 工作流 / 企业小程序地址（设置 · 网络访问 可改）"></span>' +
         '</div>' +
         '<input id="mk-search" type="search" placeholder="搜索名称 / 描述 / 标签…" autocomplete="off" spellcheck="false">' +
         '<button id="mk-refresh" class="mk-icon-btn" title="刷新清单">' +
@@ -91,21 +109,22 @@
         '<div id="mk-list" class="mk-list"></div>';
       main.insertBefore(viewEl, topbar.nextSibling);
     }
-    // 上传弹层：modal 是 fixed 全屏遮罩，挂 body 尾即可
+    // 上传弹层：modal 是 fixed 全屏遮罩，挂 body 尾即可。标题/说明/ID 标签带
+    // id，打开时按类型（技能/组件/插件）改写——三类共用这一个弹层
     modalEl = document.createElement('div');
     modalEl.id = 'mk-upload-modal';
     modalEl.className = 'modal hidden';
     modalEl.innerHTML =
       '<div class="modal-card mku-card">' +
-      '<h3>上传技能到市场</h3>' +
-      '<p class="mku-sub">从<b>已安装的用户技能</b>里选一个发布——技能先在本机装好、试过能用，再上市场。想传新技能，先去 设置 · 技能 安装（支持拖入 zip、.md 文件或文件夹）。</p>' +
+      '<h3 id="mku-title">上传技能到市场</h3>' +
+      '<p id="mku-sub" class="mku-sub"></p>' +
       '<div id="mku-skills" class="mku-skills"></div>' +
       '<div class="mku-meta">' +
-      '<label>技能 ID <span class="mku-req">必填</span>' +
+      '<label><span id="mku-id-label">技能 ID</span> <span class="mku-req">必填</span>' +
       '<input id="mku-id" placeholder="英文短名，如 wechat-chat-ops" autocomplete="off" spellcheck="false">' +
       '</label>' +
       '<label>显示名称 <span class="mku-opt">中文为主</span>' +
-      '<input id="mku-name" placeholder="市场上与技能清单里显示的名字" autocomplete="off">' +
+      '<input id="mku-name" placeholder="市场上与清单里显示的名字" autocomplete="off">' +
       '</label>' +
       '<label>版本' +
       '<input id="mku-version" placeholder="如 1.0.0" autocomplete="off" spellcheck="false">' +
@@ -114,7 +133,7 @@
       '<input id="mku-tags" placeholder="如 办公, 自动化" autocomplete="off">' +
       '</label>' +
       '<label class="mku-wide">描述' +
-      '<input id="mku-desc" placeholder="一句话说明这个技能做什么（显示在市场的卡片上，上限 1024 字）" autocomplete="off">' +
+      '<input id="mku-desc" placeholder="一句话说明它做什么（显示在市场的卡片上，上限 1024 字）" autocomplete="off">' +
       '</label>' +
       '</div>' +
       '<div id="mku-status" class="mku-status"></div>' +
@@ -128,14 +147,14 @@
     document.body.appendChild(modalEl);
   }
 
-  /* ---------- 视图开关（body.market-mode 占领主区；与小程序平台互斥） ---------- */
+  /* ---------- 视图开关（body.market-mode 占领主区；与企业小程序互斥） ---------- */
 
   function marketOpen() {
     return document.body.classList.contains('market-mode');
   }
 
   function setMarketView(on) {
-    // 市场与小程序平台都是主区整页，互斥（sites-platform 组件可能不在场，先探）
+    // 市场与企业小程序都是主区整页，互斥（sites-platform 组件可能不在场，先探）
     if (on && typeof sitesViewOpen === 'function' && sitesViewOpen() && typeof closeSites === 'function') closeSites();
     document.body.classList.toggle('market-mode', on);
     if (viewEl) viewEl.classList.toggle('hidden', !on); // .hidden 是全局 display:none!important，必须跟着切
@@ -210,8 +229,18 @@
   }
 
   function renderMarket() {
-    const ubtn = $('mk-upload-btn'); // 「＋ 上传技能」只在技能 tab 出现
-    if (ubtn) ubtn.classList.toggle('hidden', mkTab !== 'skill');
+    // 「＋ 上传」在技能/组件/插件三个 tab 出现（MCP 条目由管理员在服务端
+    // 管理页/CLI 发布，不走客户端上传）；按钮文字跟 tab 走
+    const ubtn = $('mk-upload-btn');
+    const typeLabel = { skill: '技能', component: '组件', plugin: '插件' }[mkTab];
+    if (ubtn) {
+      const show = !!typeLabel;
+      ubtn.classList.toggle('hidden', !show);
+      if (show) {
+        ubtn.textContent = '＋ 上传' + typeLabel;
+        ubtn.title = '把一个本机已安装的' + typeLabel + '发布到市场服务器（先装后传）';
+      }
+    }
     if (!mkData) return renderMarketState('清单为空');
     const server = $('mk-server');
     if (server) {
@@ -235,13 +264,13 @@
     if (!list) return;
     const sug = mkData.suggested || '';
     list.innerHTML =
-      '<div class="mk-hint">还没配置企业技能包 / 工作流 / 小程序平台地址。两者由同一台 jxai-server 提供（部署一次，技能/组件/插件装这一处）。' +
+      '<div class="mk-hint">还没配置企业技能包 / 工作流 / 企业小程序地址。两者由同一台 jxai-server 提供（部署一次，技能/组件/插件装这一处）。' +
       (sug
         ? '<br>检测到远程接入网关，推荐直接用同一台服务器：' +
         '<div class="mk-suggest"><code>' + esc(sug) + '</code></div>' +
         '<div class="mk-suggest-acts"><button id="mk-use-suggested" class="mk-act">填入此地址</button>' +
         '<button id="mk-go-settings" class="mk-act ghost">手动设置</button></div>'
-        : '<br>到 设置 · 网络访问 · 企业技能包 / 工作流 的服务器地址里填（如 https://example.com:2227）。' +
+        : '<br>到 设置 · 网络访问 · 企业技能包 / 工作流 的服务器地址里填（如 https://jxaizz.com:2227）。' +
         '<div class="mk-suggest-acts"><button id="mk-go-settings" class="mk-act">去设置</button></div>') +
       '</div>';
     const use = $('mk-use-suggested');
@@ -309,7 +338,14 @@
     const foot = card.querySelector('.mk-card-foot');
 
     const typeLabel = { skill: '技能', component: '组件', plugin: '插件', mcp: 'MCP 连接器' }[mkTab];
-    if (e.installed) {
+    if (e.builtin) {
+      // 内置组件（随包分发）：市场不给安装/卸载——它随程序静默更新升级，
+      // 要停用去 设置 → 组件 关开关。这里只提示归属，避免用户点到报错。
+      const st = document.createElement('span');
+      st.className = 'mk-installed';
+      st.textContent = '内置（随程序更新）';
+      foot.appendChild(st);
+    } else if (e.installed) {
       const st = document.createElement('span');
       st.className = 'mk-installed';
       st.textContent = e.update ? `已装 v${e.installedVersion || '?'}（有新版）` : `已安装 v${e.installedVersion || e.version}`;
@@ -408,9 +444,9 @@
     if (ext) ext.onclick = () => { if (typeof openSettings === 'function') openSettings('plugins'); };
     const uploadBtn = $('mk-upload-btn');
     if (uploadBtn) uploadBtn.onclick = mkuShow;
-    mkuBind(); // 上传技能弹层（拖拽 / 选取 / Ctrl+V）
+    mkuBind(); // 上传弹层（表单输入 / 提交 / Esc 关闭）
     // Esc 关闭市场视图（有任何弹窗开着时不抢键：确认框/设置自己处理 Esc；
-    // 小程序平台的 Esc 由它自己的组件管）
+    // 企业小程序的 Esc 由它自己的组件管）
     addDocKey((ev) => {
       if (ev.key !== 'Escape' || !marketOpen()) return;
       const anyModalOpen = [...document.querySelectorAll('.modal')].some((m) => !m.classList.contains('hidden'));
@@ -419,24 +455,82 @@
     });
   }
 
-  /* ---------- 上传技能到市场（市场 · 技能 tab 的「＋ 上传技能」） ----------
-     先装后传：从已装的用户技能（GET /api/skills）里选一个 → 后端从安装目录
-     现场打包、走发布校验链（SKILL.md 内容体检等）→ 转发市场服务器。身份=
-     本机发布者姓名（X-Jxai-User 头），归属记录与「只能动自己发的」判权都在
-     服务端；下架是进服务端回收站，不是物理删除。
+  /* ---------- 上传到市场（技能 / 组件 / 插件三类共用一个弹层） ----------
+     先装后传：从本机已装的东西里选一个 → 后端从安装目录现场打包、走发布
+     校验链 → 转发市场服务器。身份=本机发布者姓名（X-Jxai-User 头），归属
+     记录与「只能动自己发的」判权都在服务端；下架是进服务端回收站。
 
-     元信息预填取自 GET /api/market/publish-meta?skill=<id>（后端单一事实来源：
-     五字段回退链与中文→英文 ID 词表都只在 Go 一份，前端不再持有词表副本）。
-     提交契约：POST /api/market/publish JSON {skillId, id, name, version,
-     description, tags}，成功回 {ok:1, id, version, sha256, size}；失败非 2xx
-     + {error}。 */
+     三类的差异收敛在 MKU_TYPES：
+       · 列表来源（GET /api/skills 的 user / GET /api/components 的非内置 /
+         GET /api/plugins 的 claude 层）；
+       · 元信息预填（GET /api/market/publish-meta?type=…，后端单一事实来源）；
+       · 技能的 id/版本可手填（回退链与中文→英文 ID 词表在 Go 一份）；
+         组件/插件的 id 与版本锁定为包内清单值（manifest.json / plugin.json）
+         ——市场条目 id 与安装键、「已装/可更新」判定全锚在它们上，且
+         「内容有变化必须升号」的落点就在清单文件里，弹层只读展示。
 
-  let mkuSkills = [];       // 已装用户技能清单（GET /api/skills 的 user）
-  let mkuSel = '';          // 选中的技能 id
+     提交契约：POST /api/market/publish JSON {type, skillId|componentId|
+     pluginKey, id, name, version, description, tags}，成功回 {ok:1, id,
+     version, sha256, size, message?}；服务端开了发布审核时回 pending:true +
+     message（「已上传成功，等待管理员审核…」）——文案服务器说了算，有
+     message 就原样弹（2026-11-15 口径），三类一致；失败非 2xx + {error}。 */
+
+  // MKU_TYPES 三类上传的类型差异（见节注释）
+  const MKU_TYPES = {
+    skill: {
+      label: '技能',
+      sub: '从<b>已安装的用户技能</b>里选一个发布——技能先在本机装好、试过能用，再上市场。想传新技能，先去 设置 · 技能 安装（支持拖入 zip、.md 文件或文件夹）。',
+      empty: '本机还没有安装用户技能。<br>先去 设置 · 技能 安装（支持拖入 zip、.md 文件或技能文件夹），装好、试过能用再回来发布。',
+      load: async () => {
+        const d = await api('/api/skills');
+        return (d.user || []).map((s) => ({ id: s.id, name: s.displayName || s.name || s.id, version: s.version, description: s.description }));
+      },
+      metaURL: (id) => '/api/market/publish-meta?skill=' + encodeURIComponent(id),
+      idPattern: /^[a-z0-9][a-z0-9-]*$/,
+      idBad: '技能 ID 只能用纯小写字母/数字/中划线（市场端规则）：像 wechat-chat-ops 这样，不能带中文或空格。',
+      lockIdVer: false,
+      verSrc: '',
+    },
+    component: {
+      label: '组件',
+      sub: '从<b>本机已安装的用户组件</b>里选一个发布——组件先装好、试过能用，再上市场。内置组件随程序分发、随静默更新升级，不走市场；ID 与版本取自组件的 manifest.json（只读），内容有变化先在 manifest.json 里升版本号再传。',
+      empty: '本机还没有可上传的用户组件（内置组件随程序分发，不走市场）。<br>先从市场安装，或把组件目录放进 组件/user/，在 设置 · 组件 里能看到它即算装好。',
+      load: async () => {
+        const d = await api('/api/components?rescan=1');
+        return (d.components || []).filter((c) => !c.builtin)
+          .map((c) => ({ id: c.id, name: c.name || c.id, version: c.version, description: c.description }));
+      },
+      metaURL: (id) => '/api/market/publish-meta?type=component&id=' + encodeURIComponent(id),
+      idPattern: /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+      idBad: '组件 ID 取自 manifest.json：字母/数字开头，只用字母/数字/中划线/下划线/点。',
+      lockIdVer: true,
+      verSrc: 'manifest.json',
+    },
+    plugin: {
+      label: '插件',
+      sub: '从<b>本机已安装的 Claude Code 插件</b>里选一个发布——市场装的、本地 zip/目录装的都行。ID 与版本取自插件的 plugin.json（只读），内容有变化先升版本号再传。',
+      empty: '本机还没有 Claude Code 形态的插件。<br>先在 设置 · 插件 安装（市场安装、本地 zip/目录安装都行），装好再回来发布。',
+      load: async () => {
+        const d = await api('/api/plugins');
+        return (d.plugins || []).filter((p) => p.layer === 'claude')
+          .map((p) => ({ id: p.id, name: p.displayName || p.name || p.id, version: p.version, description: p.description }));
+      },
+      metaURL: (key) => '/api/market/publish-meta?type=plugin&key=' + encodeURIComponent(key),
+      idPattern: /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+      idBad: '插件 ID 取自 plugin.json 的 name（清洗后与安装键对齐）：字母/数字开头，只用字母/数字/中划线/下划线/点。',
+      lockIdVer: true,
+      verSrc: 'plugin.json',
+    },
+  };
+
+  let mkuType = 'skill';  // 当前弹层类型：skill | component | plugin（打开时取当前 tab）
+  let mkuSkills = [];     // 已装清单（按类型取，元素 {id,name,version,description,note?}）
+  let mkuSel = '';        // 选中的条目标识（技能/组件 id、插件 key）
   let mkuSuggested = false; // 技能 ID 是后端词表建议的（不是包内自带或用户手填的）
-  let mkuBusy = false;      // 发布在途
-  let mkuErr = '';          // 提交失败的提示（优先于「就绪」）
-  let mkuEditOf = null;     // 「更新发布」时正在编辑的市场条目（{id,version}）；普通上传为 null
+  let mkuBusy = false;    // 发布在途
+  let mkuErr = '';        // 提交失败的提示（优先于「就绪」）
+  let mkuExcluded = [];   // 打包时后端剔除的运行时产物（提示「包里少了什么」）
+  let mkuEditOf = null;   // 「更新发布」时正在编辑的市场条目（{id,version}）；普通上传为 null
 
   function mkuOpen() {
     const m = $('mk-upload-modal');
@@ -445,6 +539,7 @@
 
   async function mkuShow() {
     if (mkuOpen()) return;
+    mkuType = MKU_TYPES[mkTab] ? mkTab : 'skill';
     mkuReset();
     $('mk-upload-modal').classList.remove('hidden');
     await mkuLoadSkills();
@@ -456,8 +551,9 @@
   }
 
   // mkuOpenForEdit 「更新发布」入口：打开弹层并预填该市场条目的元信息（ID /
-  // 显示名 / 描述 / 标签），**版本留空**——更新就是发一个新版本（同 id、新
-  // version）。仍需选中本机已装的技能作为包体来源；没装就装一份再回来。
+  // 显示名 / 描述 / 标签）。技能**版本留空**——更新就是发一个新版本；组件/
+  // 插件版本锁定为包内清单值，不在这里清（升号要在 manifest/plugin.json 里
+  // 做，弹层会提示）。仍需选中本机已装的条目作为包体来源；没装就装一份再回来。
   async function mkuOpenForEdit(e) {
     await mkuShow();
     mkuEditOf = { id: e.id, version: e.version };
@@ -465,14 +561,36 @@
     $('mku-name').value = e.name || '';
     $('mku-desc').value = e.description || '';
     $('mku-tags').value = (e.tags || []).join(', ');
-    $('mku-version').value = '';
+    if (!MKU_TYPES[mkuType].lockIdVer) $('mku-version').value = '';
     mkuRender();
+  }
+
+  // mkuApplyType 按当前类型改写弹层文案与只读态（打开弹层时调一次）
+  function mkuApplyType() {
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
+    const title = $('mku-title');
+    if (title) title.textContent = '上传' + T.label + '到市场';
+    const sub = $('mku-sub');
+    if (sub) sub.innerHTML = T.sub;
+    const idLabel = $('mku-id-label');
+    if (idLabel) idLabel.textContent = T.label + ' ID';
+    const idEl = $('mku-id');
+    const verEl = $('mku-version');
+    if (idEl) {
+      idEl.readOnly = T.lockIdVer;
+      idEl.title = T.lockIdVer ? ('取自包内清单，不可改（' + (T.verSrc || '') + '）') : '';
+    }
+    if (verEl) {
+      verEl.readOnly = T.lockIdVer;
+      verEl.title = T.lockIdVer ? ('取自包内清单，不可改；内容有变化先升 ' + T.verSrc + ' 的版本号') : '';
+    }
   }
 
   function mkuClearForm() {
     mkuSel = '';
     mkuSuggested = false;
     mkuErr = '';
+    mkuExcluded = [];
     mkuEditOf = null;
     ['mku-id', 'mku-name', 'mku-version', 'mku-desc', 'mku-tags'].forEach((id) => { const el = $(id); if (el) el.value = ''; });
     mkuRenderSkills();
@@ -481,6 +599,7 @@
 
   function mkuReset() {
     mkuSkills = [];
+    mkuApplyType();
     mkuClearForm();
   }
 
@@ -498,17 +617,17 @@
     return (n / 1048576).toFixed(1) + ' MB';
   }
 
-  /* ---- 已装技能清单与选择 ---- */
+  /* ---- 已装清单与选择（三类按 MKU_TYPES.load 取数，渲染同一套） ---- */
 
   async function mkuLoadSkills() {
     const box = $('mku-skills');
     if (!box) return;
-    box.innerHTML = '<div class="mku-skill-empty">正在读取已装技能…</div>';
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
+    box.innerHTML = '<div class="mku-skill-empty">正在读取已装' + T.label + '…</div>';
     try {
-      const d = await api('/api/skills');
-      mkuSkills = d.user || [];
+      mkuSkills = await T.load();
     } catch (e) {
-      box.innerHTML = '<div class="mku-skill-empty">已装技能读取失败：' + esc(e.message) + '</div>';
+      box.innerHTML = '<div class="mku-skill-empty">已装' + T.label + '读取失败：' + esc(e.message) + '</div>';
       return;
     }
     mkuRenderSkills();
@@ -517,9 +636,9 @@
   function mkuRenderSkills() {
     const box = $('mku-skills');
     if (!box) return;
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
     if (!mkuSkills.length) {
-      box.innerHTML = '<div class="mku-skill-empty">本机还没有安装用户技能。<br>' +
-        '先去 设置 · 技能 安装（支持拖入 zip、.md 文件或技能文件夹），装好、试过能用再回来发布。</div>';
+      box.innerHTML = '<div class="mku-skill-empty">' + T.empty + '</div>';
       return;
     }
     box.innerHTML = '';
@@ -527,71 +646,102 @@
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'mku-skill' + (s.id === mkuSel ? ' sel' : '');
-      const disp = s.displayName || s.name || s.id;
+      const disp = s.name || s.id;
       btn.innerHTML =
         '<div class="mku-skill-line"><b>' + esc(disp) + '</b>' +
         (s.version ? '<span class="mku-skill-id">v' + esc(s.version) + '</span>' : '') +
-        '<span class="mku-skill-id">' + esc(s.id) + '</span></div>' +
+        '<span class="mku-skill-id">' + esc(s.id) + (s.note ? esc(s.note) : '') + '</span></div>' +
         (s.description ? '<div class="mku-skill-desc">' + esc(s.description) + '</div>' : '');
       btn.onclick = () => mkuPick(s.id);
       box.appendChild(btn);
     }
   }
 
-  // mkuPick 选中一个已装技能：拉后端推导的元信息预填表单（只填空字段——更新
-  // 发布时条目既有元信息不被新包内容覆盖）。
+  // mkuPick 选中一个已装条目：拉后端推导的元信息预填表单。技能只填空字段
+  // （更新发布时条目既有元信息不被新包内容覆盖）；组件/插件的 id 与版本
+  // 锁定为包内清单值——每次选中都以清单为准覆写。
   async function mkuPick(id) {
     if (mkuBusy) return;
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
     mkuSel = id;
     mkuErr = '';
     mkuSuggested = false;
+    mkuExcluded = [];
     mkuRenderSkills();
     mkuSetStatus('正在推导元信息…');
     try {
-      const meta = await api('/api/market/publish-meta?skill=' + encodeURIComponent(id));
+      const meta = await api(T.metaURL(id));
       mkuSuggested = !!meta.idSuggested;
+      mkuExcluded = meta.excluded || [];
+      if (T.lockIdVer) {
+        $('mku-id').value = meta.id || '';
+        $('mku-version').value = meta.version || '';
+      } else {
+        const fill = (elId, v) => { const el = $(elId); if (el && v && !el.value) el.value = v; };
+        fill('mku-id', meta.id);
+        fill('mku-version', meta.version);
+      }
       const fill = (elId, v) => { const el = $(elId); if (el && v && !el.value) el.value = v; };
-      fill('mku-id', meta.id);
       fill('mku-name', meta.name);
-      fill('mku-version', meta.version);
       fill('mku-desc', meta.description);
       fill('mku-tags', (meta.tags || []).join(', '));
     } catch (e) {
-      mkuErr = '元信息推导失败：' + e.message + '（仍可手填全部字段提交；后端会再校验一遍）';
+      mkuErr = '元信息推导失败：' + e.message + (T.lockIdVer ? '（组件/插件上传要求清单可读，请先修好再传）' : '（仍可手填全部字段提交；后端会再校验一遍）');
     }
     mkuRender();
   }
 
   /* ---- 渲染与提交闸门 ---- */
 
+  // mkuMarketVersion 市场在架条目的当前版本（同版本拦截的 UX 提示；后端发布
+  // 时还会再拦一次）。清单没拉到 / 没这个条目返回 null。
+  function mkuMarketVersion(id) {
+    if (!mkData || !mkData.configured) return null;
+    const list = entriesOfTab(mkuType);
+    for (const e of list) {
+      if (e.id === id) return e.version || '';
+    }
+    return null;
+  }
+
   function mkuRender() {
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
     const id = ($('mku-id').value || '').trim();
-    const idOk = /^[a-z0-9][a-z0-9-]*$/.test(id); // 市场端只收纯小写字母/数字/中划线
+    const idOk = T.idPattern.test(id);
     const name = ($('mku-name').value || '').trim();
     const desc = ($('mku-desc').value || '').trim();
     const ver = ($('mku-version').value || '').trim();
     const meName = (mkData && mkData.me && mkData.me.name) || '';
+    const mktVer = mkuMarketVersion(id);
+    const sameVer = T.lockIdVer && id && mktVer !== null && mktVer === ver;
     let msg = '';
     let kind = '';
     if (!mkuSel) {
-      msg = '先在上面选一个已安装的用户技能。';
+      msg = '先在上面选一个已安装的' + T.label + '。';
     } else if (!id) {
-      msg = '技能 ID 还没推导出来：请手填英文短名（如 wechat-chat-ops）。';
+      msg = T.lockIdVer
+        ? T.label + ' ID 没读到（清单里缺 id/name）：请检查包内清单文件。'
+        : '技能 ID 还没推导出来：请手填英文短名（如 wechat-chat-ops）。';
       kind = 'warn';
     } else if (!idOk) {
-      msg = '技能 ID 只能用纯小写字母/数字/中划线（市场端规则）：像 wechat-chat-ops 这样，不能带中文或空格。';
+      msg = T.idBad;
+      kind = 'warn';
+    } else if (sameVer) {
+      msg = '市场里 ' + id + ' 已是 v' + ver + '：内容有变化请先升 ' + T.verSrc + ' 的版本号（同版本重传会被拒）；未变过内容就不用再传。';
       kind = 'warn';
     } else if ([...name].length > 64) {
       msg = '显示名称超过 64 字（行业规范上限），请缩短。';
       kind = 'warn';
     } else if ([...desc].length > 1024) {
-      msg = '描述超过 1024 字（行业规范上限）：请精简，详细内容写进 SKILL.md 正文。';
+      msg = '描述超过 1024 字（行业规范上限）：请精简，详细内容写进包内说明。';
       kind = 'warn';
     } else {
       msg = '将发布 ' + id + (ver ? ' v' + ver : '') + '：包体取自本机已装的「' + esc(mkuSel) + '」。';
       kind = 'ok';
+      if (T.lockIdVer && mktVer) msg += '（市场在架 v' + mktVer + ' → 本次 v' + ver + '）';
       if (mkuSuggested) msg += '（ID 是按中文词表建议的，可改）';
       if (!($('mku-desc').value || '').trim()) msg += '（没写描述：市场卡片上会没有说明文字，建议补一行）';
+      if (mkuExcluded.length) msg += '\n打包已剔除运行时文件：' + mkuExcluded.slice(0, 8).join('、') + (mkuExcluded.length > 8 ? ' 等' : '');
       if (!meName) msg += '（未设置发布者姓名：市场服务器记不了归属，发布会失败——去 设置 · 网络访问 · 企业技能包 / 工作流 填一个）';
     }
     if (mkuBusy) { msg = '正在发布…'; kind = ''; }
@@ -599,7 +749,7 @@
     else if (mkuEditOf) { msg = '【更新发布】' + mkuEditOf.id + ' v' + (mkuEditOf.version || '?') + ' → ' + msg; }
     mkuSetStatus(msg, kind);
     const sub = $('mku-submit');
-    if (sub) sub.disabled = mkuBusy || !mkuSel || !id || !idOk;
+    if (sub) sub.disabled = mkuBusy || !mkuSel || !id || !idOk || sameVer;
   }
 
   /* ---- 绑定（bindMarket 里调一次） ---- */
@@ -628,16 +778,21 @@
 
   async function mkuSubmit() {
     if (mkuBusy || !mkuSel) return;
+    const T = MKU_TYPES[mkuType] || MKU_TYPES.skill;
     const id = ($('mku-id').value || '').trim();
-    if (!id) { mkuSetStatus('请填技能 ID（英文短名，市场里唯一）', 'warn'); return; }
+    if (!id) { mkuSetStatus('请填' + T.label + ' ID（市场里唯一）', 'warn'); return; }
     const body = {
-      skillId: mkuSel,
+      type: mkuType,
       id,
       name: ($('mku-name').value || '').trim() || id,
       version: ($('mku-version').value || '').trim(),
       description: ($('mku-desc').value || '').trim(),
       tags: ($('mku-tags').value || '').split(/[,，]/).map((s) => s.trim()).filter(Boolean),
     };
+    // 三类各自的「已装来源」引用字段（先装后传）
+    if (mkuType === 'component') body.componentId = mkuSel;
+    else if (mkuType === 'plugin') body.pluginKey = mkuSel;
+    else body.skillId = mkuSel;
     mkuErr = '';
     mkuBusy = true;
     const btn = $('mku-submit');
@@ -648,8 +803,11 @@
       const r = await api('/api/market/publish', { method: 'POST', body: JSON.stringify(body) });
       mkuBusy = false;
       btn.textContent = '发布到市场';
-      alert('已发布到市场：' + (r.id || id) + (r.version ? ' v' + r.version : '') +
-        (r.size ? '（' + mkuSize(r.size) + '，sha256 ' + String(r.sha256 || '').slice(0, 12) + '…）' : ''));
+      // 成功文案服务器说了算（审核中是「已上传成功，等待管理员审核…」）；
+      // 老服务器没带 message 时回落本地拼的文案
+      const fallback = '已发布到市场：' + (r.id || id) + (r.version ? ' v' + r.version : '') +
+        (r.size ? '（' + mkuSize(r.size) + '，sha256 ' + String(r.sha256 || '').slice(0, 12) + '…）' : '');
+      alert(r.message || fallback);
       $('mk-upload-modal').classList.add('hidden');
       mkData = null;
       await loadMarket(true);
@@ -681,7 +839,7 @@
   function onResize() { updateMarketCols(); }
 
   /* ---------- 设置区（设置 · 网络访问页的 #net-market-cfg 挂载段） ----------
-     组件开关归「内置组件」页，参数归网络访问页（与其他网络配置放一起）。
+     组件开关归「组件」页，参数归网络访问页（与其他网络配置放一起）。
      init 填充、dispose 清空并隐藏；回显 + 改动即存（单字段 PATCH /api/config，
      失败回滚为服务端值——与设置页 bindRemoteInput 同一套契约）。 */
 
@@ -692,9 +850,9 @@
     host.innerHTML =
       '<h4>企业技能包 / 工作流</h4>' +
       '<div class="set-field">' +
-      '<div class="sf-label">企业技能包 / 工作流 / 小程序平台地址</div>' +
-      '<input id="set-market-url" class="pf-input" placeholder="https://example.com:2227" autocomplete="off" spellcheck="false">' +
-      '<p class="sf-desc">企业技能市场与小程序平台同一台服务端：填服务器地址即可（https://域名或IP:端口），清单与 /sites 等路径后缀由程序自动拼；改动即时生效，留空则市场页显示未配置。</p>' +
+      '<div class="sf-label">企业技能包 / 工作流 / 企业小程序地址</div>' +
+      '<input id="set-market-url" class="pf-input" placeholder="https://jxaizz.com:2227" autocomplete="off" spellcheck="false">' +
+      '<p class="sf-desc">企业技能市场与企业小程序同一台服务端：填服务器地址即可（https://域名或IP:端口），清单与 /sites 等路径后缀由程序自动拼；改动即时生效，留空则市场页显示未配置。</p>' +
       '</div>' +
       '<div class="set-field">' +
       '<div class="sf-label">发布者姓名</div>' +
@@ -733,6 +891,7 @@
 
   function init() {
     injectDOM();
+    if (legacyHost) return; // 让位形态：老前端的按钮/视图/window 接口全在场，本组件不注入不覆盖
     bindMarket();
     updateMarketCols();
     window.addEventListener('resize', onResize);
@@ -744,13 +903,15 @@
   }
 
   function dispose() {
+    if (legacyHost) { legacyHost = false; return; } // 让位形态什么都没装，无可撤
     if (marketOpen()) closeMarket(); // 市场正开着：先还回对话区
     stopMarketAuto();
     window.removeEventListener('resize', onResize);
     docKeys.forEach((fn) => document.removeEventListener('keydown', fn));
     docKeys.length = 0;
     document.body.classList.remove('mk-4col'); // 挂在 body 上的全局类一并撤（组件不留痕）
-    if (btnEl) { btnEl.remove(); btnEl = null; }
+    if (btnEntry) { btnEntry.remove(); btnEntry = null; btnEl = null; }
+    else if (btnEl) { btnEl.remove(); btnEl = null; } // 旧 engine 的 DOM 注入 fallback
     if (viewEl) { viewEl.remove(); viewEl = null; }
     if (modalEl) { modalEl.remove(); modalEl = null; }
     delete window.marketOpen;

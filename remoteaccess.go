@@ -684,7 +684,7 @@ func (h *hubCtx) handleRelay(rid, ivB64, ctB64 string) {
 		return // 中继只接受 req 帧
 	}
 	// 中继白名单：/api/ 是常规接口；/sites 前缀（含 /sites-assets/）与 /s/ 是
-	// 小程序平台内嵌代理的路径（sitesproxy.go）——远程端 iframe 的 src 与页面内
+	// 企业小程序内嵌代理的路径（sitesproxy.go）——远程端 iframe 的 src 与页面内
 	// 绝对路径 fetch 都要经中继落回本端代理，不放行则远程手机端平台页打不开。
 	// 与 P2P 直连通道（p2pdirect.go）共用 relayPathAllowed，两条通道必须同口径
 	if !relayPathAllowed(fr.Path) {
@@ -931,18 +931,21 @@ var (
 )
 
 // relayPathAllowed 中继与 P2P 直连共用的路径白名单：/api/ 是常规接口；
-// /sites 前缀（含 /sites-assets/）与 /s/ 是小程序平台内嵌代理的路径
-// （sitesproxy.go）。两条通道必须同口径——2026-11-04 事故：直连侧漏放
-// /sites，手机 P2P 直连打开平台页必 403。
+// /sites 前缀（含 /sites-assets/）与 /s/ 是企业小程序内嵌代理的路径
+// （sitesproxy.go）。/attachments/ 是工具图片信封（read_image / 浏览器截图 /
+// MCP 截图等）的附件库端点——前端工具卡片经 JX_REMOTE.assetURL 用 fetch 取图
+// blob 化上屏，不放行则远程端图片加载打到网关源 404（对话里的图全看不到）。
+// 两条通道必须同口径——2026-11-04 事故：直连侧漏放 /sites，手机 P2P 直连
+// 打开平台页必 403。
 func relayPathAllowed(p string) bool {
 	return strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/sites") ||
-		strings.HasPrefix(p, "/s/")
+		strings.HasPrefix(p, "/s/") || strings.HasPrefix(p, "/attachments/")
 }
 
 // inlineJS 把 JS 内容安全内联进 <script> 标签：源码里的任何 </script 字面量
 // （藏在字符串/正则/注释里）都会让 HTML 解析器把标签提前闭合——脚本被拦腰
 // 斩断、整段解析失败，页面表面正常但该脚本的全部能力静默消失。2026-11-04
-// 手机端「服务离线」事故的根源之一：小程序平台代载代码里的一处闭合标签字面量
+// 手机端「服务离线」事故的根源之一：企业小程序代载代码里的一处闭合标签字面量
 // 报废了整个内联的 remote-boot（隧道/组件加载/外壳自愈全灭）。统一转义为
 // <\/script——在 JS 字符串与正则字面量里语义完全不变。
 var regexpScriptClose = regexp.MustCompile(`(?i)</script`)
@@ -979,10 +982,19 @@ func (a *App) p2pShell() (string, error) {
 			}
 			return "<script>\n" + inlineJS(string(js)) + "\n</script>"
 		})
-		// logo 转 dataURL（两处 img）
+		// logo 转 dataURL（两处 img：index.html 的 <img> 与 app-chat.js 动态拼的
+		// 字符串——替换发生在脚本内联之后，一并命中）；关于页固定 LOGO
+		// （/logo-default.png，brand_sync.go 出的就是这张内置图）同源复用字节。
+		// 微信二维码（设置 · 关于 · 联系我们）同理内联——远程端挂在外壳页上拿不到
+		// 家端的静态文件路由，不内联则二维码在远程访问时裂图（2026-11-20）。
 		if logo, err := fs.ReadFile(a.static, "logo.png"); err == nil {
-			s = strings.ReplaceAll(s, `src="/logo.png"`,
-				`src="data:image/png;base64,`+base64.StdEncoding.EncodeToString(logo)+`"`)
+			logoDataURL := `data:image/png;base64,` + base64.StdEncoding.EncodeToString(logo)
+			s = strings.ReplaceAll(s, `src="/logo.png"`, `src="`+logoDataURL+`"`)
+			s = strings.ReplaceAll(s, `src="/logo-default.png"`, `src="`+logoDataURL+`"`)
+		}
+		if qr, err := fs.ReadFile(a.static, "wechat-qr.png"); err == nil {
+			s = strings.ReplaceAll(s, `src="/wechat-qr.png"`,
+				`src="data:image/png;base64,`+base64.StdEncoding.EncodeToString(qr)+`"`)
 		}
 		// 标签页图标同理转 dataURL（远程端拿不到本服务的 /favicon.png）
 		if fav, err := fs.ReadFile(a.static, "favicon.png"); err == nil {
@@ -1071,11 +1083,13 @@ func (a *App) loadShellEpoch() {
 	}
 }
 
-// handleShellBump 「关于」页一键清除远程端缓存：代数 +1 并落盘。按过后，仍在
-// 运行的远程页面在下次加载时发现版本不一致，自动清掉本地缓存整页重拉；连还停
-// 留在旧版配对页（12 小时 TTL 时代外壳）上的手机也一并治愈——它们的自愈同样
-// 比对 /api/shell-hash。日常远程端每次打开本就拉最新外壳，此按钮是异常状态的
-// 统一兜底，多按无害（只是多递增几个代数）。
+// handleShellBump 远程端缓存兜底清零：代数 +1 并落盘。按过后，仍在运行的远程
+// 页面在下次加载时发现版本不一致，自动清掉本地缓存整页重拉；连还停留在旧版
+// 配对页（12 小时 TTL 时代外壳）上的手机也一并治愈——它们的自愈同样比对
+// /api/shell-hash。日常远程端每次打开本就拉最新外壳，这里是异常状态的统一兜底，
+// 多按无害（只是多递增几个代数）。
+// UI 入口（设置·关于「远程外壳」分区的一键清除按钮）已于 2026-11-16 随该分区
+// 撤掉（用户口径：远程外壳那块不再用）；接口保留——call_api / 排障仍要它兜底。
 func (a *App) handleShellBump(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.p2pShell(); err != nil { // 先确保基底与内容哈希就绪（版本号完整）
 		writeErr(w, 500, err.Error())

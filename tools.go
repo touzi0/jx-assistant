@@ -124,6 +124,9 @@ func (a *App) toolsFor(mode string) []Tool {
 	// （沙箱内远程 git 全灭，git_sync 是修改工作区档下唯一的远程通道，
 	// 见 gittools.go 文件头）。组件关掉时为空。
 	gits := a.gitTools()
+	// 组件的模型能力不再各占一个工具定义（用户拍板方案 A）：统一走基础工具
+	// component_call（componentcall.go），能调什么由环境快照的「组件能力」块
+	// 告知——组件增删能力不动工具目录，请求形状与前缀缓存稳定。
 	var tools []Tool
 	if mode == "assistant" {
 		// 数字助理总控只有「派发工作任务」这一条派发路径：dispatch_sub（派子对话）
@@ -132,7 +135,7 @@ func (a *App) toolsFor(mode string) []Tool {
 		// 只读四件套 + web_fetch：小问题（十步内的查看）总控自己看文件回答，
 		// 不必为「这个文件写了什么」专门派个任务；写与执行类工具绝不进场。
 		tools = append([]Tool{listSessionsTool(), readSummaryTool(), dispatchTaskTool(), sendToSessionTool(),
-			stopSessionTool(), a.callAPITool(),
+			stopSessionTool(), a.callAPITool(), componentCallTool(),
 			readFileTool(), listDirTool(), globTool(), grepTool(), webFetchTool(),
 			deliverResultTool(),
 			enterPlanModeTool(), exitPlanModeTool(), updateGoalTool()}, append(todos, history...)...)
@@ -140,7 +143,7 @@ func (a *App) toolsFor(mode string) []Tool {
 		// enter_plan_mode 不配：aux 只读答疑，没有可暂停的执行动作，计划无意义
 		// （exit 保留，用户手动给 aux 会话开计划模式时仍可退出）。
 		tools = append([]Tool{readFileTool(), listDirTool(), globTool(), grepTool(), webFetchTool(), a.webSearchTool(), readImageTool(),
-			exitPlanModeTool(), updateGoalTool()}, history...)
+			componentCallTool(), exitPlanModeTool(), updateGoalTool()}, history...)
 	} else {
 		// 创建技能模式专属工具：register_skill 注册闭环只挂在该模式——其他模式的
 		// 工具目录保持原形状（缓存与提示词都不受影响）。演示记录器 demo_record_*
@@ -155,7 +158,7 @@ func (a *App) toolsFor(mode string) []Tool {
 			globTool(), grepTool(), runCommandTool(), runPythonTool(), webFetchTool(), a.webSearchTool(), readImageTool(),
 			pdfTool(), ocrTool(), officeSkillTool(),
 			snapshotFileTool(), deliverResultTool(), a.dispatchSubTool(), a.listExpertsTool(),
-			// 找经理协调（requestmgr.go）：任务侧唯一能触到数字经理的通道——发一条
+			// 找经理协调（requestmgr.go）：任务侧唯一能触到长期助理的通道——发一条
 			// 求助消息给经理会话，立即返回、不等答复。子对话拿到也调不通（调用时
 			// 硬拦），assistant / aux 分支不注册（它是被找的那个，不是发起方）。
 			requestManagerTool(),
@@ -163,7 +166,7 @@ func (a *App) toolsFor(mode string) []Tool {
 			// 任务会话专注实操（需要时由总控代调）。
 			askUserQuestionTool(), requestPermissionTool(), enterPlanModeTool(), exitPlanModeTool(), updateGoalTool(), progressWriteTool(),
 			jobOutputTool(), jobListTool(), jobKillTool(),
-		}, skillCreate...), append(append(append(append(append(todos, gits...), append(a.pluginAndMCPTools(), panelScreenshotTool())...), browserTools()...), deviceTools()...), history...)...)
+		}, skillCreate...), append(append(append(append(append(append(todos, gits...), componentCallTool()), append(a.pluginAndMCPTools(), panelScreenshotTool())...), browserTools()...), deviceTools()...), history...)...)
 	}
 	return append(tools, readUserSkillTool())
 }
@@ -360,6 +363,14 @@ func jxaiHiddenRel(rel string) bool {
 // .jxai/uploads（用户上传文件的统一存放处）与 .jxai 其余内容照常可检索；
 // 按路径直接 read 访问不受影响。
 func (t *toolContext) envWalk(root string, fn func(rel string, e envEntry) error) error {
+	return t.envWalkSkip(root, nil, fn)
+}
+
+// envWalkSkip 是 envWalk 的可剪枝版本：skip 收到相对路径、名字与是否目录，返回
+// true 的目录整棵跳过、文件直接略过；内置的 .git/node_modules/.jxai 规则照旧生效
+// （任一命中即跳过）。只给需要按调用方条件剪枝的工具用（grep 的 exclude 参数），
+// list_dir/glob 等其余遍历保持 envWalk 原样——排除是显式请求，不是默认行为。
+func (t *toolContext) envWalkSkip(root string, skip func(rel, name string, isDir bool) bool, fn func(rel string, e envEntry) error) error {
 	if t.isRemote() {
 		rc, err := t.app.getRemoteClient(t.sess)
 		if err != nil {
@@ -380,6 +391,9 @@ func (t *toolContext) envWalk(root string, fn func(rel string, e envEntry) error
 				r := e.Name
 				if rel != "" {
 					r = rel + "/" + e.Name
+				}
+				if skip != nil && skip(r, e.Name, e.IsDir) {
+					continue
 				}
 				if e.IsDir {
 					if e.Name == ".git" || e.Name == "node_modules" {
@@ -419,6 +433,9 @@ func (t *toolContext) envWalk(root string, fn func(rel string, e envEntry) error
 				return nil
 			}
 			r := filepath.ToSlash(rel)
+			if skip != nil && skip(r, name, true) {
+				return filepath.SkipDir
+			}
 			if name == ".git" || (name == "node_modules" && p != root) {
 				return filepath.SkipDir
 			}
@@ -434,6 +451,9 @@ func (t *toolContext) envWalk(root string, fn func(rel string, e envEntry) error
 		if rerr != nil {
 			return nil
 		}
+		if skip != nil && skip(filepath.ToSlash(rel), info.Name(), false) {
+			return nil
+		}
 		return fn(filepath.ToSlash(rel), envEntry{Name: info.Name(), Size: info.Size()})
 	})
 }
@@ -442,7 +462,7 @@ func (t *toolContext) envWalk(root string, fn func(rel string, e envEntry) error
 
 func readFileTool() Tool {
 	return Tool{
-		Spec: toolSpec("read", "读取文本文件内容返回。用本工具——而不是 cat 等命令行——查看文本文件；大文件用 offset/limit 分段继续读取。path 支持相对工作区的路径。",
+		Spec: toolSpec("read", "读取文本文件内容返回。用本工具——而不是 cat 等命令行——查看文本文件；大文件用 offset/limit 分段继续读取。path 支持相对工作区的路径。非 UTF-8 文件（GBK/GB18030/UTF-16 等）会按探测到的编码自动解码后返回（文末注明原编码），不会出现乱码；二进制文件拒绝读取。",
 			objSchema(map[string]any{
 				"path":   strProp("文件路径（相对或绝对）"),
 				"offset": intProp("起始行号，从 1 开始，可选"),
@@ -473,10 +493,13 @@ func runReadFile(t *toolContext, args json.RawMessage) (string, error) {
 		return "", err
 	}
 	t.markObserved(path) // 观察策略：read 过的文件之后才能被 write 覆盖
-	if bytes.IndexByte(data, 0) >= 0 {
+	// 编码探测：GBK / UTF-16 等非 UTF-8 文件在这里一次性解成 UTF-8 文本，
+	// 模型看到的是正确中文而不是替换符；编码写进文末注记（edit 会按原编码写回）。
+	text, enc := decodeText(data)
+	if enc == EncBinary {
 		return "", fmt.Errorf("%s 是二进制文件，无法按文本读取", path)
 	}
-	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 	start := p.Offset
 	if start < 1 {
 		start = 1
@@ -500,12 +523,18 @@ func runReadFile(t *toolContext, args json.RawMessage) (string, error) {
 	if end < len(lines) {
 		suffix = fmt.Sprintf("\n…（共 %d 行，可调大 limit 或用 offset 继续读取）", len(lines))
 	}
+	switch {
+	case enc.needsPreserveBytes():
+		suffix += fmt.Sprintf("\n（该文件是 %s 编码，已自动解码显示；用 edit 修改会按原编码写回）", enc)
+	case enc == EncUnknown:
+		suffix += "\n（该文件编码无法确定，已按 GB18030 宽松解码显示；写入前请确认内容）"
+	}
 	return out + suffix, nil
 }
 
 func writeFileTool() Tool {
 	return Tool{
-		Spec: toolSpec("write", "创建文件或整体替换文件内容（UTF-8 无 BOM 文本）。content 按你提供的原样落盘（不做行尾/编码转换），行尾用 LF 还是 CRLF 由你按目标文件类型自行决定。既有文件本会话 read 过才能覆盖（观察策略；.jxai/tmp 下跨会话残留的旧文件除外）；局部修改优先用 edit。按会话权限模式的文件沙箱执行：修改工作区档只允许写工作区与系统临时目录内；只读档写入被拒后，工作区内目标带 sandbox_permissions=workspace-write、工作区外目标带 sandbox_permissions=full 与 justification 重试一次即可申请放行（弹审批）。",
+		Spec: toolSpec("write", "创建文件或整体替换文件内容（UTF-8 无 BOM 文本）。content 按你提供的原样落盘（不做行尾/编码转换）——覆盖既有 GBK 等非 UTF-8 文件时会把它重写成 UTF-8 并在返回里提示（想保留原编码改用 edit）。既有文件本会话 read 过才能覆盖（观察策略；.jxai/tmp 下跨会话残留的旧文件除外）；局部修改优先用 edit。按会话权限模式的文件沙箱执行：修改工作区档只允许写工作区与系统临时目录内；只读档写入被拒后，工作区内目标带 sandbox_permissions=workspace-write、工作区外目标带 sandbox_permissions=full 与 justification 重试一次即可申请放行（弹审批）。",
 			objSchema(map[string]any{
 				"path":                strProp("目标文件路径（相对或绝对）"),
 				"content":             strProp("要写入的完整内容"),
@@ -543,6 +572,14 @@ func runWriteFile(t *toolContext, args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 覆盖既有非 UTF-8 文件会改变它的编码（write 语义固定 UTF-8 无 BOM），
+	// 这点必须让模型看见：想保留原编码请改用 edit。写前探测，写后提示。
+	prevEnc := EncUTF8
+	if !t.isRemote() {
+		if _, _, serr := t.envStat(path); serr == nil {
+			prevEnc = probeTextFile(path)
+		}
+	}
 	// 带快照写入：改动前内容自动落 checkpoint，编辑历史消息时可回退；
 	// 回读注记让模型第一轮就能发现"写进去的不是想要的"（乱码/被外部改写）
 	readBack, verified, err := t.snapshotWrite(path, grant, []byte(p.Content))
@@ -550,13 +587,17 @@ func runWriteFile(t *toolContext, args json.RawMessage) (string, error) {
 		return "", err
 	}
 	t.markObserved(path)
-	return fmt.Sprintf("已写入 %s（%d 字节）%s", filepath.ToSlash(path), len(p.Content),
-		readBackNote([]byte(p.Content), readBack, verified, true)), nil
+	encNote := ""
+	if prevEnc.needsPreserveBytes() {
+		encNote = fmt.Sprintf("（注意：该文件原为 %s 编码，已按 UTF-8 无 BOM 重写；想保留原编码请改用 edit）", prevEnc)
+	}
+	return fmt.Sprintf("已写入 %s（%d 字节）%s%s", filepath.ToSlash(path), len(p.Content),
+		readBackNote([]byte(p.Content), readBack, verified, true), encNote), nil
 }
 
 func editFileTool() Tool {
 	return Tool{
-		Spec: toolSpec("edit", "对既有文本文件做局部修改：把 old_string 字面量替换为 new_string（匹配时 CRLF/LF 行尾视为等价，写回自动保持文件原行尾风格）。默认要求 old_string 在文件中恰好出现一次（多次出现时给出更长的片段或设 replace_all）。只读档被拒后，工作区内目标带 sandbox_permissions=workspace-write、工作区外目标带 sandbox_permissions=full 与 justification 重试一次即可申请放行（弹审批）。",
+		Spec: toolSpec("edit", "对既有文本文件做局部修改：把 old_string 字面量替换为 new_string（匹配时 CRLF/LF 行尾视为等价，写回自动保持文件原行尾风格）。非 UTF-8 文件（GBK/GB18030/UTF-16）按原编码解码后匹配、并按**原编码写回**（GBK 文件仍是 GBK、BOM 保留）；new_string 含原编码无法表示的字符（如 emoji 写进 GBK 文件）时直接报错、文件不改——改用 write 以 UTF-8 保存。默认要求 old_string 在文件中恰好出现一次（多次出现时给出更长的片段或设 replace_all）。只读档被拒后，工作区内目标带 sandbox_permissions=workspace-write、工作区外目标带 sandbox_permissions=full 与 justification 重试一次即可申请放行（弹审批）。",
 			objSchema(map[string]any{
 				"path":                strProp("文件路径"),
 				"old_string":          strProp("要被替换的原文（需保证唯一）"),
@@ -595,7 +636,12 @@ func runEditFile(t *toolContext, args json.RawMessage) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	content := string(data)
+	// 编码：按探测到的原编码解成文本做匹配，改完再按同一编码编回去——全程只有
+	// 一次转换（Unicode ↔ 原编码），不存在"GBK 当 UTF-8 再转 GBK"的叠加。
+	content, enc := decodeText(data)
+	if enc == EncBinary {
+		return "", fmt.Errorf("%s 是二进制文件，无法按文本编辑", path)
+	}
 	// 行尾等价匹配：read 给模型的内容已把 CRLF 归一为 LF（runReadFile），
 	// 模型按所见写的 old_string/new_string 自然是 LF；若在原始字节上逐字
 	// 匹配，跨行片段会因每个换行差一个 \r 而永远对不上（Windows 项目上
@@ -629,8 +675,14 @@ func runEditFile(t *toolContext, args json.RawMessage) (string, error) {
 		updated = strings.Replace(norm, oldNorm, newNorm, 1)
 	}
 	updated = restoreLineEndings(updated, detectFileLineEndings(content))
+	// 按原编码编回：GBK 文件写回仍是 GBK（字节稳定），不可表示字符（emoji）
+	// 直接报错、文件不动——绝不用 '?' 静默替换（那是有损且难查的丢字）。
+	outBytes, encErr := encodeText(updated, enc)
+	if encErr != nil {
+		return "", fmt.Errorf("%s：%w（文件未改动）", filepath.ToSlash(path), encErr)
+	}
 	// 带快照写入：改动前内容自动落 checkpoint（上面 envReadFile 读到的即旧内容）
-	readBack, verified, err := t.snapshotWrite(path, grant, []byte(updated))
+	readBack, verified, err := t.snapshotWrite(path, grant, outBytes)
 	if err != nil {
 		return "", err
 	}
@@ -638,8 +690,12 @@ func runEditFile(t *toolContext, args json.RawMessage) (string, error) {
 	// 匹配，盲改不可能通过），故不设 read 前置；落盘后记为已观察，后续
 	// write 覆盖随之放行（对齐 DSH「刚编辑过视为已观察」）。
 	t.markObserved(path)
-	return fmt.Sprintf("已编辑 %s（替换 %d 处）%s", filepath.ToSlash(path), replaced,
-		readBackNote([]byte(updated), readBack, verified, false)), nil
+	keepNote := ""
+	if enc.needsPreserveBytes() {
+		keepNote = fmt.Sprintf("（保持原 %s 编码写回）", enc)
+	}
+	return fmt.Sprintf("已编辑 %s（替换 %d 处）%s%s", filepath.ToSlash(path), replaced, keepNote,
+		readBackNote(outBytes, readBack, verified, false)), nil
 }
 
 // detectFileLineEndings 按多数派判定文件的主导行尾风格：CRLF 行数多于
@@ -873,19 +929,96 @@ func runGlob(t *toolContext, args json.RawMessage) (string, error) {
 
 func grepTool() Tool {
 	return Tool{
-		Spec: toolSpec("grep", "在目录内的文本文件中搜索内容，pattern 为正则表达式（非法时按字面量匹配）。返回 文件:行号: 内容。",
+		Spec: toolSpec("grep", "在目录内的文本文件中搜索内容，pattern 为正则表达式（非法时按字面量匹配）。返回 文件:行号: 内容。可选 exclude 忽略目录/文件（逗号分隔），路径一律写**相对 path 这个搜索根**的相对路径，不是绝对路径：纯名字（data、*.log）匹配任意层级的目录名或文件名并整棵跳过；含斜杠的从任意层级起算（src/gen 也会命中 deep/src/gen/x.go），前导 / 只锚定搜索根（/data 不影响 src/data）；支持通配符（*/testdata、src/*/*.tmp），不分大小写。文件与文件夹一视同仁。默认不忽略任何业务目录（.git 与 node_modules 本就跳过）。",
 			objSchema(map[string]any{
 				"pattern": strProp("搜索模式（正则表达式）"),
 				"path":    strProp("起始目录，默认工作区根目录"),
+				"exclude": strProp("可选：忽略的目录/文件模式（相对 path 搜索根），逗号分隔，如 data,*.log,dist/generated"),
 			}, "pattern")),
 		Run: runGrep,
 	}
+}
+
+// splitExcludeList 把 exclude 参数拆成模式列表：逗号（中英文）/分号/空白都当分隔，
+// 反斜杠统一成斜杠、去掉前导 ./ 与结尾 /。默认空 = 不忽略任何东西。
+func splitExcludeList(s string) []string {
+	var out []string
+	f := func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == '；' || r == ' ' || r == '\t' || r == '\r' || r == '\n'
+	}
+	for _, raw := range strings.FieldsFunc(s, f) {
+		pat := strings.TrimPrefix(strings.TrimSuffix(strings.ReplaceAll(raw, "\\", "/"), "/"), "./")
+		if pat != "" {
+			out = append(out, pat)
+		}
+	}
+	return out
+}
+
+// excludedBy 判断相对路径 rel（及它这一级名字 name）是否被 exclude 模式命中。
+// 语义按 gitignore 的习惯（模型最熟的那套），文件与文件夹一视同仁——
+// 命中目录即整棵剪枝，命中文件即略过：
+//   - 无斜杠的名字模式（data、*.log）：匹配**任意层级**的目录名/文件名；
+//   - 含斜杠、无前导 /（src/gen、*/testdata）：从**任意层级**起算，即
+//     src/gen 也会命中 deep/src/gen/x.go；
+//   - 前导 /（/data）：只锚定搜索根，src/data 不受影响。
+//
+// 路径一律相对 path 指定的搜索根；不分大小写——搜索时大小写不一致几乎总是
+// 笔误而非意图。
+func excludedBy(pats []string, rel, name string) bool {
+	if len(pats) == 0 {
+		return false
+	}
+	lrel, lname := strings.ToLower(rel), strings.ToLower(name)
+	for _, pat := range pats {
+		p := strings.ToLower(pat)
+		anchored := strings.HasPrefix(p, "/")
+		if anchored {
+			// 前导 / 锚定搜索根：先于"含不含斜杠"判断，否则剥掉斜杠后会退化成
+			// 名字模式、把 src/data 也一起剪掉。
+			p = strings.TrimPrefix(p, "/")
+			if lrel == p || strings.HasPrefix(lrel, p+"/") {
+				return true
+			}
+			if ok, _ := path.Match(p, lrel); ok {
+				return true
+			}
+			continue
+		}
+		if !strings.Contains(p, "/") {
+			// 名字模式：任意层级的目录名或文件名
+			if strings.ContainsAny(p, "*?[") {
+				if ok, _ := path.Match(p, lname); ok {
+					return true
+				}
+			} else if lname == p {
+				return true
+			}
+			continue
+		}
+		// 无前导 / 的路径模式：任意层级起算（深度不限，二级三级照命中）
+		if !strings.ContainsAny(p, "*?[") {
+			if lrel == p || strings.HasPrefix(lrel, p+"/") ||
+				strings.Contains(lrel, "/"+p+"/") || strings.HasSuffix(lrel, "/"+p) {
+				return true
+			}
+			continue
+		}
+		segs := strings.Split(lrel, "/")
+		for i := range segs {
+			if ok, _ := path.Match(p, strings.Join(segs[i:], "/")); ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func runGrep(t *toolContext, args json.RawMessage) (string, error) {
 	var p struct {
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
+		Exclude string `json:"exclude"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", err
@@ -902,8 +1035,26 @@ func runGrep(t *toolContext, args json.RawMessage) (string, error) {
 	if _, err := t.authorize(permAction{Op: "info", Tool: "grep", Path: root}); err != nil {
 		return "", err
 	}
+	excl := splitExcludeList(p.Exclude)
+	// 宽容一步：模型偶尔会把绝对路径写进 exclude（约定是相对搜索根），剥掉搜索
+	// 根前缀当相对路径用，免得静默失效；剥不掉的就按原样参与匹配。
+	if len(excl) > 0 {
+		rootSlash := strings.ToLower(filepath.ToSlash(root))
+		for i, e := range excl {
+			le := strings.ToLower(e)
+			if strings.HasPrefix(le, rootSlash+"/") {
+				// 剥成锚定形式：绝对路径本身就是确定位置，不该退化成"任意层级
+				// 同名目录都剪"
+				excl[i] = "/" + e[len(rootSlash)+1:]
+			}
+		}
+	}
+	var skip func(rel, name string, isDir bool) bool
+	if len(excl) > 0 {
+		skip = func(rel, name string, isDir bool) bool { return excludedBy(excl, rel, name) }
+	}
 	found := []string{}
-	_ = t.envWalk(root, func(rel string, e envEntry) error {
+	_ = t.envWalkSkip(root, skip, func(rel string, e envEntry) error {
 		if len(found) >= 200 {
 			return filepath.SkipAll
 		}
@@ -917,10 +1068,19 @@ func runGrep(t *toolContext, args json.RawMessage) (string, error) {
 			full = path.Join(root, rel)
 		}
 		data, rerr := t.envReadFile(full)
-		if rerr != nil || bytes.IndexByte(data, 0) >= 0 {
+		if rerr != nil {
 			return nil
 		}
-		for i, ln := range strings.Split(string(data), "\n") {
+		// 编码一律走 encoding.go 的探测（全项目唯一真源）：GBK/GB18030/UTF-16
+		// 文件先解成 UTF-8 再匹配，否则这些文件里的中文永远搜不到——read/edit/
+		// run_command 早就这么做了，只有 grep 漏了。顺带把「含 NUL 就当二进制
+		// 跳过」换成「探测结果为二进制才跳过」：UTF-16 文本带 NUL，原来会被
+		// 误当二进制整份跳过。
+		text, enc := decodeText(data)
+		if enc == EncBinary {
+			return nil
+		}
+		for i, ln := range strings.Split(text, "\n") {
 			hit := literal && strings.Contains(ln, p.Pattern)
 			if !literal && re != nil {
 				hit = re.MatchString(ln)
@@ -945,13 +1105,13 @@ func runGrep(t *toolContext, args json.RawMessage) (string, error) {
 
 func runCommandTool() Tool {
 	return Tool{
-		Spec: toolSpec("run_command", "执行一条 shell 命令并返回输出。命令按会话权限模式在 OS 级沙箱内执行：workspace-write 下只能写工作区与私有临时目录（Windows 受限令牌 / Linux Landlock / 远程沙箱 helper），read-only 下不能写任何位置，联网不受限。尝试沙箱可能拒绝的命令是安全且符合预期的：直接运行并读取标记。若命令因沙箱拒绝失败且更宽档位能让它成功，在同一轮内带 sandbox_permissions（够用的最宽档）与一句 justification 重试同一命令一次——该重试会弹审批由用户批准；未经真实拒绝不要请求升级；被拒后该命令终局，停止并说明，不要绕过。sandbox_permissions 只放宽命令沙箱，开不了 browser_*/computer_* 的能力开关。看网页/操作浏览器永远不要用命令行启动浏览器（msedge/chrome/firefox/microsoft-edge: 等一律同下场）：非完全访问档下这类命令会被直接预拦、不会执行，报错会指路——一律改用 browser_* 工具（助手进程直接驱动本机 Edge/Chrome，不经命令沙箱；若「操作浏览器」能力未开启，调用会被拦，可在重试该工具时带 request_capability=true 与 justification 向用户申请开启）。",
+		Spec: toolSpec("run_command", "执行一条 shell 命令并返回输出。命令按会话权限模式在 OS 级沙箱内执行：workspace-write 下只能写工作区与私有临时目录（Windows 受限令牌 / Linux Landlock / 远程沙箱 helper），read-only 下不能写任何位置，联网不受限。尝试沙箱可能拒绝的命令是安全且符合预期的：直接运行并读取标记。若命令因沙箱拒绝失败且更宽档位能让它成功，在同一轮内带 sandbox_permissions（够用的最宽档）与一句 justification 重试同一命令一次——该重试会弹审批由用户批准；未经真实拒绝不要请求升级；被拒后该命令终局，停止并说明，不要绕过。sandbox_permissions 只放宽命令沙箱，开不了 browser_*/computer_* 的能力开关。编码：PS 5.1 路径的引擎已把**输出与读文件**默认都钉在 UTF-8（Get-Content/Select-String/Import-Csv 默认 utf8）；命令里字面出现的文件会先探测编码——全是 GBK 老文件（.bat/.cmd/金蝶导出 CSV）时整条自动切 ANSI(936) 读；输出疑似乱码时只读命令会自动换编码重跑一次（两次都脏会如实说明），写/安装/提交类命令不重跑（重跑=执行两遍）。需要固定某种读法时在命令里显式 -Encoding。看网页/操作浏览器永远不要用命令行启动浏览器（msedge/chrome/firefox/microsoft-edge: 等一律同下场）：非完全访问档下这类命令会被直接预拦、不会执行，报错会指路——一律改用 browser_* 工具（助手进程直接驱动本机 Edge/Chrome，不经命令沙箱；若「操作浏览器」能力未开启，调用会被拦，可在重试该工具时带 request_capability=true 与 justification 向用户申请开启）。",
 			objSchema(map[string]any{
 				"command":             strProp("要执行的命令"),
 				"shell":               strProp("本地执行时的 shell：Windows 默认 powershell（或 cmd），其他平台默认 sh；远程执行忽略"),
 				"cwd":                 strProp("工作目录（可选，默认会话工作区；是否可写由沙箱决定，cwd 本身不受限）"),
 				"timeout_sec":         intProp("超时秒数，默认 60，上限 600；后台作业忽略"),
-				"run_in_background":   boolProp("true 时后台执行并立即返回作业 id（仅本地）。长驻服务（开发服务器、监控程序等）也用它：command 直接写服务本体（如 node server.js、python -m http.server 8000），它会一直跑到你 job_kill、会话停止或软件退出（关软件时连其子进程一并清场）；不要套 Start-Process——shell 退出即作业连坐清理；作业会显示在进度面板「运行中的程序」，用户可手动停止"),
+				"run_in_background":   boolProp("true 时后台执行并立即返回作业 id（仅本地）；**跑完会自动给你【后台命令回报】并唤醒你**，不用轮询（job_output 仍可中途查看）。长驻服务（开发服务器、监控程序等）也用它：command 直接写服务本体（如 node server.js、python -m http.server 8000），它会一直跑到你 job_kill、会话停止或软件退出（关软件时连其子进程一并清场）；不要套 Start-Process——shell 退出即作业连坐清理；作业会显示在进度面板「运行中的程序」，用户可手动停止"),
 				"visible":             boolProp("一般别用：只有确实需要用户盯着这个命令窗口时才置 true（默认 false = 后台悄悄跑，不弹任何窗口）"),
 				"sandbox_permissions": strProp("仅用于被沙箱拒绝后的同轮重试：请求的更宽档位（workspace-write 或 danger-full-access），必须搭配 justification；会弹审批由用户决定"),
 				"justification":       strProp("与 sandbox_permissions 搭配：一句话向用户解释为什么这条命令需要更宽权限"),
@@ -999,11 +1159,12 @@ func runCommand(t *toolContext, args json.RawMessage) (string, error) {
 		if t.isRemote() {
 			return "", fmt.Errorf("后台作业暂不支持远程工作区会话；请去掉 run_in_background 直接执行")
 		}
-		j, jerr := t.app.startJob(t, p.Command, p.Shell, cwd, policy)
+		j, jerr := t.app.startJob(t, p.Command, p.Shell, cwd, policy, "command",
+			func(j *jobRun) { t.app.reportCommandJob(t, j, p.Command, cwd) })
 		if jerr != nil {
 			return "", sandboxErrHint(jerr)
 		}
-		return fmt.Sprintf("后台作业已启动：%s（沙箱 %s，不限时）。\n- job_output 查看输出（wait=true 可等它结束）\n- job_list 列出全部作业\n- job_kill 终止\n现在可以继续做别的事。", j.ID, policy), nil
+		return fmt.Sprintf("后台作业已启动：%s（沙箱 %s，不限时）。\n- 跑完系统自动给你【后台命令回报】并唤醒你继续，不用轮询\n- job_output 可中途查看输出（wait=true 可等它结束）；job_kill 终止\n现在可以继续做别的事。", j.ID, policy), nil
 	}
 
 	timeout := time.Duration(60) * time.Second
@@ -1011,16 +1172,41 @@ func runCommand(t *toolContext, args json.RawMessage) (string, error) {
 		timeout = time.Duration(min(p.TimeoutSec, 600)) * time.Second
 	}
 
-	// 子进程统一入口（child.go）：沙箱分派、环境白名单、超时、输出捕获/截断/解码、
-	// 压窗、沙箱拒绝 marker、运行中程序登记全在那一处。这里只声明「跑什么、在哪跑、
-	// 超时多少」——不再自己拼执行细节（以前各工具各写一套，漏一处就漏一个黑窗）。
-	out, err := t.app.runChild(t.ctx, sandboxRun{
-		Dir: cwd, Command: p.Command, Shell: strings.ToLower(strings.TrimSpace(p.Shell)),
-		Timeout: timeout, Policy: policy, Workspace: t.workspace(),
-		Remote: t.sess, Visible: p.Visible, Label: "run_command", Model: true,
-	})
+	// 读面编码：命令里出现的文件先探测（encoding.go），据此决定这条 PS 5.1
+	// 命令按 UTF-8 还是按 ANSI(936) 读文件。探测不到（程序内部自己读文件的
+	// 情形：python 脚本、findstr 之类）就靠下面的输出乱码检测 + 重跑兜底。
+	encMode, encHint := detectEncodingMode(cwd, p.Command, p.Shell)
+	runOnce := func(mode string) (string, error) {
+		return t.app.runChild(t.ctx, sandboxRun{
+			Dir: cwd, Command: p.Command, Shell: strings.ToLower(strings.TrimSpace(p.Shell)),
+			Timeout: timeout, Policy: policy, Workspace: t.workspace(),
+			Remote: t.sess, Visible: p.Visible, Label: "run_command", Model: true,
+			EncodingMode: mode,
+		})
+	}
+	out, err := runOnce(encMode)
 	if err != nil {
 		return "", sandboxErrHint(err)
+	}
+	// 乱码重跑：只有只读命令才有"执行两次"的豁免（写/安装/提交/启服务重跑
+	// 等于执行两遍，副作用不可接受）；远程 Linux、cmd、后台作业不在 PS 5.1
+	// 注入范围内，直接跳过。最多重跑一次，两次都脏就如实报告。
+	if looksMojibake(out) {
+		if !t.isRemote() && isPS51Shell(p.Shell) && isReadOnlyCommand(p.Command) {
+			alt := alternateEncodingMode(encMode)
+			if out2, err2 := runOnce(alt); err2 == nil {
+				mark := fmt.Sprintf("[编码：首次按 %s 读取出现乱码，已按 %s 重跑一次并采用本次结果]", encMode, alt)
+				if looksMojibake(out2) {
+					mark = fmt.Sprintf("[编码：已按 %s 与 %s 各试一次仍疑似乱码——文件可能既非 UTF-8 也非 GBK，或内容本身异常]", encMode, alt)
+				}
+				out = out2 + "\n" + mark
+			}
+		} else {
+			out += "\n[编码：输出疑似乱码，但该命令不是只读命令（重跑会执行两遍，故未自动重试）；读文件请显式加 -Encoding Default，或改用 read 工具]"
+		}
+	}
+	if encHint != "" {
+		out += "\n[编码：" + encHint + "]"
 	}
 	return out, nil
 }
@@ -1065,7 +1251,7 @@ func runUnconfinedLocal(ctx context.Context, r sandboxRun) (string, error) {
 	case "sh", "bash":
 		cmd = exec.CommandContext(ctx, "sh", "-c", r.Command)
 	case "pwsh", "powershell":
-		exe, command := "powershell", ps51Utf8Prefix+r.Command
+		exe, command := "powershell", ps51Prologue(r.EncodingMode)+r.Command
 		if strings.ToLower(shell) == "pwsh" {
 			exe, command = "pwsh", r.Command
 		} else {
@@ -1152,16 +1338,33 @@ func sandboxEnv(full bool) []string {
 
 // ---------- PowerShell 5.1 编码注入（仅此路径；cmd/pwsh/sh 不注入） ----------
 //
-// Windows PowerShell 5.1 的 $OutputEncoding 默认 ASCII（管道传中文丢字不可逆）、
-// [Console]::OutputEncoding 默认 OEM 代码页（GBK）。给模型命令统一前置一行
-// 设置 + 注入 Python 的 UTF-8 环境变量，中文不再依赖模型记得手动设置。
-// 注入都是单条命令内可覆盖的机制：需要 GBK 老程序时在命令里自行改回
-// （[Console]::OutputEncoding=[Text.Encoding]::GetEncoding(936)）。
+// PS 5.1 的默认有三个坑：$OutputEncoding 默认 ASCII（PS→原生程序管道传中文
+// 丢字不可逆）、[Console]::OutputEncoding 默认 OEM 代码页、**Get-Content /
+// Select-String / Import-Csv 读文件默认 ANSI(936)**——UTF-8 无 BOM 的文件被
+// 解成乱码，而乱码本身是合法 UTF-8 字符串，输出侧的解码兜底救不回来（这是
+// 2026-11-09 实际踩到的坑）。所以这里一次把输出与读面都钉死到 UTF-8，并在
+// 命令涉及 GBK 文件时（encoding.go detectEncodingMode）整条切成 GBK 模式。
+//
+// 写面（Out-File/Set-Content）故意不设默认值：5.1 的 -Encoding utf8 会写
+// BOM，落到 .bat/.cmd/.ps1 上就是 cmd 解析失败——写文件仍由 write 工具与
+// [IO.File]::WriteAllText 负责。注入都是单条命令内可覆盖的机制：命令里显式
+// -Encoding 优先，模型读 GBK 老文件仍可写 -Encoding Default。
 
-// ps51Utf8Prefix 是给 PS 5.1 命令的前置语句。try/catch 防"没有控制台可设"
-// 的场景把整条命令炸掉；链式赋值让 $OutputEncoding（管出）与
-// [Console]::OutputEncoding（管入）同时成为 UTF-8。
-const ps51Utf8Prefix = `try{$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8}catch{}; `
+// ps51Prologue 返回给 PS 5.1 命令的前置语句。mode=gbk 时输出与读面一起切
+// 936：文件按 ANSI 解、输出成 GBK 字节，正好被 decodeCmdOutput 的 GB18030
+// 兜底接住。try/catch 防"没有控制台可设"的场景把整条命令炸掉。
+func ps51Prologue(mode string) string {
+	if mode == encodingModeGBK {
+		return `try{$e=[Text.Encoding]::GetEncoding(936);$OutputEncoding=$e;[Console]::OutputEncoding=$e;` +
+			`$PSDefaultParameterValues['Get-Content:Encoding']='Default';` +
+			`$PSDefaultParameterValues['Select-String:Encoding']='Default';` +
+			`$PSDefaultParameterValues['Import-Csv:Encoding']='Default'}catch{}; `
+	}
+	return `try{$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;` +
+		`$PSDefaultParameterValues['Get-Content:Encoding']='utf8';` +
+		`$PSDefaultParameterValues['Select-String:Encoding']='utf8';` +
+		`$PSDefaultParameterValues['Import-Csv:Encoding']='utf8'}catch{}; `
+}
 
 // ps51Utf8Env 是随命令注入的环境变量（Python 3 旧的发行版默认跟随 ANSI 代码页）。
 func ps51Utf8Env() []string {
@@ -1392,16 +1595,18 @@ type ProgressItem struct {
 
 func progressWriteTool() Tool {
 	return Tool{
-		Spec: toolSpec("progress_write", "维护当前任务的会话进度清单（整体替换：每次提交完整列表）。用于多步骤任务：开始前把工作拆成进度项；开工一项置 in_progress（同时只能有一项）；做完置 completed 再开下一项。简单到一两步的事不必用。",
+		Spec: toolSpec("progress_write", "维护并查看当前任务的会话进度清单。action 省略或 set：整体替换提交完整清单——用于多步骤任务，开始前把工作拆成进度项，开工一项置 in_progress（同时只能有一项），做完置 completed 再开下一项。action=list：只读，返回本会话的全貌——进度清单（哪项在做、哪项已完成）、运行中的程序（本会话在跑的子进程与后台作业，含已跑时长）、以及后台等待项（挂出去等用户处理的询问/审批/计划）。上下文被压缩、想不起自己列过什么、或不确定还有谁在等你回话时，用它重建认知；它只读，不改任何东西。简单到一两步的事不必用 set。",
 			objSchema(map[string]any{
-				"progress": arrayProp("进度项数组（全量清单，整体替换提交）", map[string]any{
+				"action": strProp("set（默认，写清单）| list（只读查看本会话全貌）| cancel（撤销一条后台等待项，需同时给 id）"),
+				"progress": arrayProp("进度项数组（全量清单，整体替换提交；仅 action=set 需要——漏传会报错，不会清空清单）", map[string]any{
 					"type": "object",
 					"properties": map[string]any{
 						"content": strProp("进度项内容，一句话"),
 						"status":  strProp("pending | in_progress | completed"),
 					},
 				}),
-			}, "progress")),
+				"id": strProp("仅 action=cancel：要撤销的后台等待项编号（如 aq-8f21）"),
+			})),
 		Run: runProgressWrite,
 	}
 }
@@ -1431,6 +1636,38 @@ func progressItemsFromArgs(args json.RawMessage) ([]ProgressItem, error) {
 }
 
 func runProgressWrite(t *toolContext, args json.RawMessage) (string, error) {
+	// action 缺省 = set（写清单）：老调用（只给 progress）行为逐字节不变。
+	var head struct {
+		Action   string          `json:"action"`
+		Progress json.RawMessage `json:"progress"`
+	}
+	if err := json.Unmarshal(args, &head); err != nil {
+		return "", err
+	}
+	switch strings.ToLower(strings.TrimSpace(head.Action)) {
+	case "list", "read":
+		return progressSnapshotText(t), nil
+	case "cancel":
+		var c struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(args, &c); err != nil || strings.TrimSpace(c.ID) == "" {
+			return "", fmt.Errorf("action=cancel 需要 id（后台请求的编号，如 aq-8f21）；不知道有哪些就用 action=list 看")
+		}
+		if err := t.app.cancelAsyncAsk(t.sess.ID, strings.TrimSpace(c.ID)); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("已撤销后台请求 %s：它不会再打扰用户，用户之后处理也不会有结果回给你。清单已随之更新（进度清单本身不受影响）。", strings.TrimSpace(c.ID)), nil
+	case "", "set", "write":
+		// 老调用总是带 progress；没带就别当"清空"处理（那会静默抹掉清单），
+		// 提示模型补参数或改用 list。
+		raw := strings.TrimSpace(string(head.Progress))
+		if raw == "" || raw == "null" {
+			return "", fmt.Errorf("action=set 需要 progress 数组（每次提交全量清单）；只想查看当前进度与在跑的程序请用 action=list")
+		}
+	default:
+		return "", fmt.Errorf("action 只能是 set（写清单）/ list（只读查看）/ cancel（撤销一条后台请求），收到 %q", head.Action)
+	}
 	items, err := progressItemsFromArgs(args)
 	if err != nil {
 		return "", err
@@ -1492,4 +1729,110 @@ func progressListOf(a *App, sessionID string) []ProgressItem {
 		return nil
 	}
 	return out
+}
+
+// elapsedCN 把秒数写成给模型看的中文时长：88s / 3m20s / 1h02m。
+func elapsedCN(sec int) string {
+	if sec < 0 {
+		sec = 0
+	}
+	if sec < 60 {
+		return fmt.Sprintf("%ds", sec)
+	}
+	m, s := sec/60, sec%60
+	if m < 60 {
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	return fmt.Sprintf("%dh%02dm", m/60, m%60)
+}
+
+// progressSnapshotText 生成「本会话全貌」的文本（progress_write action=list）：
+// 进度清单 + 运行中的程序。数据与前端那把进度面板同源（progressListOf /
+// runningChildrenOf），只是口径换成给模型看：带状态符号、命令截断、条数封顶
+// ——一次输出不能吃掉半屏上下文。后台等待项（询问/审批/计划）落地后接在最后。
+func progressSnapshotText(t *toolContext) string {
+	const itemMax = 30 // 进度项最多列这么多条
+	const runMax = 10  // 运行中的程序最多列这么多条
+	var b strings.Builder
+	items := progressListOf(t.app, t.sess.ID)
+	if len(items) == 0 {
+		b.WriteString("进度清单：（空——还没用 action=set 列过进度项）\n")
+	} else {
+		done := 0
+		for _, it := range items {
+			if it.Status == "completed" {
+				done++
+			}
+		}
+		fmt.Fprintf(&b, "进度清单：%d 项，完成 %d\n", len(items), done)
+		for i, it := range items {
+			if i >= itemMax {
+				fmt.Fprintf(&b, "…（另有 %d 项未列出）\n", len(items)-itemMax)
+				break
+			}
+			mark := "·"
+			switch it.Status {
+			case "completed":
+				mark = "✔"
+			case "in_progress":
+				mark = "▶"
+			}
+			fmt.Fprintf(&b, "%s %s\n", mark, truncateRunes(it.Content, 120))
+		}
+	}
+	runs := runningChildrenOf(t.app, t.sess.ID)
+	running := 0
+	for _, r := range runs {
+		if fmt.Sprint(r["state"]) == "running" {
+			running++
+		}
+	}
+	if len(runs) == 0 {
+		b.WriteString("运行中的程序：无\n")
+	} else {
+		fmt.Fprintf(&b, "运行中的程序：%d 条（%d 个在跑）\n", len(runs), running)
+		for i, r := range runs {
+			if i >= runMax {
+				fmt.Fprintf(&b, "…（另有 %d 条未列出）\n", len(runs)-runMax)
+				break
+			}
+			label := fmt.Sprint(r["label"])
+			if label == "" || label == "<nil>" {
+				label = "命令"
+			}
+			sec := 0
+			if v, ok := r["elapsed"].(int); ok {
+				sec = v
+			}
+			line := fmt.Sprintf("- %s｜%s｜已跑 %s",
+				label, truncateRunes(fmt.Sprint(r["command"]), 80), elapsedCN(sec))
+			if fmt.Sprint(r["state"]) == "running" {
+				line += "｜运行中"
+			} else {
+				line += "｜已结束"
+				if e := fmt.Sprint(r["exit"]); e != "" && e != "<nil>" {
+					line += "（" + e + "）"
+				}
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+	// 后台等待项：挂出去等人处理的询问/审批/计划（模型忘了自己挂过什么时就靠它）。
+	asks := t.app.asyncPendingOf(t.sess.ID)
+	if len(asks) == 0 {
+		b.WriteString("后台等待项：无\n")
+	} else {
+		fmt.Fprintf(&b, "后台等待项：%d 条（在等用户处理）\n", len(asks))
+		for _, it := range asks {
+			line := fmt.Sprintf("- %s｜%s｜%s｜已等 %s",
+				it.ID, asyncKindLabel(it.Kind), truncateRunes(asyncSummary(it.asyncAsk), 80), elapsedCN(it.WaitingSec))
+			if it.DeadlineMs > 0 {
+				line += "｜超时 " + time.UnixMilli(it.DeadlineMs).Format("15:04")
+			}
+			b.WriteString(line + "\n")
+		}
+		b.WriteString("（结果会自己回来，不要轮询；不需要某一条就用 action=\"cancel\" + id 撤销。）\n")
+	}
+	b.WriteString("（要看某个后台作业的输出用 job_output；终止作业用 job_kill。本工具 action=list 只读，不改清单。）")
+	return b.String()
 }

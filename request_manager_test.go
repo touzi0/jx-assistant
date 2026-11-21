@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// newRequestMgrTestApp 建一个带临时库与临时工作区的 App，**不预置数字经理会话**
+// newRequestMgrTestApp 建一个带临时库与临时工作区的 App，**不预置长期助理会话**
 // （求助通道要能自己找/建它），并返回一个顶层任务会话。
 func newRequestMgrTestApp(t *testing.T) (*App, *SessionMeta) {
 	t.Helper()
@@ -97,7 +97,7 @@ func TestRequestManagerDeliversToManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("求助失败: %v", err)
 	}
-	if !strings.Contains(out, "已发给数字经理") || !strings.Contains(out, "不用等") {
+	if !strings.Contains(out, "已发给长期助理") || !strings.Contains(out, "不用等") {
 		t.Fatalf("返回值应写明已发出且不用等：%s", out)
 	}
 	mgr := managerOf(t, a)
@@ -207,7 +207,7 @@ func TestRequestManagerGuards(t *testing.T) {
 	}
 }
 
-// 提示词成对到位：执行模式拿「找经理帮忙」，数字助理拿「任务来找你协调」，aux 都没有。
+// 提示词成对到位：执行模式拿「找经理帮忙」，数字助理拿定稿第五节「任务来找你、审批来找你」，aux 都没有。
 func TestManagerPromptWiring(t *testing.T) {
 	a, _ := newRequestMgrTestApp(t)
 	for _, mode := range []string{"task", "office", "coding", "beginner-coding", "skill-create"} {
@@ -218,19 +218,20 @@ func TestManagerPromptWiring(t *testing.T) {
 		if !strings.Contains(sys, "不要滥用") {
 			t.Fatalf("模式 %s 的提示词应带一句「不要滥用」", mode)
 		}
-		if strings.Contains(sys, "## 任务来找你协调") {
+		if strings.Contains(sys, "任务来找你、审批来找你") {
 			t.Fatalf("模式 %s 不该拿到数字助理的处理准则", mode)
 		}
 	}
 	as := a.systemPrompt(&SessionMeta{Mode: "assistant", Workspace: a.Cfg.Workspace})
-	if !strings.Contains(as, "## 任务来找你协调") || !strings.Contains(as, "不会等你") {
-		t.Fatalf("数字助理的系统提示词缺少「任务来找你协调」段：%.400s", as)
+	// 2026-11-15 定稿：原独立拼接段 managerCoordPrompt 并入 assistantPrompt 第五节
+	if !strings.Contains(as, "任务来找你、审批来找你") || !strings.Contains(as, "不等你") {
+		t.Fatalf("数字助理的系统提示词缺少「任务来找你、审批来找你」节：%.400s", as)
 	}
 	if strings.Contains(as, "## 找经理帮忙") {
 		t.Fatal("数字助理不该拿到发起侧的「找经理帮忙」段")
 	}
 	aux := a.systemPrompt(&SessionMeta{Mode: "aux", Workspace: a.Cfg.Workspace})
-	if strings.Contains(aux, "## 找经理帮忙") || strings.Contains(aux, "## 任务来找你协调") {
+	if strings.Contains(aux, "## 找经理帮忙") || strings.Contains(aux, "任务来找你、审批来找你") {
 		t.Fatal("aux 两侧都不该有（它既不发求助也不处理求助）")
 	}
 }
@@ -375,7 +376,7 @@ func TestRequestManagerEndToEndWithFakeModel(t *testing.T) {
 
 	// ① 模型真的调到了 request_manager，工具结果写明已发出且不用等
 	waitFor(t, "任务侧工具调用落库", func() bool { return msgHas(t, a, task.ID, "request_manager") })
-	waitFor(t, "任务侧工具结果落库", func() bool { return msgHas(t, a, task.ID, "已发给数字经理", "不用等") })
+	waitFor(t, "任务侧工具结果落库", func() bool { return msgHas(t, a, task.ID, "已发给长期助理", "不用等") })
 	// ② 经理会话收到求助（没经理会话就自动建出来），身份是 aiuser/origin=help
 	mgr := managerOf(t, a)
 	if mgr == nil {

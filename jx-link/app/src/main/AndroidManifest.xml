@@ -14,6 +14,9 @@
     <!-- Android 13+：下载完成通知（DownloadManager 进度/完成提示要它；
          危险权限，运行时随进设备页预申请，用户拒绝仅少通知、下载不受阻） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 检查更新：下载 APK 后交给系统安装器安装（Android 8+ 需用户授予
+         「允许安装未知应用」，运行时引导；系统不允许静默自装，只做引导安装） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 

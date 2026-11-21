@@ -71,16 +71,21 @@ var vtLinkCur vtLinkState
 //
 // 1) 环境变量指定（组件模式：主程序自己知道文件在哪）
 // 2) 输入法自己目录（手写/调试最方便）
-// 3) 开发工作区里的主程序目录（../坚祥数字助理GO）
-// 4) 安装版主程序目录（与 config.json 同级）
+// 3) 开发工作区根（voicetype → voice → 组件 → 工作区根，三级向上；
+//    没有这条，双击启动的输入法读不到主程序设置——叉掉的热键会在重启后复活。
+//    目录改名前的老布局 ../坚祥数字助理GO 也保留一条）
+// 4) 开发工作区里的老主程序目录（../坚祥数字助理GO，改名前的工作区布局）
+// 5) 安装版主程序目录（与 config.json 同级）
 func vtLinkCandidatePaths() []string {
 	out := []string{}
 	if p := strings.TrimSpace(os.Getenv("VT_VOICETYPE_JSON")); p != "" {
 		out = append(out, p)
 	}
 	out = append(out, filepath.Join(vtDir, vtLinkFile))
+	out = append(out, filepath.Join(vtDir, "..", "..", "..", vtLinkFile)) // 工作区根：voicetype→voice→组件→软著版数字助理
 	out = append(out, filepath.Join(vtDir, "..", "坚祥数字助理GO", vtLinkFile))
-	out = append(out, `D:\123\坚祥数字助理GO\`+vtLinkFile)
+	out = append(out, `D:\123\AI数字助理\`+vtLinkFile)   // 安装版（2026-11-19 起新装机目录名跟发行名）
+	out = append(out, `D:\123\坚祥数字助理GO\`+vtLinkFile) // 老装机（AppId 不变沿用旧目录，改名前装的）
 	return out
 }
 

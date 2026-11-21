@@ -8,8 +8,12 @@
 //	  常驻助手。新版启动时自清 .old（FinalizeEngineSwap）。想立即生效走
 //	  /api/update/restart：临时生成 PowerShell 助手逃出 kill-on-close Job
 //	  （processguard 加了 BREAKAWAY_OK，仅此一处用），等旧进程退出后拉起新 exe。
-//	组件：整目录替换（先杀 worker，修市场链路同款缺口），Rescan 后前端
-//	  CX.refresh() 热生效，不打扰用户。
+//	组件：整目录替换（先把旧目录改名挪开、再把新目录落位），Rescan 后前端
+//	  CX.refresh() 热生效。运行中占着目录的（语音的输入法进程、起着的 worker）
+//	  挪不动——那就**不硬来**：包下载暂存进 data/updates/pending，旧版照常服务，
+//	  下次主程序启动时（此刻没有任何进程占用组件目录）一次落地，见
+//	  ApplyPendingComponentBlocks。2026-11-16 用户口径：语音听写/输入法不能因为
+//	  一次更新被打断，"先等着，重启就跟着更新"。
 //
 // blocks.json 是「快照式清单」：记录截至本次发布每块应是哪个版本（不是变更
 // 单）。落后多版的客户端一步对齐到每块最新——V3 只改主程序时清单里 voice 仍
@@ -21,9 +25,11 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -69,6 +75,20 @@ type updateBlockState struct {
 	Runtime       string            `json:"runtime,omitempty"` // 已应用的运行时块版本（py3.14.8）
 	Skills        string            `json:"skills,omitempty"`  // 已应用的内置技能包版本
 	Builtin       string            `json:"builtin,omitempty"` // 已应用的内置组件版本（Cua / Windows-MCP 依赖）
+	// ComponentsPending 运行中占着目录、替换不掉而暂存待下次启动落地的组件块：
+	// id → 暂存信息。旧目录与旧 worker 一律不动（用户正在用的语音输入法不该被
+	// 一次更新打断），重启主程序时没有任何进程占用，替换一次就成。
+	ComponentsPending map[string]pendingComponentBlock `json:"componentsPending,omitempty"`
+}
+
+// pendingComponentBlock 一个已下载暂存、等下次启动落地的组件块。
+type pendingComponentBlock struct {
+	Version string `json:"version"`         // 包里的组件版本（落地后写进 manifest）
+	File    string `json:"file,omitempty"`  // release 附件名
+	SHA256  string `json:"sha256,omitempty"`// 包校验和（同包不重复下载）
+	Dir     string `json:"dir"`             // 已解压待用的组件根目录（data/updates/pending/<id>）
+	At      string `json:"at,omitempty"`
+	Reason  string `json:"reason,omitempty"` // 上次替换没成的说人话原因（被占用等）
 }
 
 var (
@@ -245,6 +265,12 @@ func (a *App) applyBlocksPlan(blocks *updateBlocks, rel releaseInfo, sourceURL s
 		if err := a.applyEngineBlock(*e, rel, sourceURL); err != nil {
 			log.Printf("[更新] 主程序分块更新失败（回退整包横幅）: %v", err)
 			setUpdateError("主程序静默更新失败: " + err.Error())
+			// 静默路把整包横幅连 Available 一起抑制了，回退时重新打开——但只在
+			// 发布里真有安装包可下时开：组件-only 发布没有附件，开着也只是
+			// 一条没有可执行动作的空横幅
+			updateMu.Lock()
+			updateState.Available = updateState.DownloadURL != ""
+			updateMu.Unlock()
 			a.broadcast(Event{Type: "update_available", Title: e.Version})
 			return
 		}
@@ -275,6 +301,9 @@ func (a *App) applyEngineBlock(b updateBlock, rel releaseInfo, sourceURL string)
 	}
 	exeSrc, err := findEngineExe(tmp)
 	if err != nil {
+		return err
+	}
+	if err := verifyEngineCarriesVersion(exeSrc, b.Version); err != nil {
 		return err
 	}
 	exePath := currentExePath()
@@ -325,6 +354,27 @@ func findEngineExe(dir string) (string, error) {
 	}
 }
 
+// verifyEngineCarriesVersion 校验 engine 包里的 exe 真带本版版本串。版本号经
+// -X main.appVersion=<版本> 注入为 ASCII 字面量，正常产物必命中；扫不到＝
+// 载荷与版本号不符（旧 exe 被当成新版发布）。2026-11-19 内测源事故：17 号
+// 二进制被标成 20261119-2 发布，客户端交换→重启→发现仍是旧版→清账→再检查
+// 再交换，无限循环、版本永远升不上去。发布侧脚本（发布静默更新.ps1）出包时
+// 有同款自检，这里防的是服务器端 publish-update 不校验载荷的手滑：坏包拒装、
+// 回退整包横幅，磁盘上正跑的旧版分毫不动。
+func verifyEngineCarriesVersion(path, version string) error {
+	if strings.TrimSpace(version) == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读 engine 包里的 exe 失败: %w", err)
+	}
+	if !bytes.Contains(raw, []byte(version)) {
+		return fmt.Errorf("engine 包里的 exe 不含版本串 %s（载荷与版本号不符，疑似旧程序被当成新版发布）", version)
+	}
+	return nil
+}
+
 // FinalizeEngineSwap 新版启动时结算上一次 engine 交换：确认版本、清残留、同步
 // 横幅状态。幂等，任何失败不阻断启动（下次启动再来一遍）。
 func (a *App) FinalizeEngineSwap() {
@@ -365,12 +415,20 @@ func (a *App) FinalizeEngineSwap() {
 		// 残留（连发两版静默更新必产生一个），此前自清只认精确的 .old，
 		// 带时间戳的一直没人清（实测 20261014-1 换 -2 后留下 .old-1791972527）。
 		// 按前缀一并扫掉；仍被古董实例占用的删不动就留着，下次启动再试。
+		// 旧名前缀一并扫（2026-11-19 换名后按新名扫不到旧名残件，名单由
+		// exe_rename_windows.go 提供，非 Windows 为空）。
 		if dir := filepath.Dir(exePath); dir != "" {
-			prefix := filepath.Base(exePath) + ".old"
+			prefixes := append([]string{filepath.Base(exePath) + ".old"}, legacyExeResiduePrefixes()...)
 			if entries, err := os.ReadDir(dir); err == nil {
 				for _, e := range entries {
-					if !e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
-						_ = os.Remove(filepath.Join(dir, e.Name()))
+					if e.IsDir() {
+						continue
+					}
+					for _, prefix := range prefixes {
+						if strings.HasPrefix(e.Name(), prefix) {
+							_ = os.Remove(filepath.Join(dir, e.Name()))
+							break
+						}
 					}
 				}
 			}
@@ -391,19 +449,41 @@ func (a *App) syncPendingToState() {
 		updateState.PendingVersion = ""
 	}
 	updateState.Applied = st.Applied
+	// 待下次启动落地的组件块：设置页只在有内容时安静显示一行，不当错误报
+	if len(st.ComponentsPending) > 0 {
+		m := make(map[string]string, len(st.ComponentsPending))
+		for id, p := range st.ComponentsPending {
+			m[id] = p.Version
+		}
+		updateState.ComponentsPending = m
+	} else {
+		updateState.ComponentsPending = nil
+	}
 	updateMu.Unlock()
 }
 
-// planComponentBlocks 算需要静默更新的组件块（id 升序）：只含本机已装且版本
-// 落后的；没装的跳过（静默更新不新增组件，新增走市场页手动装）。
+// planComponentBlocks 算需要静默更新的组件块（id 升序）。两类都要：
+//   - 本机已装且版本落后的：升级（本地比清单新则不动，用户手动装的更新版不回退）；
+//   - 本机没有的：补装。清单带块＝发布版本应持有该组件——与安装包 stage\组件
+//     整目录随包装回是同一语义。2026-11-06 客户事故的教训：内置功能组件化后
+//     （skill-market / sites-platform 的入口全靠组件注入），老客户升级 engine
+//     却拿不到新组件目录，入口随升级消失、连市场入口也没了（想再装组件得先有
+//     市场入口，死锁）。想彻底不要某组件用**开关关闭**——关掉不丢数据、记账
+//     保持关、补装也不会把开关打开；手动删目录只在两次组件发版之间有效
+//     （发新版清单带块就会装回，与安装包升级同款行为）。
 func (a *App) planComponentBlocks(blocks map[string]updateBlock) []string {
 	ids := make([]string, 0, len(blocks))
 	for id, b := range blocks {
-		m, ok := a.Components.Manifest(id)
-		if !ok {
+		if b.Version == "" {
+			continue // 防呆：没版本的块不碰
+		}
+		// 用户组件（组件/user/）不参与热更新：它由用户从市场/发行渠道自己
+		// 装、自己卸，版本归用户；清单里的同名条目即使有块也不去覆盖它。
+		if _, ok := a.Components.Manifest(id); ok && !a.Components.IsBuiltin(id) {
+			log.Printf("[更新] 组件 %s 在本机是用户组件（组件/user/），不参与内置热更新", id)
 			continue
 		}
-		if b.Version == "" || versionCompare(b.Version, m.Version) <= 0 {
+		if m, ok := a.Components.Manifest(id); ok && versionCompare(b.Version, m.Version) <= 0 {
 			continue // 本地已是清单版本或更新
 		}
 		ids = append(ids, id)
@@ -412,21 +492,38 @@ func (a *App) planComponentBlocks(blocks map[string]updateBlock) []string {
 	return ids
 }
 
-// applyComponentBlocks 逐个应用组件块：成功后广播 components_updated 让前端
-// CX.refresh() 热生效。
+// applyComponentBlocks 逐个应用组件块：换成了广播 components_updated 让前端
+// CX.refresh() 热生效；换不掉的（目录被运行中的进程占着）只暂存、广播
+// components_pending 安静提一句，旧版继续服务。
 func (a *App) applyComponentBlocks(blocks map[string]updateBlock, rel releaseInfo, sourceURL string) {
 	ids := a.planComponentBlocks(blocks)
 	applied := []string{}
+	staged := []string{}
 	for _, id := range ids {
 		b := blocks[id]
 		m, _ := a.Components.Manifest(id)
-		if err := a.applyComponentBlock(id, b, rel, sourceURL); err != nil {
+		err := a.applyComponentBlock(id, b, rel, sourceURL)
+		var st *errComponentStaged
+		if errors.As(err, &st) {
+			// 运行中被占用：新包已暂存，旧版照常跑，等下次启动落地。这不算失败
+			// ——不写 LastError、不弹错误，只在状态里安静留一句。
+			if st.New {
+				log.Printf("[更新] %s", st.Error())
+				staged = append(staged, id+"→"+st.Version)
+			}
+			continue
+		}
+		if err != nil {
 			log.Printf("[更新] 组件 %s 分块更新失败: %v", id, err)
 			setUpdateError("组件 " + id + " 静默更新失败: " + err.Error())
 			continue
 		}
 		log.Printf("[更新] 组件 %s 已静默更新 %s → %s", id, m.Version, b.Version)
 		applied = append(applied, id+"→"+b.Version)
+	}
+	a.syncPendingToState() // 待下次启动的组件一起刷进 /api/status
+	if len(staged) > 0 {
+		a.broadcast(Event{Type: "components_pending", Title: strings.Join(staged, "、")})
 	}
 	if len(applied) == 0 {
 		return
@@ -457,59 +554,286 @@ func (a *App) applyComponentBlocks(blocks map[string]updateBlock, rel releaseInf
 	a.broadcast(Event{Type: "components_updated", Title: strings.Join(applied, "、")})
 }
 
-// applyComponentBlock 下载组件 zip → 校验 → 解压找根 → 杀 worker → 整目录替换
-// → Rescan。
+// applyComponentBlock 应用一个组件块：没有暂存就先下载校验解压到暂存区，然后
+// 试着整目录替换。
+//
+// 替换不成就**不硬来**：把原因记进 pending 记账、返回 errComponentStaged，旧版
+// 组件与它的 worker/输入法进程一根手指头都不碰，等下次主程序启动时落地。为什么
+// 不「杀进程换完再拉起来」：语音组件的听写 worker 与独立输入法正被用户使用，
+// 杀了就是打断用户（2026-11-16 用户口径：先等着，重启跟着更新就行）。
 func (a *App) applyComponentBlock(id string, b updateBlock, rel releaseInfo, sourceURL string) error {
-	if strings.ContainsAny(id, `\/:*?"<>|`) || id == "." || id == ".." {
+	if strings.ContainsAny(id, `\/:*?"<>|`) || id == "." || id == ".." || id == userComponentsSubdir {
 		return fmt.Errorf("组件 id 不能当目录名: %s", id)
 	}
-	url := findReleaseAssetURL(rel.Assets, b.File, sourceURL)
-	if url == "" {
-		return fmt.Errorf("附件里找不到 %s", b.File)
+	// 已暂存同一版（或更新）：本轮什么都不做——不重复下载、不重复试替换，等
+	// 下次启动一次性落地。每轮轮询都重下几百兆语音包是不可接受的。
+	st := a.loadUpdateBlockState()
+	stageDir := a.pendingComponentDir(id)
+	if p, ok := st.ComponentsPending[id]; ok {
+		if dirExists(p.Dir) && versionCompare(p.Version, b.Version) >= 0 {
+			return &errComponentStaged{ID: id, Version: p.Version, Reason: p.Reason}
+		}
+		// 清单又发新版（或暂存被清掉了）：旧暂存作废，重新下一份
+		_ = os.RemoveAll(stageDir)
+		delete(st.ComponentsPending, id)
+		if err := a.saveUpdateBlockState(st); err != nil {
+			return err
+		}
 	}
-	zipPath, cleanup, err := downloadUpdateFile(url, b.SHA256)
-	if err != nil {
+	if _, err := a.stageComponentBlock(id, b, rel, sourceURL); err != nil {
 		return err
 	}
-	defer cleanup()
-	tmp, err := os.MkdirTemp("", "jxcomp-")
-	if err != nil {
-		return err
+	dst := filepath.Join(a.Components.BuiltinDir(), id)
+	if err := replaceComponentDir(dst, stageDir); err != nil {
+		reason := componentBusyReason(err)
+		st = a.loadUpdateBlockState()
+		if st.ComponentsPending == nil {
+			st.ComponentsPending = map[string]pendingComponentBlock{}
+		}
+		st.ComponentsPending[id] = pendingComponentBlock{
+			Version: b.Version, File: b.File, SHA256: b.SHA256, Dir: stageDir,
+			At: time.Now().Format(time.RFC3339), Reason: reason,
+		}
+		if serr := a.saveUpdateBlockState(st); serr != nil {
+			return fmt.Errorf("暂存记账写盘失败: %v（替换失败原因：%s）", serr, reason)
+		}
+		return &errComponentStaged{ID: id, Version: b.Version, New: true, Reason: reason}
 	}
-	defer os.RemoveAll(tmp)
-	if err := unzip(zipPath, tmp); err != nil {
-		return fmt.Errorf("解压失败: %w", err)
-	}
-	root, err := findRootWith(tmp, "manifest.json")
-	if err != nil {
-		return err
-	}
-	var m ComponentManifest
-	if data, err := os.ReadFile(filepath.Join(root, "manifest.json")); err != nil || json.Unmarshal(data, &m) != nil {
-		return fmt.Errorf("包里没有合法的 manifest.json")
-	}
-	if strings.TrimSpace(m.ID) != id {
-		return fmt.Errorf("包内组件 id（%s）与清单条目（%s）不一致", m.ID, id)
-	}
-	// 先杀 worker：exe 形态的 worker 占着目录时删不掉，py 形态会继续用旧代码服务
-	if a.Bridge != nil {
-		a.Bridge.KillComponent(id)
-	}
-	dst := filepath.Join(a.Components.Dir(), id)
-	if err := os.RemoveAll(dst); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		return err
-	}
-	if err := copyDir(root, dst); err != nil {
-		return fmt.Errorf("复制组件文件失败: %w", err)
+	// 换成了：暂存区（已被改名用掉或复制过）与 pending 记账一起清掉
+	_ = os.RemoveAll(stageDir)
+	st = a.loadUpdateBlockState()
+	if _, ok := st.ComponentsPending[id]; ok {
+		delete(st.ComponentsPending, id)
+		_ = a.saveUpdateBlockState(st)
 	}
 	a.Components.Rescan()
 	if _, ok := a.Components.Manifest(id); !ok {
 		return fmt.Errorf("组件更新后未被识别（manifest.json 异常）")
 	}
 	return nil
+}
+
+// pendingComponentDir 组件暂存区目录（data/updates/pending/<id>）：解压好的
+// 组件根就放这儿，等下次启动搬进 组件/。
+func (a *App) pendingComponentDir(id string) string {
+	return filepath.Join(a.Cfg.DataDir, "updates", "pending", id)
+}
+
+// stageComponentBlock 下载 → 校验 → 解压 → 找根 → 校验 manifest → 落到暂存区，
+// 返回暂存目录（组件根，内含 manifest.json）。
+func (a *App) stageComponentBlock(id string, b updateBlock, rel releaseInfo, sourceURL string) (string, error) {
+	url := findReleaseAssetURL(rel.Assets, b.File, sourceURL)
+	if url == "" {
+		return "", fmt.Errorf("附件里找不到 %s", b.File)
+	}
+	zipPath, cleanup, err := downloadUpdateFile(url, b.SHA256)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	tmp, err := os.MkdirTemp("", "jxcomp-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	if err := unzip(zipPath, tmp); err != nil {
+		return "", fmt.Errorf("解压失败: %w", err)
+	}
+	root, err := findRootWith(tmp, "manifest.json")
+	if err != nil {
+		return "", err
+	}
+	var m ComponentManifest
+	if data, err := os.ReadFile(filepath.Join(root, "manifest.json")); err != nil || json.Unmarshal(data, &m) != nil {
+		return "", fmt.Errorf("包里没有合法的 manifest.json")
+	}
+	if strings.TrimSpace(m.ID) != id {
+		return "", fmt.Errorf("包内组件 id（%s）与清单条目（%s）不一致", m.ID, id)
+	}
+	dst := a.pendingComponentDir(id)
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return "", err
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return "", fmt.Errorf("清旧暂存失败: %w", err)
+	}
+	// 解压临时目录与暂存区多半同卷：直接改名省一次几百兆的拷贝，跨卷退回复制
+	if err := os.Rename(root, dst); err != nil {
+		if cerr := copyDir(root, dst); cerr != nil {
+			return "", fmt.Errorf("暂存组件包失败: %w", cerr)
+		}
+	}
+	return dst, nil
+}
+
+// replaceComponentDir 用 src 目录内容整体替换 dst：
+//  1. 先把旧目录改名挪开——Windows 上目录里有打开的句柄就挪不动，这时替换当场
+//     作废、旧目录分毫未损，调用方据此判定「被占用」走暂存待启动路；
+//  2. 再把 src 落到 dst（同卷直接改名，跨卷退回复制），失败回滚挪开的旧目录；
+//  3. 清掉挪开的旧目录（仍被占用就留着，启动时由 cleanupComponentAsideDirs 收）。
+//
+// 刻意不做「先 RemoveAll 再复制」：删到一半失败会把旧组件留成半残——2026-11-14
+// 的 voice 就是这么坏的（目录被删空、manifest 还在，组件直接消失，日志里只剩
+// 「asr.log 被占用」）。改名只动目录项，失败也不会破坏任何文件。
+func replaceComponentDir(dst, src string) error {
+	aside := ""
+	if dirExists(dst) {
+		clearReadonlyTree(dst)
+		aside = fmt.Sprintf("%s.old-%d", dst, time.Now().Unix())
+		if err := os.Rename(dst, aside); err != nil {
+			return fmt.Errorf("旧组件目录挪不开: %w", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		if aside != "" {
+			_ = os.Rename(aside, dst)
+		}
+		return err
+	}
+	var err error
+	if rerr := os.Rename(src, dst); rerr != nil {
+		err = copyDir(src, dst)
+	}
+	if err != nil {
+		_ = os.RemoveAll(dst)
+		if aside != "" {
+			_ = os.Rename(aside, dst) // 回滚：老版本重新就位，别让组件凭空消失
+		}
+		return fmt.Errorf("写入新组件文件失败: %w", err)
+	}
+	if aside != "" {
+		_ = os.RemoveAll(aside)
+	}
+	return nil
+}
+
+// componentBusyReason 把替换失败的原因说人话：Windows 的占用报错原文（The process
+// cannot access the file because it is being used by another process / 拒绝访问）
+// 用户看不懂，状态里要能一眼分清是「被占用」还是别的原因。
+func componentBusyReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	for _, k := range []string{"being used by another process", "process cannot access",
+		"sharing violation", "lock violation", "拒绝访问", "另一个进程", "正被占用"} {
+		if strings.Contains(msg, strings.ToLower(k)) {
+			return "组件文件正被运行中的进程占用，关掉软件后会自动更新"
+		}
+	}
+	return err.Error()
+}
+
+// errComponentStaged 组件包已下载暂存、等下次主程序启动时落地。不是失败：调用方
+// 据此既不记错误也不广播失败，New 表示本轮刚下载暂存（false = 之前已暂存，本轮
+// 什么都没做）。
+type errComponentStaged struct {
+	ID      string
+	Version string
+	New     bool
+	Reason  string
+}
+
+func (e *errComponentStaged) Error() string {
+	if e.New {
+		return fmt.Sprintf("组件 %s %s 已下载暂存，下次启动软件时自动更新（%s）", e.ID, e.Version, e.Reason)
+	}
+	return fmt.Sprintf("组件 %s %s 已在暂存区等下次启动更新", e.ID, e.Version)
+}
+
+// ApplyPendingComponentBlocks 启动时落地「运行中被占用」的组件暂存包。
+//
+// 调用点必须在任何组件 worker 与语音输入法进程起来之前（NewApp 里 InitComponents
+// 之后、Bridge 创建之前）：此刻组件目录没有任何进程占用，替换一次就成。失败不
+// 阻断启动——记账保留，下次启动再试，日志里留原因。
+func (a *App) ApplyPendingComponentBlocks() {
+	st := a.loadUpdateBlockState()
+	if len(st.ComponentsPending) == 0 {
+		return
+	}
+	ids := make([]string, 0, len(st.ComponentsPending))
+	for id := range st.ComponentsPending {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	changed := false
+	for _, id := range ids {
+		p := st.ComponentsPending[id]
+		if !dirExists(p.Dir) {
+			log.Printf("[更新] 组件 %s 的暂存包已不在（%s），取消待更新记账", id, p.Dir)
+			delete(st.ComponentsPending, id)
+			changed = true
+			continue
+		}
+		// 本机已是同版或更新（完整安装包覆盖安装 / 用户手动装过）、或这个 id 现在
+		// 是用户组件（组件/user）：暂存包作废，只清账
+		if m, ok := a.Components.Manifest(id); ok {
+			if !a.Components.IsBuiltin(id) {
+				log.Printf("[更新] 组件 %s 现在是用户组件，丢弃内置暂存包", id)
+				_ = os.RemoveAll(p.Dir)
+				delete(st.ComponentsPending, id)
+				changed = true
+				continue
+			}
+			if versionCompare(m.Version, p.Version) >= 0 {
+				log.Printf("[更新] 组件 %s 本机已是 %s（暂存的是 %s），清掉暂存包", id, m.Version, p.Version)
+				_ = os.RemoveAll(p.Dir)
+				delete(st.ComponentsPending, id)
+				changed = true
+				continue
+			}
+		}
+		dst := filepath.Join(a.Components.BuiltinDir(), id)
+		if err := replaceComponentDir(dst, p.Dir); err != nil {
+			log.Printf("[更新] 组件 %s 暂存包启动应用失败（保留，下次启动再试）: %v", id, err)
+			continue
+		}
+		delete(st.ComponentsPending, id)
+		if st.Applied == nil {
+			st.Applied = map[string]string{}
+		}
+		st.Applied[id] = p.Version
+		changed = true
+		_ = os.RemoveAll(p.Dir)
+		log.Printf("[更新] 组件 %s 已按暂存包更新到 %s（启动时落地，无进程占用）", id, p.Version)
+	}
+	if changed {
+		_ = a.saveUpdateBlockState(st)
+		a.Components.Rescan()
+	}
+	cleanupComponentAsideDirs(a.Components.BuiltinDir())
+}
+
+// cleanupComponentAsideDirs 清掉历史上替换组件时改名让路留下的 <id>.old-<时间戳>
+// 目录（旧版注释说「下次启动再清」，此前其实没人清）。
+func cleanupComponentAsideDirs(root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.Contains(e.Name(), ".old-") {
+			continue
+		}
+		p := filepath.Join(root, e.Name())
+		if err := os.RemoveAll(p); err != nil {
+			log.Printf("[更新] 组件旧目录残留清不掉（下次启动再试）: %s", p)
+		}
+	}
+}
+
+// clearReadonlyTree 递归去掉只读位：Windows 上带只读属性的文件删不掉，
+// os.RemoveAll 会整块失败（同步工具、解压器、杀软都可能给组件文件打上只读）。
+func clearReadonlyTree(dir string) {
+	_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if info.Mode().Perm()&0200 == 0 {
+			_ = os.Chmod(p, 0644)
+		}
+		return nil
+	})
 }
 
 /* ---------- HTTP：手动入口 ---------- */

@@ -32,6 +32,10 @@ type LayerPlugin struct {
 	Marketplace string `json:"marketplace,omitempty"`
 	Enabled  bool   `json:"enabled"`
 	Adapted  bool   `json:"adapted"` // DSH：插件/ 有原件但无适配器（灰显不可开关）
+	// 会话生效视图（GET /api/plugins?s=<会话id> 时填充）：GlobalEnabled＝全局
+	// 开关值、Override＝该会话是否显式覆盖过（按对话开关浮窗显示覆盖徽标用）。
+	GlobalEnabled bool `json:"globalEnabled,omitempty"`
+	Override      bool `json:"override,omitempty"`
 	// Claude 层的组件概览（徽章计数 + 执行型组件开关状态）
 	Components map[string]bool         `json:"components,omitempty"`
 	Skills     int                     `json:"skills,omitempty"`

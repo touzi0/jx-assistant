@@ -2,7 +2,8 @@
  * 二选一 + 用户名 → POST /api/wizard/discover|connect → 自动配好内部模型通道、
  * 技能/组件市场、软件更新。首次启动 app.js 调 maybeShowWizard 自动弹（!wizardDone），
  * 设置·网络访问的「重新运行接入向导」可随时重开；「跳过」写 wizardDone 不再自动弹，
- * 点遮罩/Esc 关闭视为暂缓（下次启动还会弹）。 */
+ * 点遮罩/Esc 关闭视为暂缓（下次启动还会弹）。拖选文字防误关见 bindWizard 的
+ * 按下起点判定与左侧防误触带（.wz-guard）。 */
 
 let wzBusy = false; // 连接在途：防重复提交
 
@@ -108,7 +109,16 @@ async function wzConnect() {
     wzSetResult('ok', bits.join('<br>'));
     go.textContent = '完成';
     go.disabled = false;
-    go.onclick = () => closeWizard(); // 完成即关（wizardDone 后端已写）
+    // 完成即关（wizardDone 后端已写）。关闭的同时广播 wizard:done（2026-11-13
+    // 充值组件）：组件据此在「公司通道 + 服务端开了门户」时紧接着弹个人中心
+    // 引导浮窗（portalURL 空=纯本地/个人配置或门户未开，组件收到也不弹）。
+    // Esc / 点遮罩是「暂缓」语义，不走这条广播。
+    go.onclick = () => {
+      closeWizard();
+      if (window.JX && typeof JX.emit === 'function') {
+        JX.emit('wizard:done', { company: res.company || '', portalURL: res.portalURL || '', connected: true });
+      }
+    };
   } catch (e) {
     wzSetResult('bad', esc(e.message));
     go.disabled = false;
@@ -132,7 +142,12 @@ function bindWizard() {
   $('wz-go').onclick = wzConnect;
   $('wz-skip').onclick = wzSkip;
   const m = $('welcome-modal');
-  m.addEventListener('click', (e) => { if (e.target === m) closeWizard(); }); // 点遮罩=暂缓
+  // 拖选文字（公司名/姓名）惯性滑出卡片时，click 会落在共同祖先遮罩上而误关窗：
+  // 只有「按下就在遮罩上」的才算点遮罩关闭。左侧防误触带 .wz-guard 覆盖卡片左侧，
+  // 落在带上的点击 target 不是遮罩，天然不关——两道防线双保险
+  let wzDownOnMask = false;
+  m.addEventListener('mousedown', (e) => { wzDownOnMask = e.target === m; });
+  m.addEventListener('click', (e) => { if (e.target === m && wzDownOnMask) closeWizard(); }); // 点遮罩=暂缓
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || !wizardOpen()) return;
     // 有别的弹窗开着时不抢键（confirm 在更上层）

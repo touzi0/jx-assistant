@@ -69,8 +69,10 @@ body.mk-4col .mk-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .mk-act.ghost:hover { background: #fbecec; border-color: #e2b4b4; color: var(--danger); }
 
 
-/* 上传技能到市场（市场 · 技能 tab 的「＋ 上传技能」）：
-   先装后传——从已装用户技能里选一个发布；选中后元信息表单按后端推导预填。 */
+/* 上传到市场（市场 · 技能/组件/插件 tab 的「＋ 上传xx」，三类共用弹层）：
+   先装后传——从本机已装清单里选一个发布；选中后元信息表单按后端推导预填。
+   组件/插件的 ID 与版本锁定为包内清单值（manifest.json / plugin.json），
+   输入框只读展示（.mku-meta input[readonly]）。 */
 .mku-card { width: min(560px, calc(100vw - 32px)); }
 .mku-card .spacer { flex: 1; }
 .mku-sub { font-size: 12.5px; color: var(--text-2); line-height: 1.75; margin-bottom: 12px; white-space: normal; }
@@ -87,6 +89,7 @@ body.mk-4col .mk-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .mku-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-top: 14px; }
 .mku-meta label { margin-bottom: 10px; }
 .mku-meta label.mku-wide { grid-column: 1 / -1; }
+.mku-meta input[readonly] { background: var(--hover); color: var(--text-2); cursor: default; }
 .mku-req { color: var(--danger); font-size: 11px; margin-left: 4px; }
 .mku-opt { color: var(--text-3); font-size: 11px; margin-left: 4px; }
 .mku-status { font-size: 12.5px; color: var(--text-2); line-height: 1.7; white-space: pre-line; min-height: 17px; }

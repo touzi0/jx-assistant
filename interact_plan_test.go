@@ -6,6 +6,8 @@ package main
 //   · 重启后的批准 / 修改 / 忽略由 resolvePersistedPlan 收口：投一条通知进会话、
 //     按需拉起新一轮。测试里用 runners 塞一个空 run 把会话标成「正在执行」，
 //     投递就走排队（不真跑模型），只验证语义与落库结果。
+// 另锁定「停止连带取消待审批」（2026-11-08）：等待审批/提问的这轮被停止
+//（ctx 取消）——待审批计划作废、审批按拒绝收卡，浮窗随广播收起。
 
 import (
 	"context"
@@ -115,11 +117,13 @@ func TestResolvePersistedPlanApprove(t *testing.T) {
 	}
 	q := a.pendingOf("s1")
 	if len(q.Steer) != 1 {
-		t.Fatalf("应插话投递 1 条通知，实际 %d 条", len(q.Steer))
+		t.Fatalf("应插话投递 1 条回执，实际 %d 条", len(q.Steer))
 	}
 	pm := q.Steer[0]
-	if pm.Kind != kindReport || !strings.Contains(pm.Content, "计划已批准") {
-		t.Fatalf("批准的投递内容不对: kind=%q content=%q", pm.Kind, pm.Content)
+	// 2026-11-18 起遗留计划审批走合成工具回执对（exit_plan_mode 的后续结果），
+	// 不再是 kindReport 用户侧通知
+	if pm.ToolName != "exit_plan_mode" || pm.Origin != originToolReport || !strings.Contains(pm.Content, "计划已批准") {
+		t.Fatalf("批准的投递内容不对: toolName=%q origin=%q content=%q", pm.ToolName, pm.Origin, pm.Content)
 	}
 }
 
@@ -149,7 +153,7 @@ func TestResolvePersistedPlanReject(t *testing.T) {
 	}
 }
 
-// 忽略（搁置）：计划不撤销——它仍在待审批，只是这一轮停下来
+// 取消：计划不撤销——它仍在待审批，只是这一轮停下来
 func TestResolvePersistedPlanIgnore(t *testing.T) {
 	st := testPlanStore(t)
 	createPlanSession(t, st, "s1", "会话一", true)
@@ -159,27 +163,30 @@ func TestResolvePersistedPlanIgnore(t *testing.T) {
 	a := newPlanTestApp(t, st)
 
 	if err := a.resolveQuestion("q-4", "__ignore__"); err != nil {
-		t.Fatalf("搁置应成功: %v", err)
+		t.Fatalf("取消应成功: %v", err)
 	}
 	pp, ok := st.PendingPlanOf("s1")
 	if !ok || pp.ID != "q-4" {
-		t.Fatal("搁置后计划必须还在（仍等用户处置）")
+		t.Fatal("取消后计划必须还在（仍等用户处置）")
 	}
 	m, _ := st.Get("s1")
 	if !m.PlanMode {
-		t.Fatal("搁置不该改变计划模式状态")
+		t.Fatal("取消不该改变计划模式状态")
 	}
 	if q := a.pendingOf("s1"); len(q.Queue) != 0 {
-		t.Fatalf("搁置不该往会话里投任何消息，实际 %+v", q.Queue)
+		t.Fatalf("取消不该往会话里投任何消息，实际 %+v", q.Queue)
 	}
 	if qs := a.pendingQuestions(); len(qs) != 1 || qs[0].ID != "q-4" {
-		t.Fatalf("搁置后它仍应挂在待办清单里，实际 %+v", qs)
+		t.Fatalf("取消后它仍应挂在待办清单里，实际 %+v", qs)
 	}
 }
 
-// 计划在等待中被停止/中断（ctx 取消）：计划仍留在库里继续等审批，
-// 而且**不能广播 question_resolved**——前端收到它就会把卡收了，计划框就没了。
-func TestPlanWaitCancelledKeepsPlan(t *testing.T) {
+// 停止连带取消待审批（2026-11-08 修复）：等待审批中本轮被停止（ctx 取消，
+// 即用户点「停止」/数字助理代停）——库里那份无时限的待审批计划随之**作废**
+// （拒绝/撤销语义，不是批准），广播 question_resolved 让前端收卡，兜底轮询
+// （/api/questions → pendingQuestions）也不再把它挂回来；迟到的批准请求只会
+// 得到「不存在或已处理」。重启遗留（不走这条收尾）的保留语义不受影响。
+func TestStopCancelsPendingPlan(t *testing.T) {
 	st := testPlanStore(t)
 	a := newPlanTestApp(t, st)
 	sess := createPlanSession(t, st, "s1", "会话一", true)
@@ -216,26 +223,33 @@ func TestPlanWaitCancelledKeepsPlan(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ctx 取消后等待没有结束")
 	}
-	if pp, ok := st.PendingPlanOf("s1"); !ok || pp.ID != q.ID {
-		t.Fatal("等待被停止/中断后，计划必须仍在库里等审批")
+	if _, ok := st.PendingPlanOf("s1"); ok {
+		t.Fatal("停止后待审批计划应随本轮作废（不再挂着等审批）")
+	}
+	if qs := a.pendingQuestions(); len(qs) != 0 {
+		t.Fatalf("作废后兜底轮询不该再把它挂出来，实际 %+v", qs)
 	}
 	time.Sleep(50 * time.Millisecond) // 放行广播
+	resolved := false
 	mu.Lock()
 	for _, ev := range events {
-		if ev.Type == "question_resolved" {
-			mu.Unlock()
-			t.Fatal("计划仍在等审批，不该广播 question_resolved（前端会据此收掉计划框）")
+		if ev.Type == "question_resolved" && ev.QuestionID == q.ID {
+			resolved = true
 		}
 	}
 	mu.Unlock()
-
-	// 停止之后用户仍能批准：内存里已没有等待者，走遗留计划那条路
-	a.runners["s1"] = &sessionRun{}
-	if err := a.resolveQuestion(q.ID, "__approve__"); err != nil {
-		t.Fatalf("停止之后仍应能批准这份计划: %v", err)
+	if !resolved {
+		t.Fatal("停止作废后应广播 question_resolved（前端据此收掉审批卡）")
 	}
-	if _, ok := st.PendingPlanOf("s1"); ok {
-		t.Fatal("批准后待审批记录应撤掉")
+
+	// 迟到的批准（前端竞态窗口里才发出）：等待者与库里的计划都没了，明确报错
+	if err := a.resolveQuestion(q.ID, "__approve__"); err == nil {
+		t.Fatal("已作废的审批请求不该再能批准")
+	}
+	// 会话模式不动：停止取消的是这份审批请求，不是计划模式本身
+	m, _ := st.Get("s1")
+	if !m.PlanMode {
+		t.Fatal("停止取消审批不该顺手改会话模式（仍在计划模式）")
 	}
 }
 
@@ -438,5 +452,117 @@ func TestAskTimeoutSecAndHold(t *testing.T) {
 	a.resolveQuestion(qH.ID, "慢慢选好了")
 	if s := <-held; s != "慢慢选好了" {
 		t.Fatalf("停表后作答应照常返回，实际 %q", s)
+	}
+}
+
+// 停止连带取消待审批的另一半：越权审批（perm.go 的 requestApproval，与提问
+// 同构）在等待中被停止——按拒绝（非超时、更非批准）收卡：广播
+// approval_resolved 让前端浮窗收起、从待办清单消失、迟到的批准报错。
+func TestStopCancelsPendingApproval(t *testing.T) {
+	st := testPlanStore(t)
+	a := newPlanTestApp(t, st)
+	sess := createPlanSession(t, st, "s1", "会话一", false)
+
+	ch, unsub := a.subscribe()
+	defer unsub()
+	var mu sync.Mutex
+	var events []Event
+	go func() {
+		for ev := range ch {
+			mu.Lock()
+			events = append(events, ev)
+			mu.Unlock()
+		}
+	}()
+
+	type res struct{ approved, always, timedOut bool }
+	done := make(chan res, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		ap, al, to := a.requestApproval(ctx, sess, "shell", "写工作区外", "测试用")
+		done <- res{ap, al, to}
+	}()
+	id := waitApprovalRegistered(t, a)
+
+	cancel() // 用户点了停止：审批等待随之结束
+	select {
+	case r := <-done:
+		if r.approved || r.timedOut {
+			t.Fatalf("停止应按「拒绝（非超时、非批准）」返回给工具，实际 %+v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("停止后审批等待没有结束")
+	}
+	time.Sleep(50 * time.Millisecond) // 放行广播
+	resolved := false
+	mu.Lock()
+	for _, ev := range events {
+		if ev.Type == "approval_resolved" && ev.ApprovalID == id {
+			resolved = true
+		}
+	}
+	mu.Unlock()
+	if !resolved {
+		t.Fatal("停止后应广播 approval_resolved（前端据此收掉审批浮窗）")
+	}
+	if list := a.pendingApprovals(); len(list) != 0 {
+		t.Fatalf("停止后审批应从待办清单消失，实际 %+v", list)
+	}
+	if err := a.resolveApproval(id, true, false); err == nil {
+		t.Fatal("已随停止取消的审批不该再能批准")
+	}
+}
+
+// 停止的取消语义要传到 AI 侧：等待审批/提问的工具在 ctx 取消（= 停止）后返回
+// 「已取消（作废）」的说明——不是批准、也不是超时放行，模型与落库的 tool 结果
+// 都不会把停止误解成用户点了同意。
+func TestStopCancelSemanticsInToolResults(t *testing.T) {
+	st := testPlanStore(t)
+	a := newPlanTestApp(t, st)
+	sess := createPlanSession(t, st, "s1", "会话一", true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 工具开跑前本轮已被停止：内部等待立刻随 ctx 取消返回
+
+	planOut := make(chan string, 1)
+	go func() {
+		out, err := runExitPlanMode(&toolContext{ctx: ctx, app: a, sess: sess},
+			json.RawMessage(`{"plan":"# 计划"}`))
+		if err != nil {
+			planOut <- "err:" + err.Error()
+			return
+		}
+		planOut <- out
+	}()
+	select {
+	case s := <-planOut:
+		if !strings.Contains(s, "作废") || strings.Contains(s, "批准了") {
+			t.Fatalf("停止后 exit_plan_mode 应返回作废（非批准）语义，实际 %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("停止后 exit_plan_mode 没有返回")
+	}
+	if _, ok := st.PendingPlanOf("s1"); ok {
+		t.Fatal("停止后 exit_plan_mode 落的计划应已随取消作废")
+	}
+
+	askOut := make(chan string, 1)
+	go func() {
+		out, err := runAskUserQuestion(&toolContext{ctx: ctx, app: a,
+			sess: createPlanSession(t, st, "s2", "会话二", false)},
+			json.RawMessage(`{"question":"选哪个？"}`))
+		if err != nil {
+			askOut <- "err:" + err.Error()
+			return
+		}
+		askOut <- out
+	}()
+	select {
+	case s := <-askOut:
+		if !strings.Contains(s, "不视为放行") {
+			t.Fatalf("停止后 ask_user_question 应返回取消（非放行）语义，实际 %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("停止后 ask_user_question 没有返回")
 	}
 }

@@ -1,0 +1,8 @@
+# 组件运行时残留排除清单（相对仓库根，/ 分隔；# 开头为注释行）
+# 开发机上组件边跑边写的产物：打包安装包（stage 副本）与发布静默更新（组件 zip）
+# 都按本清单剔除，绝不进发行包。新组件产生运行时残留时往这里加行。
+组件/voice/voicetype/history/
+组件/voice/voicetype/webview2-profile/
+组件/voice/voicetype/asr.log
+组件/voice/voicetype/history.json
+组件/voice/voicetype/vt.log

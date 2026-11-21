@@ -47,9 +47,10 @@ import kotlin.math.abs
  *   调用，由网页按层级决定（设置页 → 连按两次退出 → 菜单 → 右栏 → 左栏 →
  *   对话页呼出左栏），与浏览器返回、左右滑手势同一套。壳只保留网页做不到的两件
  *   事：先退系统全屏视频；网页说 'exit'（3 秒内连按两次）时 finish() 真正结束本页
- * - 应用级「首页」浮条：原生 TextView 胶囊浮在 WebView 之上、
- *   屏幕水平绝对居中，与网页布局完全解耦——此前把按钮注入网页顶栏，编程模式下
- *   顶栏内容变多会把右侧栏按钮挤到第二行；浮条盖在网页上，网页爱怎么排怎么排
+ * - 应用级「首页」浮条：原生胶囊浮在 WebView 之上、屏幕水平绝对居中，与网页布局
+ *   完全解耦——此前把按钮注入网页顶栏，编程模式下顶栏内容变多会把右侧栏按钮挤到
+ *   第二行；浮条盖在网页上，网页爱怎么排怎么排。三格：回首页｜设备名｜刷新
+ *   （刷新＝就地重连事件流与执行流再补拉消息，不整页重载；见 startRefresh）
  * - 原生上下边缘手势：从屏幕顶缘往下滑 / 底缘往上滑回首页（参数对齐电脑端左右栏
  *   滑出手势：30dp 热区、56dp 触发、横向意图即让位；只认从边缘起手的滑动）
  * - 系统返回键 = 回首页
@@ -60,6 +61,15 @@ class DeviceActivity : Activity() {
     private lateinit var web: WebView
     private lateinit var failBox: View
     private var loadUrlNow: String = ""
+
+    // 首页浮条右侧刷新按钮：转圈期间禁用（防连点），结果由网页经 JXLink.refreshDone
+    // 回执；REFRESH_TIMEOUT_MS 内没回执照失败收场（页面卡死，或电脑端前端还是老版本、
+    // 没有 jxRemoteRefresh 这个入口）
+    private lateinit var chipRefresh: android.widget.ImageButton
+    private lateinit var chipStatus: android.widget.TextView
+    private var refreshing = false
+    private var spinAnim: android.animation.ObjectAnimator? = null
+    private val chipH = Handler(Looper.getMainLooper())
 
     // HTTPS 优先状态：先试 https 同端口，主 frame 加载失败即回落 http（一次定论）
     private var httpsTried = false
@@ -215,11 +225,17 @@ class DeviceActivity : Activity() {
         web = findViewById(R.id.web)
         failBox = findViewById(R.id.load_fail)
 
-        // 应用级首页浮条：浮在 WebView 之上、水平绝对居中；点击回首页
-        findViewById<android.widget.TextView>(R.id.home_chip).apply {
-            text = dev.name
-            setOnClickListener { finish() }
-        }
+        // 应用级首页浮条：浮在 WebView 之上、水平绝对居中。
+        // 左＝回首页；中＝设备名；右＝刷新（重连 + 补拉，见 refreshRemote）
+        findViewById<android.widget.TextView>(R.id.chip_name).text = dev.displayName()
+        findViewById<android.widget.ImageButton>(R.id.chip_home).setOnClickListener { finish() }
+        chipStatus = findViewById(R.id.chip_status)
+        chipRefresh = findViewById(R.id.chip_refresh)
+        chipRefresh.setOnClickListener { startRefresh() }
+        // 整页刷新的兜底出口：长按＝把网页整页重拉——「重连」救不回半死的页面时，
+        // 用户还能自己把它拉起来（连点两次做不到：转圈期间按钮不收点击，第二下
+        // 必然落在转圈里被吞掉；长按不受 clickable 影响，任何时候都能用）
+        chipRefresh.setOnLongClickListener { reloadPage(); true }
 
         // 预申请麦克风（2026-10-12 修）：首次进设备页就把系统权限框弹掉，
         // 消除「网页请求麦克风 → 系统框弹出 → 用户切去设置 → 网页侧超时被拒」
@@ -257,6 +273,72 @@ class DeviceActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         takeShareExtras(intent) // 已在设备页时分享直达（不重载网页）
+    }
+
+    /* ---------- 首页浮条的刷新：重连 + 补拉（不整页 reload） ----------
+       为什么不是整页刷新：用户可能正打到一半（输入框有字、消息区上翻在读），
+       整页重载会把这些一起清掉；而断掉的其实只是两条长连接（全局事件流与当前
+       会话执行流）。所以点一下＝让网页就地重连再补拉（web/app-chat.js 的
+       reconnectRemote），壳只负责交互状态：转圈、防连点、结果回执。
+       真重连不回来（网络还没恢复/页面卡死）才给兜底：长按＝整页重载。 */
+
+    /** 点击：发起一次重连（转圈中忽略——按钮此时不接受点击，防连点） */
+    private fun startRefresh() {
+        if (refreshing) return
+        refreshing = true
+        chipH.removeCallbacks(hideStatus)
+        // 防连点用 isClickable=false 而不是 isEnabled=false：禁用整个 View 会连长按一起
+        // 吃掉——网络卡住时转圈能持续到 8 秒超时，期间用户唯一的兜底出口（长按整页
+        // 重载）必须还在。长按只要求 longClickable，与 clickable 无关。
+        chipRefresh.isClickable = false
+        chipRefresh.alpha = 0.6f
+        chipStatus.visibility = View.GONE
+        spinAnim = android.animation.ObjectAnimator.ofFloat(chipRefresh, View.ROTATION, 0f, 360f).apply {
+            duration = 700
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            interpolator = android.view.animation.LinearInterpolator()
+            start()
+        }
+        chipH.postDelayed(refreshTimeout, REFRESH_TIMEOUT_MS)
+        // 网页侧入口（web/app-chat.js）：返回 false 表示这版电脑端前端没有它（老版本），
+        // 直接按失败处理；正常走 JXLink.refreshDone 异步回执
+        web.evaluateJavascript(JS_REMOTE_REFRESH) { res ->
+            if ((res ?: "").trim('"') == "false") failRefresh()
+        }
+    }
+
+    private val refreshTimeout = Runnable { failRefresh() }
+
+    private fun failRefresh() {
+        if (!refreshing) return
+        finishRefresh(false)
+        Toast.makeText(this, "网络未恢复，请稍后再试（长按刷新按钮可整页重载）", Toast.LENGTH_LONG).show()
+    }
+
+    /** 收尾：停转圈、复原按钮，成功给 1 秒「已刷新」回执 */
+    private fun finishRefresh(ok: Boolean) {
+        if (!refreshing) return // 已超时收场：迟到的回执不再改界面（免得把新一轮的转圈掐掉）
+        refreshing = false
+        chipH.removeCallbacks(refreshTimeout)
+        spinAnim?.cancel()
+        spinAnim = null
+        chipRefresh.rotation = 0f
+        chipRefresh.alpha = 1f
+        chipRefresh.isClickable = true
+        chipStatus.text = if (ok) "已刷新" else "未恢复"
+        chipStatus.visibility = View.VISIBLE
+        chipH.postDelayed(hideStatus, STATUS_MS)
+    }
+
+    private val hideStatus = Runnable { chipStatus.visibility = View.GONE }
+
+    /** 兜底出口：整页重载（等价网页里的 location.reload）。输入框内容会丢，故只在
+     *  重连失败时长按时走 */
+    private fun reloadPage() {
+        android.util.Log.d("JxLink", "reload page (refresh fallback)")
+        chipH.removeCallbacks(hideStatus)
+        chipStatus.visibility = View.GONE
+        web.reload()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -392,7 +474,7 @@ class DeviceActivity : Activity() {
                     ),
                 )
                 web.visibility = View.GONE
-                findViewById<android.widget.TextView>(R.id.home_chip).visibility = View.GONE
+                findViewById<View>(R.id.home_chip).visibility = View.GONE
                 window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
 
@@ -401,7 +483,7 @@ class DeviceActivity : Activity() {
                 fullscreenView = null
                 (window.decorView as? android.widget.FrameLayout)?.removeView(v)
                 web.visibility = View.VISIBLE
-                findViewById<android.widget.TextView>(R.id.home_chip).visibility = View.VISIBLE
+                findViewById<View>(R.id.home_chip).visibility = View.VISIBLE
                 window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                 fullscreenCb?.onCustomViewHidden()
                 fullscreenCb = null
@@ -516,6 +598,14 @@ class DeviceActivity : Activity() {
         /** 手机壳标识：网页侧据此决定「下载」走壳的保存通路还是浏览器的 blob 通路 */
         @android.webkit.JavascriptInterface
         fun shellName(): String = "jx-link"
+
+        /** 网页回报「刷新」的结果（web/app-chat.js 的 jxRemoteRefresh）：
+         *  ok=true 已重连并补拉完，false=电脑端没答上话（网络未恢复）——
+         *  壳据此收尾转圈、给回执并提示失败。跑在 JavaBridge 线程，交回主线程。 */
+        @android.webkit.JavascriptInterface
+        fun refreshDone(ok: Boolean) {
+            runOnUiThread { finishRefresh(ok) }
+        }
     }
 
     private fun portOf(u: Uri): Int =
@@ -632,6 +722,9 @@ class DeviceActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         shareH.removeCallbacksAndMessages(null)
+        chipH.removeCallbacksAndMessages(null)
+        spinAnim?.cancel()
+        spinAnim = null
         // 全屏视频残留兜底（正在全屏时退出页面）
         fullscreenView?.let {
             (window.decorView as? android.widget.FrameLayout)?.removeView(it)
@@ -710,6 +803,17 @@ class DeviceActivity : Activity() {
         private const val REQ_AUDIO_PRE = 5 // 进设备页预申请（结果与网页请求共用一段处理）
         private const val SHARE_WAIT_MS = 120_000L // 页面就绪等待窗口（中继拉起外壳可能要十几秒）
         private const val SHARE_CHUNK_BYTES = 384 * 1024 // base64 分块：每块注入 ~512KB 字符串
+        private const val REFRESH_TIMEOUT_MS = 8_000L // 刷新回执等待上限：超时按失败收场
+        private const val STATUS_MS = 1_000L // 「已刷新」回执停留时间（到点复原）
+
+        /** 刷新入口（web/app-chat.js 的 jxRemoteRefresh）：返回 false＝这版电脑端前端
+         *  没有这个函数（老版本），壳按失败处理；正常结果走 JXLink.refreshDone 回执 */
+        private const val JS_REMOTE_REFRESH = """
+            (function(){try{
+              if(typeof window.jxRemoteRefresh!=='function')return false;
+              window.jxRemoteRefresh();return true;
+            }catch(e){return false}})()
+        """
 
         /** 就绪探测：远程外壳把它俩之一暴露出来才算页面可用（gate 先载、外壳后到） */
         private const val JS_SHARE_READY = """

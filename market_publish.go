@@ -1,15 +1,28 @@
-/* 市场发布（把技能发到市场服务器）：POST /api/market/publish
+/* 市场发布（把已装的东西发到市场服务器）：POST /api/market/publish
 
-   设计口径（2026-10-10 重构）：**先装后传**——只能发布已安装到本机的用户技能
-   （技能/user/<id>/），包由后端从安装目录现场打包。这保证上市场的技能至少
-   「在本机装得进来、能被 read_skill 读到」，也顺便把前端从 zip 解析/词表
-   兜底里解放出来（元信息推导全在 Go 一处）。
+   设计口径（2026-10-10 重构）：**先装后传**——只能发布已安装到本机的东西
+   （技能=user/<id>/、组件=组件/user/<id>/、插件=claude-plugins 缓存里的
+   插件根），包由后端从安装目录现场打包。这保证上市场的内容至少「在本机
+   装得进来」，也顺便把前端从 zip 解析/词表兜底里解放出来（元信息推导全
+   在 Go 一处）。2026-11-19 起三类同一条链路：
+     · skill     元信息回退链见下表，id/版本可由表单改写；
+     · component id 与版本锁定为组件 manifest.json 的值（市场条目 id 必须
+       与 manifest.id 一致，客户端按它判定「已安装」；版本是「内容有变化
+       必须升号」的落点）；打包剔除运行时产物/用户数据（见 publishSkip*）；
+     · plugin    id=ccSanitizeName(plugin.json 的 name)（与安装键 name@市场
+       两端对齐）、版本取 plugin.json，同样锁定。
 
-   市场服务器（jxai-server，另一仓库）的用户发布端点是 POST /api/market/publish：
+   市场服务器（jxai-server，另一仓库）的用户发布端点 POST /api/market/publish：
    multipart（type / file=zip / id / name / version / desc / tags），**身份取
    X-Jxai-User 请求头**（值=本机发布者姓名），服务端记 owner、判归属；同 id
-   重发布只允许原发布者。下架端点 POST /api/market/unpublish {type,id} 同样
-   带头，归属校验在服务端做（客户端只发消息）。
+   重发布只允许原发布者。服务端开了发布审核（marketReview，缺省开）时上传
+   先落待审区，响应 200 带 pending:true 与提示文案——文案服务器说了算，
+   客户端有 message 就原样弹（2026-11-15 口径），三类共用。下架端点 POST
+   /api/market/unpublish {type,id} 同样带头，归属校验在服务端做（客户端只
+   发消息）。服务端另有「用户名+设备名+IP」三要素审计：这两个用户端点在
+   X-Jxai-User 之外还必须带 X-Jxai-Device 头（值=本机稳定设备标识，见
+   marketDevice），缺设备头服务端 403——错误信息已写明原因，客户端经下面
+   的拒绝分支原样转达给用户。
 
    本端点（客户端本地服务）做四件事：
      1. 定位已装技能 技能/user/<id>/，现场打 zip（包根=SKILL.md 所在目录）；
@@ -45,6 +58,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -530,7 +544,27 @@ const (
 // owner 与下载明细、判「只能动自己发的」；没设发布者姓名时不带。
 const marketUserHeader = "X-Jxai-User"
 
+// marketDeviceHeader 设备标识头：与服务端 jxai-server 的 deviceHeader 同名。
+// 用户面发布/下架两个端点必带（三要素审计「用户名+设备名+IP」），缺头服务端
+// 直接 403；清单/下载等只读接口不受影响。值见 marketDevice。
+const marketDeviceHeader = "X-Jxai-Device"
+
 func (a *App) marketUser() string { return strings.TrimSpace(a.Cfg.PublisherName) }
+
+// marketDevice 本机稳定设备标识：复用远程接入设备号 RemoteAccess.MyID
+// （config.go 的 ensureRemoteIdentity 启动时生成并落盘，同一台机器恒定不变），
+// 让市场审计的「设备名」与手机远程入口 /a/<设备号> 同源。防御 MyID 被清空的
+// 极端情况：现场生成一个并立即回写，保证发布/下架永远带得上设备头。
+func (a *App) marketDevice() string {
+	if id := strings.TrimSpace(a.Cfg.RemoteAccess.MyID); id != "" {
+		return id
+	}
+	a.Cfg.RemoteAccess.MyID = genDeviceID()
+	if err := a.Cfg.Save(a.CfgPath); err != nil {
+		log.Printf("市场设备号生成后回写配置失败: %v", err)
+	}
+	return a.Cfg.RemoteAccess.MyID
+}
 
 // marketRequest 给市场请求补身份头（有发布者姓名才带）。
 func (a *App) marketRequest(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
@@ -562,6 +596,9 @@ type publishMeta struct {
 	Description string   `json:"description"`
 	Tags        []string `json:"tags"`
 	IDSuggested bool     `json:"idSuggested"` // id 是中文词表建议的（前端标注「可改」）
+	// Excluded 打包时剔除的运行时产物（组件/插件发布时前端提示「包里少了
+	// 什么」；技能为空）。
+	Excluded []string `json:"excluded,omitempty"`
 }
 
 // zipSkillDir 把技能目录打成 zip（包根=目录本身，SKILL.md 在根部）。
@@ -605,6 +642,100 @@ func zipSkillDir(dir string) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+/* ---------- 组件 / 插件：打包与元信息（三类同一条先装后传链路） ---------- */
+
+// 打包组件/插件目录时剔除的运行时产物。组件目录是「边跑边写」的（worker
+// 进程的 cwd 锚在组件目录里）：WebView2 用户数据（几十 MB 缓存）、输入历史、
+// 本机凭据（im-bridge 的 config.json 明文存着各平台 token——它的口径是
+// 「本机私有数据」）都不能进市场包。目录名按任意层级匹配；剔除清单随
+// publish-meta 回给前端展示，用户看得见少了什么。
+var (
+	publishSkipDirNames = map[string]bool{
+		"webview2-profile": true, // WebView2 用户数据目录（缓存）
+		"__pycache__":      true, // Python 字节码缓存
+		"node_modules":     true, // 依赖目录（层级深、体积大）
+		".git":             true,
+		"history":          true, // 运行输入历史等用户数据
+	}
+	publishSkipFileNames = map[string]bool{
+		"config.json":   true, // 组件本机配置（含凭据）
+		"runtime.json":  true, // 运行时状态（游标等）
+		"mappings.json": true, // 运行时映射表
+		"history.json":  true, // 输入历史
+		"Thumbs.db":     true,
+		".DS_Store":     true,
+	}
+)
+
+// publishSkipFile 判断一个文件是否运行时产物（按文件名与扩展名）。
+func publishSkipFile(rel string) bool {
+	name := filepath.Base(rel)
+	if publishSkipFileNames[name] {
+		return true
+	}
+	return strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".tmp") ||
+		strings.HasSuffix(name, "~") // 编辑器备份（xxx.exe~）
+}
+
+// zipDirForPublish 把组件/插件目录打成 zip（包根=目录本身，manifest 在根部），
+// 剔除运行时产物，返回 zip 字节与被剔除的相对路径（前端提示用）。
+func zipDirForPublish(dir string) ([]byte, []string, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	var skipped []string
+	err := filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if info.IsDir() {
+			if publishSkipDirNames[info.Name()] {
+				skipped = append(skipped, filepath.ToSlash(rel)+"/")
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if publishSkipFile(rel) {
+			skipped = append(skipped, filepath.ToSlash(rel))
+			return nil
+		}
+		hdr, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		hdr.Method = zip.Deflate
+		w, err := zw.CreateHeader(hdr)
+		if err != nil {
+			return err
+		}
+		in, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		_, err = io.Copy(w, in)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, nil, err
+	}
+	return buf.Bytes(), skipped, nil
+}
+
+// reMarketRefID 组件/插件的市场 id 字符集（与服务端 marketID 同口径：字母/
+// 数字/中划线/下划线/点；技能另用更严的纯小写规则）。
+var reMarketRefID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 // prepareSkillPublish 定位已装用户技能（技能/user/<id>/），现场打包并走发布
 // 校验链（inspectSkillZip + rewriteSkillZip），返回 zip 数据、包信息与推导出
@@ -656,27 +787,165 @@ func (a *App) prepareSkillPublish(skillID string) (data []byte, pack *skillPackI
 	return data, pack, meta, nil
 }
 
-// handleMarketPublishMeta 选中一个已装技能后取推导元信息（前端预填表单；
-// 词表建议只在这半边发生，Go 单一来源）。
+// prepareComponentPublish 定位已装组件（仅用户组件）并现场打包、推导元信息。
+// 内置组件随程序发版、被静默更新持有，市场不得覆盖（装不回去）——直接拒绝。
+// id/版本取自 manifest.json 且不接受表单改写：市场条目 id 必须与 manifest.id
+// 一致（decorateEntries 按它判定已安装），版本是「内容有变化必须升号」的落点。
+func (a *App) prepareComponentPublish(componentID string) (data []byte, meta publishMeta, excluded []string, err error) {
+	id := strings.TrimSpace(componentID)
+	if id == "" {
+		return nil, meta, nil, fmt.Errorf("需要 componentId（已装用户组件的 id）")
+	}
+	if a.Components == nil {
+		return nil, meta, nil, fmt.Errorf("组件体系未初始化")
+	}
+	if a.Components.IsBuiltin(id) {
+		return nil, meta, nil, fmt.Errorf("「%s」是内置组件（随程序分发、随静默更新升级），不走市场上传；市场只收用户组件（组件/user/ 下，市场装的手动放的都算）", id)
+	}
+	dir, ok := a.Components.CompDir(id)
+	if !ok {
+		return nil, meta, nil, fmt.Errorf("本机没有安装组件 %s：先装好（市场安装或放进 组件/user/）再上传", componentID)
+	}
+	rawMD, rerr := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if rerr != nil {
+		return nil, meta, nil, fmt.Errorf("组件缺少 manifest.json（不是有效的组件目录）: %w", rerr)
+	}
+	var m ComponentManifest
+	if jerr := json.Unmarshal(rawMD, &m); jerr != nil {
+		return nil, meta, nil, fmt.Errorf("manifest.json 不是合法 JSON: %w", jerr)
+	}
+	// 体检走服务端 validateAndDerive 的同款规则，让问题在本机就报出来
+	if m.Client.JS == "" && m.Client.CSS == "" {
+		return nil, meta, nil, fmt.Errorf("manifest.json 的 client.js / client.css 至少要有一个（服务端同款校验）")
+	}
+	for _, f := range []string{m.Client.JS, m.Client.CSS} {
+		if f != "" {
+			if _, serr := os.Stat(filepath.Join(dir, filepath.FromSlash(f))); serr != nil {
+				return nil, meta, nil, fmt.Errorf("清单里声明的 %s 在组件目录里不存在（服务端同款校验）", f)
+			}
+		}
+	}
+	if data, excluded, err = zipDirForPublish(dir); err != nil {
+		return nil, meta, nil, fmt.Errorf("打包组件目录失败: %w", err)
+	}
+	if m.ID == "" {
+		m.ID = filepath.Base(dir)
+	}
+	if !reMarketRefID.MatchString(m.ID) {
+		return nil, meta, nil, fmt.Errorf("组件 id %q 不是市场能接受的形态（字母/数字开头，只用字母/数字/中划线/下划线/点）", m.ID)
+	}
+	meta.ID = m.ID
+	meta.Name = firstNonEmptyStr(m.Name, m.ID)
+	meta.Version = firstNonEmptyStr(m.Version, "1.0.0")
+	meta.Description = m.Description
+	return data, meta, excluded, nil
+}
+
+// preparePluginPublish 定位已装 Claude Code 插件（claude-plugins 缓存里的插件根）
+// 并现场打包、推导元信息。id=ccSanitizeName(plugin.json 的 name)——与市场端
+// 推导、客户端安装键 name@jx-market 同一套清洗，两端自然对齐；版本取
+// plugin.json 的 version，同样不接受表单改写。
+func (a *App) preparePluginPublish(pluginKey string) (data []byte, meta publishMeta, excluded []string, err error) {
+	key := strings.TrimSpace(pluginKey)
+	if key == "" || !strings.Contains(key, "@") {
+		return nil, meta, nil, fmt.Errorf("需要 pluginKey（已装插件的 key，形如 名@市场，从插件清单接口取）")
+	}
+	if a.CCPlugins == nil {
+		return nil, meta, nil, fmt.Errorf("插件体系未初始化")
+	}
+	root, ok := a.CCPlugins.rootOf(key)
+	if !ok {
+		return nil, meta, nil, fmt.Errorf("本机没有安装插件 %s（上传只支持 Claude Code 形态的插件：市场装的、本地装的都行，从 设置 · 插件 安装）", key)
+	}
+	man, merr := ccReadManifest(root)
+	if merr != nil {
+		return nil, meta, nil, fmt.Errorf("插件清单读不出来: %w", merr)
+	}
+	if data, excluded, err = zipDirForPublish(root); err != nil {
+		return nil, meta, nil, fmt.Errorf("打包插件目录失败: %w", err)
+	}
+	meta.ID = ccSanitizeName(man.Name)
+	meta.Name = firstNonEmptyStr(man.DisplayName, man.Name, meta.ID)
+	meta.Version = firstNonEmptyStr(man.Version, "1.0.0")
+	meta.Description = man.Description
+	return data, meta, excluded, nil
+}
+
+// marketEntryVersion 查市场清单里某条目的当前版本（发布前的同版本拦截用）。
+// 清单拉不到时按「没找到」处理——这是本机的礼貌校验，真正的规则在服务端。
+func (a *App) marketEntryVersion(marketRawURL, typ, id string) (string, bool) {
+	man, err := a.fetchMarketManifest(marketRawURL, true)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range marketEntriesOf(man, typ) {
+		if e.ID == id {
+			return e.Version, true
+		}
+	}
+	return "", false
+}
+
+// handleMarketPublishMeta 选中一个已装技能/组件/插件后取推导元信息（前端预填
+// 表单；词表建议只在这半边发生，Go 单一来源）。type 缺省 skill（老前端只传
+// skill 参数）；组件传 id、插件传 key（name@市场）。
 func (a *App) handleMarketPublishMeta(w http.ResponseWriter, r *http.Request) {
-	skillID := strings.TrimSpace(r.URL.Query().Get("skill"))
-	if skillID == "" {
-		writeErr(w, 400, "需要 skill 参数（已装用户技能的 id）")
+	typ := strings.TrimSpace(r.URL.Query().Get("type"))
+	switch typ {
+	case "":
+		typ = "skill"
+	case "skill", "component", "plugin":
+	default:
+		writeErr(w, 400, "type 只能是 skill / component / plugin")
 		return
 	}
-	_, _, meta, err := a.prepareSkillPublish(skillID)
+	var meta publishMeta
+	var excluded []string
+	var err error
+	switch typ {
+	case "skill":
+		skillID := strings.TrimSpace(r.URL.Query().Get("skill"))
+		if skillID == "" {
+			writeErr(w, 400, "需要 skill 参数（已装用户技能的 id）")
+			return
+		}
+		_, _, meta, err = a.prepareSkillPublish(skillID)
+	case "component":
+		if id := strings.TrimSpace(r.URL.Query().Get("id")); id == "" {
+			writeErr(w, 400, "需要 id 参数（已装用户组件的 id）")
+			return
+		} else {
+			_, meta, excluded, err = a.prepareComponentPublish(id)
+		}
+	case "plugin":
+		if key := strings.TrimSpace(r.URL.Query().Get("key")); key == "" {
+			writeErr(w, 400, "需要 key 参数（已装插件的 key，形如 名@市场）")
+			return
+		} else {
+			_, meta, excluded, err = a.preparePluginPublish(key)
+		}
+	}
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	meta.Excluded = excluded
 	writeJSON(w, 200, meta)
 }
 
-// handleMarketPublish 把一个**已安装的用户技能**发布到市场服务器。
-// POST /api/market/publish {skillId, id, name, version, description, tags}。
+// handleMarketPublish 把一个**已安装的**技能/组件/插件发布到市场服务器。
+// POST /api/market/publish {type, skillId|componentId|pluginKey, id, name,
+// version, description, tags}。type 缺省 skill（老前端不带 type 只传 skillId）。
+// 组件/插件的 id 与版本锁定为包内清单值（body 里的 id/version 不生效——
+// 前端也是只读展示），且与市场在架版本相同时拒收：内容有变化必须先在
+// manifest.json / plugin.json 里升版本号。
 func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SkillID     string   `json:"skillId"`
+		Type string `json:"type"` // skill（缺省）/ component / plugin
+		// 三类各自的「已装来源」引用（先装后传）
+		SkillID     string `json:"skillId"`
+		ComponentID string `json:"componentId"`
+		PluginKey   string `json:"pluginKey"`
 		ID          string   `json:"id"`
 		Name        string   `json:"name"`
 		Version     string   `json:"version"`
@@ -685,6 +954,20 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&body); err != nil {
 		writeErr(w, 400, "请求体不是合法 JSON")
+		return
+	}
+	typ := strings.TrimSpace(body.Type)
+	ref := ""
+	switch typ {
+	case "", "skill":
+		typ = "skill"
+		ref = strings.TrimSpace(body.SkillID)
+	case "component":
+		ref = strings.TrimSpace(body.ComponentID)
+	case "plugin":
+		ref = strings.TrimSpace(body.PluginKey)
+	default:
+		writeErr(w, 400, "type 只能是 skill / component / plugin")
 		return
 	}
 	user := a.marketUser()
@@ -702,28 +985,52 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	data, pack, meta, err := a.prepareSkillPublish(body.SkillID)
+	var data []byte
+	var meta publishMeta
+	var excluded []string
+	switch typ {
+	case "skill":
+		data, _, meta, err = a.prepareSkillPublish(ref)
+	case "component":
+		data, meta, excluded, err = a.prepareComponentPublish(ref)
+	case "plugin":
+		data, meta, excluded, err = a.preparePluginPublish(ref)
+	}
 	if err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	// 显式字段优先；id 强制英文短名（^[a-z0-9-]+$，Agent Skills 规范）
-	id := strings.TrimSpace(body.ID)
-	if id != "" {
-		if id = skillIDForMarket(id); id == "" {
-			writeErr(w, 400, "技能 ID 只能用纯小写字母/数字/中划线（市场端规则，如 wechat-chat-ops），不能带中文或空格")
+	sum := sha256.Sum256(data)
+	// id 与版本：技能沿用「表单优先 + 推导回退」（市场端规则：纯小写字母/
+	// 数字/中划线）；组件/插件锁定为包内清单值——市场条目 id 与安装键、
+	// 「已装/可更新」判定全锚在它们上，表单改写只会造出装不上/判不准的条目。
+	var id, version string
+	if typ == "skill" {
+		id = strings.TrimSpace(body.ID)
+		if id != "" {
+			if id = skillIDForMarket(id); id == "" {
+				writeErr(w, 400, "技能 ID 只能用纯小写字母/数字/中划线（市场端规则，如 wechat-chat-ops），不能带中文或空格")
+				return
+			}
+		} else {
+			id = meta.ID
+		}
+		if id == "" {
+			writeErr(w, 400, "技能 ID 推不出来：市场只收纯小写字母/数字/中划线的 ID（如 wechat-chat-ops），中文名（如「微信操作」）请在弹层里填一个英文 ID")
 			return
 		}
+		if builtinSkillIDs[id] {
+			writeErr(w, 400, fmt.Sprintf("%s 是自带技能的 id，会装不上，请改名", id))
+			return
+		}
+		version = firstNonEmptyStr(body.Version, meta.Version, "1.0.0")
 	} else {
-		id = meta.ID
-	}
-	if id == "" {
-		writeErr(w, 400, "技能 ID 推不出来：市场只收纯小写字母/数字/中划线的 ID（如 wechat-chat-ops），中文名（如「微信操作」）请在弹层里填一个英文 ID")
-		return
-	}
-	if builtinSkillIDs[id] {
-		writeErr(w, 400, fmt.Sprintf("%s 是自带技能的 id，会装不上，请改名", id))
-		return
+		id, version = meta.ID, meta.Version
+		if v, found := a.marketEntryVersion(raw, typ, id); found && v == version {
+			src := map[string]string{"component": "组件 manifest.json", "plugin": "插件 plugin.json"}[typ]
+			writeErr(w, 400, fmt.Sprintf("市场里 %s %s 已是 v%s：内容有变化请先把 %s 的 version 升一号再上传（同版本重传会被拒）", map[string]string{"component": "组件", "plugin": "插件"}[typ], id, version, src))
+			return
+		}
 	}
 	name := firstNonEmptyStr(body.Name, meta.Name, id)
 	if n := len([]rune(name)); n > skillNameMax {
@@ -735,7 +1042,6 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("描述 %d 字符，超出了上限 %d（行业规范）：描述会进每个会话的技能清单，请精简，详细内容写进 SKILL.md 正文", n, skillDescMax))
 		return
 	}
-	version := firstNonEmptyStr(body.Version, meta.Version, "1.0.0")
 	tags := make([]string, 0, len(body.Tags))
 	for _, t := range body.Tags {
 		if t = strings.TrimSpace(t); t != "" {
@@ -766,7 +1072,7 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	mw := multipart.NewWriter(pw)
 	go func() {
 		defer pw.Close()
-		_ = mw.WriteField("type", "skill")
+		_ = mw.WriteField("type", typ)
 		_ = mw.WriteField("id", id)
 		_ = mw.WriteField("name", name)
 		_ = mw.WriteField("version", version)
@@ -792,6 +1098,7 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set(marketUserHeader, user)
+	req.Header.Set(marketDeviceHeader, a.marketDevice())
 	resp, err := marketPublishClient.Do(req)
 	if err != nil {
 		writeErr(w, 502, "连接市场服务器失败: "+err.Error())
@@ -800,8 +1107,10 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var srv struct {
-		Entry map[string]any `json:"entry"`
-		Error string         `json:"error"`
+		Entry   map[string]any `json:"entry"`
+		Error   string         `json:"error"`
+		Pending bool           `json:"pending"` // 服务端开了发布审核：进待审区，管理员批准后才上架
+		Message string         `json:"message"` // 成功/待审文案服务器说了算（2026-11-15 口径），客户端原样转达
 	}
 	_ = json.Unmarshal(respBody, &srv)
 	if resp.StatusCode >= 400 {
@@ -827,8 +1136,17 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 	a.marketMu.Unlock()
 
 	out := map[string]any{
-		"ok": 1, "type": "skill", "id": id, "name": name, "version": version,
-		"description": desc, "tags": tags, "sha256": pack.SHA256, "size": pack.Size,
+		"ok": 1, "type": typ, "id": id, "name": name, "version": version,
+		"description": desc, "tags": tags, "sha256": hex.EncodeToString(sum[:]), "size": int64(len(data)),
+	}
+	if len(excluded) > 0 {
+		out["excluded"] = excluded
+	}
+	if srv.Pending {
+		out["pending"] = true
+	}
+	if srv.Message != "" {
+		out["message"] = srv.Message
 	}
 	if srv.Entry != nil {
 		out["entry"] = srv.Entry
@@ -840,7 +1158,8 @@ func (a *App) handleMarketPublish(w http.ResponseWriter, r *http.Request) {
 
 // handleMarketUnpublish 下架一条自己发布的条目：客户端只发消息——归属校验
 // 与「挪进服务端回收站」都在服务端做（POST <origin>/api/market/unpublish，
-// 身份走 X-Jxai-User 头），客户端不再自判归属（那只是给按钮显隐用的 UX）。
+// 身份走 X-Jxai-User + X-Jxai-Device 头，同发布的审计口径），客户端不再自判
+// 归属（那只是给按钮显隐用的 UX）。
 func (a *App) handleMarketUnpublish(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Type string `json:"type"`
@@ -873,6 +1192,7 @@ func (a *App) handleMarketUnpublish(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set(marketUserHeader, user)
+	req.Header.Set(marketDeviceHeader, a.marketDevice())
 	resp, err := marketPublishClient.Do(req)
 	if err != nil {
 		writeErr(w, 502, "连接市场服务器失败: "+err.Error())

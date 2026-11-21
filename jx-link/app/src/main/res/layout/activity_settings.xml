@@ -20,10 +20,70 @@
             android:textSize="20sp"
             android:textStyle="bold" />
 
-        <!-- 区域一：清空应用缓存 -->
+        <!-- 区域一：检查更新 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="检查更新"
+                android:textColor="@color/text1"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/upd_current"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="当前版本：-"
+                android:textColor="@color/text2"
+                android:textSize="13sp" />
+
+            <TextView
+                android:id="@+id/upd_status"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="还没有检查过更新"
+                android:textColor="@color/text2"
+                android:textSize="13sp"
+                android:lineSpacingExtra="3dp" />
+
+            <Button
+                android:id="@+id/btn_check_update"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="14dp"
+                android:background="@drawable/bg_btn_secondary"
+                android:text="检查更新"
+                android:textColor="@color/text1"
+                android:textSize="15sp"
+                android:stateListAnimator="@null" />
+
+            <Button
+                android:id="@+id/btn_download_update"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_btn_primary"
+                android:text="下载并安装"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:stateListAnimator="@null"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- 区域二：清空应用缓存 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
             android:background="@drawable/bg_card"
             android:orientation="vertical"
             android:padding="16dp">
@@ -57,7 +117,7 @@
                 android:stateListAnimator="@null" />
         </LinearLayout>
 
-        <!-- 区域二：反馈意见 -->
+        <!-- 区域三：反馈意见 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -121,6 +181,69 @@
                 android:background="@drawable/bg_btn_primary"
                 android:text="发送反馈"
                 android:textColor="#FFFFFF"
+                android:textSize="15sp"
+                android:stateListAnimator="@null" />
+        </LinearLayout>
+
+        <!-- 区域四：更新源（内测可指向别的源） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:background="@drawable/bg_card"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="更新源"
+                android:textColor="@color/text1"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="只填服务基地址（要带 https:// 前缀），如 https://jxaizz.com:2227；\n清单路径 /updates/android/latest 会自动补上，误贴了也会收敛掉。"
+                android:textColor="@color/text2"
+                android:textSize="13sp"
+                android:lineSpacingExtra="3dp" />
+
+            <EditText
+                android:id="@+id/upd_source"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:background="@drawable/bg_btn_secondary"
+                android:hint="https://服务器地址:端口"
+                android:inputType="textUri"
+                android:maxLines="1"
+                android:padding="10dp"
+                android:textSize="13sp"
+                android:textColor="@color/text1"
+                android:textColorHint="#B8BDC6" />
+
+            <Button
+                android:id="@+id/btn_source_save"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_btn_secondary"
+                android:text="保存更新源"
+                android:textColor="@color/text1"
+                android:textSize="15sp"
+                android:stateListAnimator="@null" />
+
+            <Button
+                android:id="@+id/btn_source_reset"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_btn_secondary"
+                android:text="恢复默认"
+                android:textColor="@color/text2"
                 android:textSize="15sp"
                 android:stateListAnimator="@null" />
         </LinearLayout>

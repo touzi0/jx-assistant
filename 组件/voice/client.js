@@ -22,7 +22,8 @@
  *       模型文件齐备，未就绪时设置页切回云端。
  *
  * 3) 快捷键：默认鼠标侧键，可自定义键盘单键/组合键、甚至鼠标左右键同按
- *    （不允许单独的左键或右键）；点按切换与长按输入两种模式（设置页可切）。
+ *    （不允许单独的左键或右键）；触发方式默认**点按切换**（按一下开始、再按一下
+ *    结束），设置页可切成长按输入。
  *    主/副键帽框与录制器用主程序 HK 的共用控件（app-hotkeys.js），并经
  *    JX.registerHotkey 登记——设置·快捷键 总表里是同一份数据，两边改互相同步。
  *    仅在窗口聚焦时激活（失焦自动松手）。主输入框的占位灰字会像发送快捷键
@@ -35,7 +36,7 @@
  *    语音误触发排查（点上传文件启动听写）2026-10-10.md。
  *
  * 全程零配置（不需要任何密钥）。按钮 DOM 在 web/index.html（位置与样式不变），
- * 默认带 .hidden——按钮属于本组件，组件关掉（设置 → 内置组件）或没加载到页面
+ * 默认带 .hidden——按钮属于本组件，组件关掉（设置 → 组件）或没加载到页面
  * = 按钮整组不出现。热开关 dispose 完整撤销（识别停止、朗读停止、钩子注销、
  * 设置页消失），不需要刷新页面。
  */
@@ -91,19 +92,30 @@
        可触发——有侧键的用侧键，没有的自然用 Alt。
      · 用户自定义（设置页录制）：单组合，元素为 'ctrl'|'alt'|'shift'|'meta' |
        单个字母/数字 | 'f1'..'f12' | 'space' | 'mouse-side'（侧键，前后两枚都算）
+       | 'mouse-side-1'（侧键1·后退位）| 'mouse-side-2'（侧键2·前进位）
        | 'mouse-left' | 'mouse-right'。
      · 清空（设置页「清空」按钮）：存空数组＝停用快捷键（只点按钮听写）。
      · 独按修饰键（如默认副键 Alt）：按住期间又按了别的键（用户在按 Alt+X
        组合）→ 解除不触发；点按模式在**独按松开**时触发，避免任何 Alt 组合误触。
      · 校验：不允许只剩单独的 mouse-left 或单独的 mouse-right（废掉正常点击/菜单）。
-     · 模式：tap=点按切换；hold=长按输入（按住说话、松开/失焦结束）。
+     · 模式：tap=点按切换（**默认**）；hold=长按输入（按住说话、松开/失焦结束）。
      仅窗口聚焦时激活；失焦自动清空按键状态并结束长按会话。纯字母/数字单键在
      输入框聚焦时不触发（字符要留给打字），组合键不受此限。 */
 
   const KEY_NAMES = {
     ctrl: 'Ctrl', alt: 'Alt', shift: 'Shift', meta: 'Win', space: '空格',
-    'mouse-side': '鼠标侧键', 'mouse-left': '鼠标左键', 'mouse-right': '鼠标右键',
+    'mouse-side': '鼠标侧键', 'mouse-side-1': '鼠标侧键1', 'mouse-side-2': '鼠标侧键2',
+    'mouse-left': '鼠标左键', 'mouse-right': '鼠标右键',
   };
+
+  // 配置键名 vs 实际按下的键名：'mouse-side' 两枚侧键都算（旧配置不变），
+  // 配了具体某一枚（mouse-side-1=后退位 / mouse-side-2=前进位）就只认那一枚——
+  // 与独立输入法（voicetype 的 vtKeyMatches）同一套语义。
+  function keyMatches(cfg, actual) {
+    if (cfg === actual) return true;
+    if (cfg === 'mouse-side') return actual === 'mouse-side-1' || actual === 'mouse-side-2';
+    return false;
+  }
 
   function isModKey(k) { return k === 'ctrl' || k === 'alt' || k === 'shift' || k === 'meta'; }
 
@@ -133,6 +145,16 @@
   function voiceShortcutMode() {
     return pref.get('shortcutMode', 'tap') === 'hold' ? 'hold' : 'tap';
   }
+  // 触发方式的产品默认＝**点按切换**（按一下开始、再按一下结束）；长按输入是可选项。
+  // 独立语音输入法的触发方式也跟这里走（主程序把它写进 voicetype.json 联动文件），
+  // 所以默认只在主程序这一处定。
+  // 存量归一（一次性）：早期版本没记"用户显式选过"，机器上可能留着一份从没主动选过
+  // 的 hold（旧版默认或验证脚本遗留），表现为"默认竟然是长按"。没有显式选择标记的
+  // hold 一律回到默认点按；用户之后在设置页主动选长按会打标记，不再被迁移。
+  function migrateShortcutModeDefault() {
+    if (pref.get('shortcutModeSet', false)) return;
+    if (pref.get('shortcutMode', null) === 'hold') pref.set('shortcutMode', 'tap');
+  }
   function shortcutLabel() {
     const alts = shortcutAlternatives();
     if (!alts.length) return '无（已清空）';
@@ -158,7 +180,9 @@
     return null; // 其他键不收（避免录出系统级/生僻组合）
   }
   function normMouse(e) {
-    return { 0: 'mouse-left', 2: 'mouse-right', 3: 'mouse-side', 4: 'mouse-side' }[e.button] || null;
+    // button 3=XBUTTON1（侧键1·后退位）4=XBUTTON2（侧键2·前进位），分开记名；
+    // 配置里写 'mouse-side' 的经 keyMatches 两枚都算
+    return { 0: 'mouse-left', 2: 'mouse-right', 3: 'mouse-side-1', 4: 'mouse-side-2' }[e.button] || null;
   }
   function isEditable(t) {
     return !!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable));
@@ -237,9 +261,14 @@
 
   function altHeld(alt) { // 一个备选组合是否被完整按住
     for (const k of alt) {
-      if (!heldKey.has(k) && !heldMouse.has(k)) return false;
+      if (!heldKey.has(k) && !heldMouse.has(k) && !heldMouseKeyMatches(k)) return false;
     }
     return true;
+  }
+  // 配置键名（可能是泛指的 'mouse-side'）是否被当前按着的具体侧键满足
+  function heldMouseKeyMatches(k) {
+    for (const m of heldMouse) if (keyMatches(k, m)) return true;
+    return false;
   }
 
   // 独按修饰键状态（如默认备选里的 Alt）：按住期间按了别的键就解除，
@@ -279,7 +308,8 @@
         // 光标移出窗口松手、WebView2 不派发 window blur 等都会造成）会把之后任何一次
         // 普通鼠标点击都补成"组合成立"→ 点「上传文件」却开了听写。详见
         // 语音误触发排查（点上传文件启动听写）2026-10-10.md。
-        if (key && !alt.includes(key)) continue;
+        // 归属判定用 keyMatches：配 'mouse-side' 时侧键 1/2 都算该组合的成员。
+        if (key && !alt.some((k) => keyMatches(k, key))) continue;
         if (mode === 'hold') {
           if (holdSession) return;
           const c0 = activeVoiceCtl(); if (c0 && c0.active()) return;
@@ -394,8 +424,9 @@
       if (!active || (window.HK && HK.isRecording())) return;
       const m = normMouse(e);
       if (!m) return;
-      // 侧键在快捷键里时拦掉默认的后退/前进导航
-      if (shortcutAlternatives().some((a) => a.includes(m))) e.preventDefault();
+      // 侧键在快捷键里时拦掉默认的后退/前进导航（配 'mouse-side' 时两枚都拦，
+      // 只配某一枚时另一枚放行——原生前进/后退照常）
+      if (shortcutAlternatives().some((a) => a.some((k) => keyMatches(k, m)))) e.preventDefault();
       if (armedSolo && m !== armedSolo.key) cancelSolo();
       heldMouse.add(m);
       shortcutFire('press', m);
@@ -582,51 +613,131 @@
     });
   }
 
+  /** 后端合成一段音频（带重试）：网络错 / HTTP 非 2xx / 空音频都算失败，按
+   * 1s→5s→15s 退避重试最多 3 次。微软免密钥通道对新域名限流（429）、后备
+   * 旧域名 403 多为短窗抖动，退避重试大概率能过。空体也算失败——旧版后端
+   * 两代通道全挂时不写错误码、回 200 空体，拿到 0 字节 blob 去播只会炸链
+   * （前端必须自防：组件热更先于后端发版到达用户机器）。 */
+  function ttsFetchChunk(text, signal) {
+    const delays = [1000, 5000, 15000];
+    const attempt = (n) => ttsFetchBlob(text, signal).then((b) => {
+      if (b && b.size > 0) return b;
+      throw new Error('合成了空音频');
+    }).catch((e) => {
+      if (signal.aborted || n >= delays.length) throw e; // 已停 / 重试耗尽
+      return new Promise((r) => setTimeout(r, delays[n])).then(() => attempt(n + 1));
+    });
+    return attempt(0);
+  }
+
   /** 后端合成并播放一段文本（分段流式）：返回 Promise，全部播完/出错/被停时落定
-   * （单飞：先停上一条）。播放队列预取窗口 3 块：块 i 在播时，i+1/i+2 已在合成。 */
+   * （单飞：先停上一条）。播放队列预取窗口 3 块：块 i 在播时，i+1/i+2 已在合成。
+   * 块级容错：单块合成失败（重试耗尽）跳过继续播后面的，链尾一次性轻提示；
+   * 连续 2 块都失败说明服务在长故障窗里，停链并明确报错。块间衔接不单赌
+   * onended——看门狗按音频时长 + 余量兜底推进（长寿命 audio 换 src 在
+   * WebView2/Chromium 上偶发不派发 ended，链会静默卡死）。 */
   function ttsPlay(text) {
     stopAudio();
     ttsAbort = new AbortController();
     const signal = ttsAbort.signal;
     const chunks = splitSpeechChunks(text);
     const blobs = chunks.map(() => null);
-    let idx = 0, stopped = false;
+    let idx = 0, stopped = false, skipped = 0, consecSkip = 0, curWD = null;
     const prefetch = () => {
       for (let i = idx; i < Math.min(idx + 3, chunks.length); i++) {
-        if (!blobs[i]) blobs[i] = ttsFetchBlob(chunks[i], signal);
+        if (!blobs[i]) {
+          const p = ttsFetchChunk(chunks[i], signal);
+          p.catch(() => {}); // 防「停止时未消费的预取 reject」变 unhandledrejection
+          blobs[i] = p;
+        }
       }
     };
     prefetch();
     return new Promise((resolve, reject) => {
       const playChunk = () => {
         if (stopped) return;
-        if (idx >= chunks.length) { stopAudio(); resolve(); return; }
+        if (idx >= chunks.length) {
+          stopAudio();
+          if (skipped > 0) voiceToast('有 ' + skipped + ' 小段合成失败，已跳过继续');
+          resolve();
+          return;
+        }
         const i = idx;
         blobs[i].then((blob) => {
           if (stopped || signal.aborted) return;
           playURL = URL.createObjectURL(blob);
           if (!playEl) playEl = new Audio(); // 长寿命元素：只建一次，后续块换 src 续播
-          playEl.src = playURL;
-          playEl.onended = () => {
-            URL.revokeObjectURL(playURL); playURL = null;
+          const el = playEl;
+          el.src = playURL;
+          let advanced = false, lastT = -1, wdResets = 0;
+          // 幂等推进：onended 与看门狗都走这里，只生效一次
+          const advance = () => {
+            if (advanced || stopped) return;
+            advanced = true;
+            clearTimeout(curWD);
+            if (playURL) { URL.revokeObjectURL(playURL); playURL = null; }
             idx += 1;
             prefetch();
             playChunk();
           };
-          // 收尾回调先验本链（与上一行 blobs[i].then 同款守卫）：旧链被停/被顶替后
+          el.onended = advance;
+          // 看门狗：按音频时长 + 2.5s 余量推进；触发时若明显没播完（时长偏短）
+          // 且 currentTime 还在走则续等防切尾，停滞或到尾才推进
+          const armWD = (sec) => {
+            clearTimeout(curWD);
+            curWD = setTimeout(() => {
+              if (advanced || stopped) return;
+              const d = el.duration, t = el.currentTime;
+              if (isFinite(d) && d > 0 && t < d - 0.3 && t > lastT && wdResets < 20) {
+                wdResets += 1; lastT = t; armWD(2.5);
+                return;
+              }
+              advance(); // ended 丢失 / 播放停滞：兜底续接下一块
+            }, Math.max(2, sec) * 1000 + 2500);
+          };
+          el.onloadedmetadata = () => {
+            if (advanced || stopped) return;
+            if (isFinite(el.duration) && el.duration > 0) armWD(el.duration);
+          };
+          armWD(chunks[i].length / 4 + 3); // metadata 未到先按字数估（中文约 4 字/秒）
+          // 收尾回调先验本链（与上方 blobs[i].then 同款守卫）：旧链被停/被顶替后
           // 其 play() 会因 stopAudio 的 pause() 以 AbortError 迟到 reject——此刻新链
-          // 往往已启动，无守卫的 stopAudio() 会误杀新链（abort 其预取、整条安静砍掉），
+          // 往往已启动，无守卫的收尾会误杀新链（abort 其预取、整条安静砍掉），
           // 表现为「点朗读键没声音」，桌面端鼠标连点停止→再点朗读（几百毫秒内）最易踩中。
           const gone = () => stopped || signal.aborted;
-          playEl.onerror = () => { if (gone()) return; stopAudio(); reject(new Error('播放失败')); };
-          playEl.play().catch((e) => { if (gone()) return; stopAudio(); reject(e); });
+          // 块播放失败（坏音频/解码错）：跳过该块续播，连续两段才停链。
+          // 注意 reject 必须先于 stopAudio——stopAudio 会经 ttsStopChain 先行
+          // resolve 本链，晚到的 reject 会被吞（旧版「朗读中断」提示从不出现，
+          // 用户只看到无声停住，正是本次报障的观感）。
+          const failChunk = (msg) => {
+            if (gone()) return;
+            skipped += 1;
+            consecSkip += 1;
+            if (consecSkip >= 2) {
+              reject(new Error(msg + '（连续 ' + consecSkip + ' 段失败，已停止朗读）'));
+              stopAudio();
+              return;
+            }
+            advance();
+          };
+          el.onerror = () => failChunk('播放失败');
+          el.play().then(() => { consecSkip = 0; }).catch((e) => { if (gone()) return; failChunk('播放失败：' + (e && e.message ? e.message : e)); });
         }).catch((e) => {
           if (signal.aborted || stopped) return;
-          stopAudio();
-          reject(i === 0 ? e : new Error('朗读中断：' + (e && e.message ? e.message : e)));
+          skipped += 1;
+          consecSkip += 1;
+          if (consecSkip >= 2) {
+            reject(new Error('朗读服务暂时不可用：' + (e && e.message ? e.message : e)
+              + '（连续 ' + consecSkip + ' 段失败，已停止朗读）'));
+            stopAudio();
+            return;
+          }
+          idx += 1; // 单块合成失败：跳过继续（链尾一次性提示）
+          prefetch();
+          playChunk();
         });
       };
-      ttsStopChain = () => { stopped = true; resolve(); }; // 被停/被顶替：安静落定（按钮由 stopSpeak 复位）
+      ttsStopChain = () => { stopped = true; clearTimeout(curWD); resolve(); }; // 被停/被顶替：安静落定（按钮由 stopSpeak 复位）
       playChunk();
     });
   }
@@ -1565,13 +1676,14 @@
     const modeSel = document.createElement('select');
     modeSel.className = 'sp-select';
     const m1 = document.createElement('option');
-    m1.value = 'tap'; m1.textContent = '点按切换（按一下开始，再按一下结束）';
+    m1.value = 'tap'; m1.textContent = '点按切换（默认：按一下开始，再按一下结束）';
     const m2 = document.createElement('option');
     m2.value = 'hold'; m2.textContent = '长按输入（按住说话，松开结束）';
     modeSel.append(m1, m2);
     modeSel.value = voiceShortcutMode();
     modeSel.onchange = () => {
       pref.set('shortcutMode', modeSel.value === 'hold' ? 'hold' : 'tap');
+      pref.set('shortcutModeSet', true); // 记下"用户显式选过"：默认归一不再动它
       firedLatch = false;
       refreshShortcutPlaceholders();
     };
@@ -1589,7 +1701,9 @@
       subWrap.appendChild(resetBtn);
       row('副快捷键', subWrap);
       note('主＝鼠标侧键（前后两枚都算）、副＝Alt 键，两个框各自点击即可**独立录制**'
-        + '自定义组合（键盘单键/组合键、鼠标左右键同按；不支持单独的左键或右键；'
+        + '自定义组合（键盘单键/组合键、鼠标左右键同按、单个鼠标侧键——录制时按下'
+        + '某一枚侧键即记为「鼠标侧键1」（后退位）或「鼠标侧键2」（前进位），'
+        + '只认那一枚，另一枚留给浏览器前进/后退；不支持单独的左键或右键；'
         + '框内 ✕ 停用该槽）。「恢复默认」＝主侧键、副 Alt。**注意：独立语音悬浮窗'
         + '只接管右 Alt 与右 Ctrl**——左 Alt、左 Ctrl 留给系统与其它程序（菜单栏、'
         + 'Alt+Tab、Ctrl+组合键都不受影响），所以想用键盘触发听写请按**右边那枚**。'
@@ -1730,6 +1844,11 @@
     init() {
       active = true;
 
+      // 先把触发方式归一到默认（点按切换）：必须在下面注册快捷键之前跑——主程序
+      // 在注册/HK 变更时把触发方式推进联动文件 voicetype.json，顺序反了就会先把
+      // 老的 hold 推给语音输入法。
+      migrateShortcutModeDefault();
+
       // 语音输入按钮（主对话与右栏子对话各一套）：按钮 DOM 在主程序 index.html 里
       //（位置与样式不变），默认带 .hidden——按钮属于本组件，由组件揭开并接管行为；
       // 组件关掉/没加载 = 按钮整组不出现。本地 ASR 落地后所有形态都揭开：浏览器
@@ -1828,7 +1947,7 @@
       };
       JX.registerCtxMenu(ctxMenuFn);
 
-      // 设置区以独立分区页呈现（设置 → 语音，位于「内置组件」之后）：
+      // 设置区以独立分区页呈现（设置 → 语音，位于「组件」之后）：
       // pane 字段交给 app-settings.js 动态挂导航项与页面容器，组件关掉即撤
       CX.registerSettings({
         id: 'voice',

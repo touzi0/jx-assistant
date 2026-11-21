@@ -4,8 +4,9 @@ package main
 
 // 立即重启的接力助手：主进程挂在 kill-on-close Job 里（processguard_windows.go），
 // 自己拉起自己会随 Job 陪葬。这里经 WMI 把一个一次性 cmd 接力命令托管到 Job 外
-// （WmiPrvSE 系统服务代为创建，与主进程的 Job 无任何从属关系）：等约 5 秒旧进程
-// 退出 → start 拉起新 exe → 追加 restart.log。不删 .old：留给新版启动自清（万一
+// （WmiPrvSE 系统服务代为创建，与主进程的 Job 无任何从属关系）：等约 8 秒旧进程
+// 退出 → start 拉起新 exe（连试 3 次、间隔约 8 秒，竞态兜底见 restartRelayCmd）
+// → 追加 restart.log。不删 .old：留给新版启动自清（万一
 // 新版起不来，.old 还在可手工救回）。
 //
 // 2026-10-15 实测教训（安装机 WMI→powershell 全链路排查，三层雷）：
@@ -74,10 +75,15 @@ func spawnRestartHelper(a *App, st updateBlockState) error {
 	return createBreakawayProcess(relayCmd)
 }
 
-// restartRelayCmd 拼一次性接力命令：ping 计时约 5 秒（等旧进程退出）→ start 拉起
-// 新版 → 全程留痕 restart.log。start 首个引号参数是窗口标题，必须给空串占位。
-// 路径全部绝对且带引号（含中文没问题，命令行全程 UTF-16）；日志行保持 ASCII，
-// 避免 cmd 代码页把中文写成乱码。
+// restartRelayCmd 拼一次性接力命令：ping 计时约 8 秒（等旧进程退出）→ start
+// 拉起新版，共试 3 次、间隔约 8 秒 → 全程留痕 restart.log。start 首个引号参数
+// 是窗口标题，必须给空串占位。路径全部绝对且带引号（含中文没问题，命令行
+// 全程 UTF-16）；日志行保持 ASCII，避免 cmd 代码页把中文写成乱码。
+//
+// 多次拉起的安全性：单实例互斥体（desktop_windows.go）会把撞上已运行实例
+// 的新进程收敛为「唤起旧窗口后退出」，不产生第二份窗口/服务——所以无条件
+// 重试没有副作用。2026-11-20 生产事故：接力只拉一次，旧进程退得慢的机器上
+// 新实例被互斥体顶掉之后再无人拉起，用户看到「重启起不来」且桌面无入口。
 func restartRelayCmd(exePath string, args []string, logPath string) string {
 	quoted := make([]string, len(args))
 	for i, a := range args {
@@ -89,18 +95,24 @@ func restartRelayCmd(exePath string, args []string, logPath string) string {
 	}
 	argLine := strings.Join(quoted, " ")
 	dir := filepath.Dir(exePath)
-	wait := `ping -n 6 127.0.0.1 >nul`
+	wait := `ping -n 9 127.0.0.1 >nul`
 	mark := `echo [%date% %time%] relay: launching ` + exePath + ` >>"` + logPath + `" 2>&1`
 	start := `start "" /d "` + dir + `" "` + exePath + `"`
 	if argLine != "" {
 		start += " " + argLine
 	}
-	start += ` >>"` + logPath + `" 2>&1`
 	cmdExe := os.Getenv("SystemRoot") + `\System32\cmd.exe`
 	if os.Getenv("SystemRoot") == "" {
 		cmdExe = "cmd.exe"
 	}
-	return cmdExe + ` /c ` + wait + ` & ` + mark + ` & ` + start
+	parts := []string{cmdExe + ` /c ` + wait, mark}
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			parts = append(parts, wait)
+		}
+		parts = append(parts, start)
+	}
+	return strings.Join(parts, ` & `)
 }
 
 // createBreakawayProcess 以 CREATE_BREAKAWAY_FROM_JOB 启动（Job 已配

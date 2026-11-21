@@ -61,38 +61,39 @@
     </div>
     <div id="session-list"></div>
 
-    <!-- 底部框架：设置行独占最后一行；其上是按钮格 .foot-grid——桌面
-         display:contents 完全透明（按钮就是 sidebar-foot 的普通行，观感与
-         从前一致），手机端切成三栏网格。分区挂载点：组件入口一律 append 进
-         #foot-apps（回收站上方——内置格 .foot-grid 之前），不锚定任何兄弟
-         按钮；手机端两个格容器同吃 sidebar-foot 的三栏网格（见 style.css），
-         设置行恒在最底独占整行。 -->
+    <!-- 底部框架＝界面插槽 sidebar.foot（实现见 app-core.js 的 JX.slot，两套形态
+         见 style.css 的插槽段）：条目一律经
+         JX.slot('sidebar.foot').add({key,label,icon,order,title,onClick}) 注册——
+         内置「回收站」是第一位使用者（order 1，在 app-left.js 注册），组件从 2
+         起往上叠；序号小的排下面（紧贴设置行），大的往上。
+         电脑＝竖排整行；手机＝三列均分网格（3 个一行，4~6 个自动两行、格高固定、
+         标签最多两行超出裁掉）——形态与尺寸全归插槽，条目自己不写布局。
+         #foot-apps 是插槽容器（display:contents，本身不参与排版）；设置行不是
+         格子，恒在最底独占整行（手机端 grid-column:1/-1）。 -->
     <div class="sidebar-foot">
-      <!-- 组件入口格（skill-market / sites-platform 等由组件 append 注入） -->
       <div class="foot-grid" id="foot-apps"></div>
-      <!-- 内置格：回收站 -->
-      <div class="foot-grid">
-      <button id="btn-recycle" class="foot-btn" title="回收站">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
-        回收站
-      </button>
-      </div>
-      <!-- 连接状态胶囊/反馈胶囊/手机图标都嵌在设置行右侧（同一行的中间对齐，
-           行内右对齐的锚点是 .foot-feedback 的 margin-left:auto） -->
+      <!-- 连接状态胶囊/反馈（或账号）胶囊/手机胶囊都嵌在设置行右侧（同一行的中间
+           对齐，行内右对齐的锚点是 .foot-feedback 的 margin-left:auto——组件注入
+           账号胶囊时锚点由它的挂载点接过去，见 style.css） -->
       <button id="btn-settings" class="foot-btn">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h0a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55h0a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v0a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/></svg>
-        设置
+        <span class="foot-btn-label">设置</span>
         <!-- 反馈胶囊：紧挨手机图标左侧，点击直达设置面板的「问题反馈」页
              （不冒泡到外层设置按钮，见 app-left.js；用 role=button 避免按钮套按钮） -->
         <!-- 更新胶囊：反馈胶囊左侧，仅在有更新时出现——新版本可用（available）
              或已静默换装待重启（pendingRestart），与置顶更新横幅同源同机制（app-chat.js
              syncUpdatePill）。点击唤起更新横幅（完整动作在横幅里：立即重启/稍后/确认更新）。 -->
         <span id="btn-update" class="foot-update hidden" role="button" tabindex="0" title="软件更新">更新</span>
+        <!-- 账号胶囊挂载点：组件/portal 启用时由组件往这里注入「账号」胶囊（点击打开
+             个人中心浮窗 #portal-modal），同时隐藏右边的反馈胶囊——两者占同一个
+             右对齐位置，组件关掉后按钮撤走、反馈胶囊恢复原样。空容器不占位
+             （style.css 的 .pf-card-slot:empty）。 -->
+        <span class="pf-card-slot" data-cx-slot="account-pill"></span>
         <span id="btn-feedback" class="foot-feedback" role="button" tabindex="0" title="问题反馈：直达设置 · 问题反馈">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 8.7 8.7 0 0 1-3.9-.92L3 21l1.95-5.29A8.5 8.5 0 1 1 21 11.5z"/><path d="M12 8.5v3M12 14.5h.01"/></svg>
           反馈
         </span>
-        <span id="status-phone" class="foot-phone hidden" title="手机远程访问：点击查看扫码入口"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg></span>
+        <span id="status-phone" class="foot-phone hidden" title="手机远程访问：点击查看扫码入口"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg><span class="foot-phone-label">手机</span></span>
         <span id="status-text" class="pill gray">连接中…</span>
       </button>
     </div>
@@ -115,10 +116,10 @@
       </button>
     </header>
 
-    <!-- 市场视图、小程序平台视图均已组件化（组件/skill-market/ 与
+    <!-- 市场视图、企业小程序视图均已组件化（组件/skill-market/ 与
          组件/sites-platform/，视图 DOM 由组件注入 #main）。 -->
     <div id="progress-panel" class="hidden"></div>
-    <div id="messages"><div class="msg-col" id="msg-col"></div></div>
+    <div id="messages"><div id="load-older" class="load-older hidden"></div><div class="msg-col" id="msg-col"></div></div>
 
     <div id="composer-wrap" class="composer-wrap">
       <div id="hint" class="composer-hint"></div>
@@ -239,7 +240,7 @@
           <span class="sub-dd-status" id="sub-dd-status"></span>
         </div>
         <div class="sub-chat">
-          <div id="sub-messages"><div class="msg-col" id="sub-msg-col"></div></div>
+          <div id="sub-messages"><div id="sub-load-older" class="load-older hidden"></div><div class="msg-col" id="sub-msg-col"></div></div>
           <div class="sub-composer-wrap composer-wrap">
             <div id="sub-hint" class="composer-hint"></div>
             <div id="sub-queue-dock" class="queue-dock hidden" data-queue-dock></div>
@@ -335,24 +336,35 @@
             <input id="plan-feedback" type="text" placeholder="反馈修改意见（可留空）">
             <button id="plan-reject" class="ghost">修改</button>
           </div>
-          <div class="ap-actions"><button id="plan-ignore" class="ghost" title="搁置这份计划：本轮对话到此结束（等同点「停止」），计划仍留着，随时可以再批准或修改">忽略计划</button><button id="plan-approve" class="ok">批准并开始执行</button></div>
+          <div class="ap-actions"><button id="plan-cancel" class="ghost" title="取消这份计划：本轮对话到此结束（等同点「停止」），计划仍留着，随时可以再批准或修改">取消计划</button><button id="plan-approve" class="ok">批准并开始执行</button></div>
         </div>
       </div>
       <!-- 文件视图（文件工具）：点对话里「文件改动」面板的文件行在此打开——
            整文件展开的 diff 视图，本次删除的行红色、新增的行绿色、未变行正常，
            行号两列（旧/新）。数据复用 /file-version 接口（本批最早快照的改动前
            内容 vs 文件当前内容），渲染与页签注册见 app-chat.js「文件工具」一节；
-           样式 style.css 的 fvw-*/fdiff-* 前缀（视觉口径对齐 ZCode 轻量 diff）。 -->
+           样式 style.css 的 fvw-*/fdiff-* 前缀（视觉口径对齐 ZCode 轻量 diff）。
+           顶栏「编辑」进入编辑模式：编辑区放的是文件**最新全文**（GET/POST
+           /api/sessions/{id}/file，见 fileedit.go），底部「保存 / 取消」。 -->
       <div class="rp-view" id="rp-view-file">
         <div class="fvw-bar">
           <span class="fvw-path" id="fvw-path" title=""></span>
           <span class="fvw-stat" id="fvw-stat"></span>
           <button id="fvw-wrap" class="fvw-ico" type="button" title="当前：长行横向滚动（点击改为折行显示）">折行</button>
-          <button id="fvw-sysopen" class="fvw-ico" type="button" title="用系统默认应用打开这个文件">打开方式</button>
+          <button id="fvw-edit" class="fvw-ico" type="button" disabled title="编辑这个文件（显示最新完整内容；保存前自动留旧版本，可随时回退）">编辑</button>
+          <button id="fvw-sysopen" class="fvw-ico" type="button" title="用系统默认应用打开这个文件（在外部程序里改也行，回来点 ⟳ 重新读取）">打开</button>
           <button id="fvw-reload" class="fvw-ico" type="button" title="重新读取（文件与快照）">⟳</button>
         </div>
         <div class="fvw-note hidden" id="fvw-note"></div>
         <div class="fvw-body" id="fvw-body"></div>
+        <div class="fvw-edit-wrap hidden" id="fvw-edit-wrap">
+          <textarea id="fvw-editor" class="fvw-editor" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+        </div>
+        <div class="fvw-edit-bar hidden" id="fvw-edit-bar">
+          <span class="fvw-edit-hint" id="fvw-edit-hint"></span>
+          <button id="fvw-save" class="fvw-btn primary" type="button">保存</button>
+          <button id="fvw-cancel" class="fvw-btn" type="button">取消</button>
+        </div>
       </div>
             <div class="rp-view" id="rp-view-browser">
         <div class="bpw-bar">
@@ -404,20 +416,26 @@
      公司默认模型）、技能/组件市场、软件更新。机制照 confirm-modal（hidden 切换/点遮罩
      关闭/Enter 提交）；首次启动自动弹出，设置·网络访问可随时重开 -->
 <div id="welcome-modal" class="modal hidden">
-  <div class="modal-card welcome-card">
-    <h2 id="wz-title">欢迎使用坚祥数字助理</h2>
-    <p class="wz-sub">接入公司服务端后即可开箱使用（模型、技能市场、软件更新全自动配置）。</p>
-    <div class="wz-form">
-      <label class="strong">姓名<input id="wz-user" placeholder="如 张三（服务端按人分配 API key 并统计用量）" autocomplete="off"></label>
-      <div class="wz-either"><b>公司名称与服务器地址，两项填其中一项即可</b></div>
-      <label>公司名称<input id="wz-company" placeholder="局域网内自动发现（配对口令）" autocomplete="off"></label>
-      <label>服务器地址<input id="wz-server" placeholder="如 example.com:2227（与上项二选一，自动按 https）" autocomplete="off" spellcheck="false"></label>
-    </div>
-    <div id="wz-result" class="remote-result hidden"></div>
-    <div class="modal-actions">
-      <button id="wz-skip">跳过，手动配置</button>
-      <span class="spacer"></span>
-      <button id="wz-go" class="accent">连 接</button>
+  <!-- 防误触带与弹窗同壳一体（零缝隙、同高拼接）：拖选公司名/人名惯性左滑出输入区
+       时点它不关窗（target 不是遮罩）；app-wizard.js 另有「按下起点在遮罩上」判定
+       兜底——滑过任何缝隙/落到任意遮罩处松开也不关 -->
+  <div class="wz-shell">
+    <div class="wz-guard" aria-hidden="true"><span>防误触区</span></div>
+    <div class="modal-card welcome-card">
+      <h2 id="wz-title">欢迎使用坚祥数字助理</h2>
+      <p class="wz-sub">接入公司服务端后即可开箱使用（模型、技能市场、软件更新全自动配置）。</p>
+      <div class="wz-form">
+        <label class="strong">姓名<input id="wz-user" placeholder="如 张三（服务端按人分配 API key 并统计用量）" autocomplete="off"></label>
+        <div class="wz-either"><b>公司名称与服务器地址，两项填其中一项即可</b></div>
+        <label>公司名称<input id="wz-company" placeholder="局域网内自动发现（配对口令）" autocomplete="off"></label>
+        <label>服务器地址<input id="wz-server" placeholder="如 jxaizz.com:2227（与上项二选一，自动按 https）" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div id="wz-result" class="remote-result hidden"></div>
+      <div class="modal-actions">
+        <button id="wz-skip">跳过，手动配置</button>
+        <span class="spacer"></span>
+        <button id="wz-go" class="accent">连 接</button>
+      </div>
     </div>
   </div>
 </div>
@@ -457,7 +475,7 @@
         </button>
         <button class="set-nav-item" data-pane="components">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-          内置组件
+          组件
         </button>
         <button class="set-nav-item" data-pane="skills">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l2.4 5.9L20 10l-4.4 4.4L16.8 21 12 18l-4.8 3 1.2-6.6L4 10l5.6-2.1z"/></svg>
@@ -651,9 +669,9 @@
               <p class="sf-desc">中继网关的域名或 IP 与端口，不带 http:// 前缀；给别人分发本软件时，这里应改成对方自己部署的网关。</p>
             </div>
           </div>
-          <!-- 企业技能包/工作流 与 小程序平台 的网络配置挂载点：由组件注入内容
+          <!-- 企业技能包/工作流 与 企业小程序 的网络配置挂载点：由组件注入内容
                （组件/skill-market/、组件/sites-platform/），组件不在场（关闭/摘除）时
-               容器保持空置隐藏——开关归「内置组件」页，参数归本页。 -->
+               容器保持空置隐藏——开关归「组件」页，参数归本页。 -->
           <div class="gen-section hidden" id="net-market-cfg"></div>
           <div class="gen-section hidden" id="net-sites-cfg"></div>
           <div class="gen-section">
@@ -783,13 +801,20 @@
           </div>
         </div>
         <div class="set-pane" id="set-pane-components">
-          <h3>内置组件</h3>
+          <h3>组件</h3>
           <div class="prov-section">
-            <div class="tip-inline" style="margin:0 0 10px">来自 组件/ 的原生外围扩展；开关即时生效，无需刷新</div>
-            <div id="component-list"></div>
-            <!-- 组件自己的设置区（组件经 CX.registerSettings 交出，关掉组件即消失） -->
-            <div id="component-sections"></div>
+            <div class="tip-inline" style="margin:0 0 10px">组件 = 本栈原生的外围扩展（前后端自包含，走同一个组件桥）。开关即时热生效，无需刷新页面，也无需重启服务。</div>
           </div>
+          <div class="gen-section">
+            <h4>内置组件 <span class="sec-sub">随包分发，不可删除；可开关，随程序更新升级</span></h4>
+            <div id="component-builtin-list"></div>
+          </div>
+          <div class="gen-section">
+            <h4>用户组件 <span class="sec-sub">可开关、可删除；市场/发行渠道单个安装</span></h4>
+            <div id="component-user-list"></div>
+          </div>
+          <!-- 组件自己的设置区（组件经 CX.registerSettings 交出，关掉组件即消失） -->
+          <div id="component-sections"></div>
         </div>
         <div class="set-pane" id="set-pane-skills">
           <h3>技能</h3>
@@ -848,9 +873,15 @@
         </div>
         <div class="set-pane" id="set-pane-about">
           <h3>关于</h3>
+          <!-- 关于页固定显示软件自身的基础信息（2026-11-19 用户口径）：名称与 LOGO
+               都不随服务端品牌变化——名称写死软件正式名「坚祥数字助理」（exe/安装
+               包打包名「AI数字助理」是另一回事，互不跟随），LOGO 走
+               /logo-default.png（只出内置默认图，不吃 data/brand/ 品牌缓存）；
+               app-core.js 的 applyBrandTexts() 也不覆盖这里的 <b>。
+               主页面/左上角/窗口标题仍走品牌下发，两不相干。 -->
           <div class="about-block">
             <div class="hero" style="justify-content:flex-start">
-              <img class="logo-img" src="/logo.png" alt="坚祥数字助理">
+              <img class="logo-img" src="/logo-default.png" alt="坚祥数字助理">
               <div>
                 <b>坚祥数字助理</b>
                 <div class="tip-inline" id="about-version" style="margin:0">版本 0.1.0</div>
@@ -872,17 +903,35 @@
               </select>
             </div>
           </div>
-          <div class="gen-section">
-            <h4>远程外壳 <span class="sec-sub">远程端（手机）经中继加载的单文件页面</span></h4>
-            <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-              <span class="tip-inline" id="about-shell-ver">外壳版本读取中…</span>
-              <button id="btn-shell-bump" type="button" class="fb-img-btn" style="margin-top:0">一键清除远程端缓存</button>
-              <span class="sf-desc" id="about-shell-done" style="display:none"></span>
+          <!-- 联系我们（2026-11-16）：占位原来是「远程外壳」（远程端经中继加载的
+               单文件页）——那套远程端已不再使用，按用户口径整块撤掉，换成联系入口。
+               二维码图片在 web/wechat-qr.png（随 exe 内嵌，离线也能显示）。
+               排版（2026-11-18 用户口径）：三行文字一段、靠左；二维码单独一行放
+               文字下面（不跟文字并排）。 -->
+          <div class="gen-section" id="contact-section">
+            <h4>联系我们 <span class="sec-sub">邮箱与微信</span></h4>
+            <div class="contact-card">
+              <div class="contact-lines">
+                <div class="contact-line">
+                  <span class="contact-k">邮箱</span>
+                  <a href="mailto:tonghao.work@foxmail.com">tonghao.work@foxmail.com</a>
+                </div>
+                <div class="contact-line">
+                  <span class="contact-k">微信</span>
+                  <span>扫下方二维码添加</span>
+                </div>
+                <div class="contact-line">
+                  <span class="contact-k">备注</span>
+                  <span>加微信请备注：来自数字助理</span>
+                </div>
+              </div>
+              <div class="contact-qr" title="微信二维码">
+                <img src="/wechat-qr.png" alt="微信二维码" width="180" height="180">
+              </div>
             </div>
-            <p class="tip" style="margin:8px 0 0">远程端每次打开本就拉最新外壳；此按钮把版本号 +1，让仍停留在旧页面或旧缓存里的远程端（含还停在旧版配对页上的手机）在下次加载时自动清缓存并整页重载。</p>
           </div>
           <div class="gen-section" id="feedback-section">
-            <h4>问题反馈 <span class="sec-sub">反馈存到服务端供排查改进</span></h4>
+            <h4>问题反馈 <span class="sec-sub">本机必存；连了公司服务端还会同步一份供排查改进</span></h4>
             <div class="set-field">
               <div class="fb-kinds">
                 <button type="button" class="fb-kind cur" data-kind="bug">问题</button>
@@ -904,10 +953,74 @@
     </div>
     <!-- 通用底栏：横跨整个设置卡（导航与分区之下），一级/二级、手机/桌面都在 -->
     <div class="set-footer">
-      <p class="tip" style="margin:0">「对话历史与压缩」「模型」的改动点底部「保存」一并生效（模型卡片内的保存只提交该家提供方）；「子对话专家」在各卡片内单独保存；常规页即时生效</p>
+      <p class="tip" style="margin:0">「对话历史与压缩」「模型」「AI 记忆与拟人化」等组件独立设置页的改动点底部「保存」一并生效（模型卡片内的保存只提交该家提供方）；「子对话专家」在各卡片内单独保存；常规页即时生效</p>
       <div class="modal-actions">
         <button id="set-cancel">取消</button>
         <button id="set-save" class="accent">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 本对话的组件与插件（会话级覆盖浮窗）：加号菜单进入，结构与样式复用设置卡
+     （settings-card 双栏 + 手机两级），但导航只有 组件/插件 两页，组件注册的
+     独立设置页（如语音）排在它们之后。开关走会话级覆盖（POST 带 session），
+     优先于全局开关；全局开关在 设置 里。逻辑见 web/app-cxsession.js -->
+<div id="cxsession" class="modal hidden">
+  <div class="modal-card settings-card" id="cxsession-card">
+    <!-- 手机二级页的返回头（桌面与一级列表隐藏；标题随所选分区更新） -->
+    <div class="set-back">
+      <button type="button" id="cxs-back" title="返回列表">←</button>
+      <b id="cxs-back-title"></b>
+    </div>
+    <div class="settings-body">
+      <nav class="set-nav" id="cxs-nav">
+        <button class="set-nav-item active" data-pane="cxs-components">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          组件
+        </button>
+        <button class="set-nav-item" data-pane="cxs-plugins">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 16v-4M12 8h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg>
+          插件
+        </button>
+        <!-- 组件注册的独立设置页（如语音）动态插在这里（排在组件/插件之下） -->
+      </nav>
+      <div class="set-panes" id="cxs-panes">
+        <div class="set-pane active" id="cxs-pane-cxs-components">
+          <h3>本对话的组件</h3>
+          <div class="prov-section">
+            <div class="tip-inline" style="margin:0 0 10px">每行两个开关：<b>上</b>＝本对话启用/停用该组件（即时热生效）；<b>下</b>＝该组件的设置「会话独立 / 跟随全局」（独立时的改动只影响本对话，切回跟随会删掉本对话那份记录）。全局开关与全局设置在 设置 → 组件，不受这里影响。</div>
+            <div id="cxs-component-list"></div>
+            <!-- 组件自己的设置区（组件经 CX.registerSettings 交出，非独立页形态） -->
+            <div id="cxs-component-sections"></div>
+          </div>
+        </div>
+        <div class="set-pane" id="cxs-pane-cxs-plugins">
+          <h3>本对话的插件</h3>
+          <div class="prov-section">
+            <div class="tip-inline" style="margin:0 0 10px">只影响<b>本对话</b>的插件生效集（斜杠命令等随之变化）；安装/卸载与全局开关在 设置 → 插件。</div>
+          </div>
+          <div id="cxs-plugin-list"></div>
+          <div id="cxs-plugin-sections"></div>
+        </div>
+        <!-- 组件注册的独立设置页容器（动态创建） -->
+      </div>
+    </div>
+    <div class="set-footer">
+      <div class="cxs-scope-row">
+        <div class="cxs-scope-txt">
+          <b>本对话使用独立的组件设置</b>
+          <span class="tip" id="cxs-scope-tip">跟随全局：每行的启停与设置都按 设置 → 组件 里的全局值</span>
+        </div>
+        <label class="pr-toggle" title="一键切全场：关＝每行的配置与启停都完全回归全局（会清空本对话的组件配置覆盖）">
+          <input type="checkbox" id="cxs-cfg-scope">
+          <span></span>
+        </label>
+      </div>
+      <p class="tip" style="margin:2px 0 0">开关与「会话独立」即点即生效（只影响本对话）；组件设置区的改动在下方「保存」统一生效、取消即丢弃。切到别的对话时按那个对话自己的生效集与设置装配</p>
+      <div class="modal-actions">
+        <button id="cxs-cancel">取 消</button>
+        <button id="cxs-save" class="accent">保 存</button>
       </div>
     </div>
   </div>
@@ -926,6 +1039,10 @@
   <button class="pop-item" id="pm-goal">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/></svg>
     目标模式<span class="pop-check" id="pm-goal-check"></span>
+  </button>
+  <button class="pop-item" id="pm-cxsession" title="只影响本对话的组件/插件生效集（会话级覆盖，全局开关不动）；全局开关在 设置 → 组件 / 插件">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><path d="M14 6.5h7M14 10h4"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><path d="M6.5 14v7M3 17.5h7"/><path d="M14 14l3 3 4-4"/></svg>
+    本对话的组件与插件<span class="pop-check" id="pm-cxsession-check"></span>
   </button>
   <button class="pop-item" id="pm-export">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>
@@ -1139,6 +1256,7 @@
 <!-- 加载顺序即依赖顺序：core（全局状态/视图抽象/工具）→ hotkeys（快捷键统一登记）→ left → right → chat → ctxmenu（桌面壳右键菜单）→ settings → app（启动入口）。跨文件只有全局名引用，顺序不可调换 -->
 <script src="/qrcode.lib.js"></script>
 <script src="/qr.js"></script>
+<script src="/marked.lib.js"></script>
 <script src="/app-core.js"></script>
 <script src="/app-hotkeys.js"></script>
 <script src="/app-left.js"></script>
@@ -1148,6 +1266,7 @@
 <script src="/app-ccplugins.js"></script>
 <script src="/app-mcp.js"></script>
 <script src="/app-settings.js"></script>
+<script src="/app-cxsession.js"></script>
 <script src="/app-wizard.js"></script>
 <script src="/app.js"></script>
 <script src="/cx.js"></script>

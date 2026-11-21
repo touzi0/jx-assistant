@@ -61,6 +61,7 @@ const (
 	swpNoActivate = 0x0010
 	swHide        = 0
 	swShow        = 5
+	hwndBottom    = 1 // SetWindowPos 的 hWndInsertAfter=HWND_BOTTOM（压到兄弟窗口最底）
 )
 
 var (
@@ -120,14 +121,6 @@ type ctlRawVtbl struct {
 	getParentWindow, putParentWindow                      edge.ComProc
 	notifyParentWindowPositionChanged, close              edge.ComProc
 	getCoreWebView2                                       edge.ComProc
-}
-
-// nwrArgsVtbl 镜像 ICoreWebView2NewWindowRequestedEventArgs（未随绑定库导出）。
-type nwrArgsVtbl struct {
-	queryInterface, addRef, release edge.ComProc
-	getUri, getNewWindow            edge.ComProc
-	putHandled, getHandled          edge.ComProc
-	getDeferral, getWindowFeatures  edge.ComProc
 }
 
 // panelRect 即 COREWEBVIEW2_PHYSICAL_BOUNDS（tagRECT 布局）。
@@ -301,12 +294,10 @@ type browserPanel struct {
 	navCh                      chan struct{} // 最近一次导航的完成信号（NavigationCompleted 关闭）
 
 	// 事件 token：关闭时反注册（remove_XXX）要用；注册时由 WebView2 写入。
-	newWinToken   int64
-	titleToken    int64
+	titleToken int64
 	closing       bool          // 关闭已发起：迟到事件一律跳过，不碰将亡控件
 	closingDone   chan struct{} // 本实例正在进行的那次关闭（等进程退出+拆窗口）的完成信号；nil=没有在关（见 closePanel）
 	dragHold      int32         // 1 = 用户正在拖动/缩放主窗口：暂停面板落位（见 holdForWindowDrag）
-	newWinHandler *evtHandler   // 引用保活：COM 侧只存裸指针，Go 侧必须持有
 	titleHandler  *evtHandler
 }
 
@@ -479,18 +470,26 @@ func (p *browserPanel) createOnUI() error {
 	if wv == nil {
 		return fmt.Errorf("CoreWebView2 不可用")
 	}
-	var nwt, tt int64
-	nwh := newEvtHandler(func(sender, args unsafe.Pointer) { p.onNewWindow(args) })
-	_, _, _ = wvVtblOf(wv).addNewWindowRequested.Call(
-		uintptr(unsafe.Pointer(wv)), uintptr(unsafe.Pointer(nwh)), uintptr(unsafe.Pointer(&nwt)))
+	// 新窗口语义（target=_blank / window.open / 中键）由文档创建脚本原地收敛
+	// （blankInterceptorJS），不再挂原生 NewWindowRequested 处理器——其 args
+	// vtbl 槽位与新版运行时错位，调用即写访问冲突整进程闪退（2026-11-18 实测
+	// 复现，put_Handled 槽5 中招）。脚本注入走主接口 vtbl（navigate 与
+	// CallDevToolsProtocolMethod 之间的槽位经日常工具链路实证无错位）。
+	// 注入完成回调只来一次：直接挂保活表防 GC 踩裸指针（同 retire 常规）。
+	var tt, swt int64
+	swh := newEvtHandler(func(sender, args unsafe.Pointer) {})
+	s16, _ := windows.UTF16PtrFromString(blankInterceptorJS)
+	_, _, _ = wvVtblOf(wv).addScriptToExecuteOnDocumentCreated.Call(
+		uintptr(unsafe.Pointer(wv)), uintptr(unsafe.Pointer(s16)), uintptr(unsafe.Pointer(swh)), uintptr(unsafe.Pointer(&swt)))
+	retireEvtHandler(swh)
 	th := newEvtHandler(func(sender, args unsafe.Pointer) { p.onTitleChanged() })
 	_, _, _ = wvVtblOf(wv).addDocumentTitleChanged.Call(
 		uintptr(unsafe.Pointer(wv)), uintptr(unsafe.Pointer(th)), uintptr(unsafe.Pointer(&tt)))
 	p.stateMu.Lock()
 	p.chrome, p.ctl, p.wv, p.hwnd = ch, ctl, wv, hwnd
 	p.closing = false
-	p.newWinHandler, p.titleHandler = nwh, th
-	p.newWinToken, p.titleToken = nwt, tt
+	p.titleHandler = th
+	p.titleToken = tt
 	p.stateMu.Unlock()
 	p.applyRectOnUI()
 	return nil
@@ -507,6 +506,10 @@ func (p *browserPanel) createOnUI() error {
 // 都要显式 HWND_TOP 重申；主窗口激活/Z 序变化时另有 reassertPanelTop 去抖
 // 兜底（见 desktop_windows.go 的 mainWndSubclassProc）。实测：面板被压到主
 // WebView2 之下时导航/标题/CDP 全部正常，画面永远看不见。
+// 例外：HTML 浮层让位态（App.panelOverlayYield，设置等全屏 .modal 打开期间）
+// 有意压到 HWND_BOTTOM——主 WebView2 铺满客户区且不透明，压底即整个被盖住，
+// 浮层得以完整显示在浏览器之上（见 YieldTop；HTML 无法浮于原生子窗口之上，
+// 这是唯一的让路方式）。
 func (p *browserPanel) applyRectOnUI() {
 	defer panelRecover("applyRectOnUI") // 整段都是 COM 调用，落在 UI 线程原生栈上：panic 冒出去就是整进程死
 	if atomic.LoadInt32(&p.dragHold) != 0 {
@@ -535,14 +538,19 @@ func (p *browserPanel) applyRectOnUI() {
 	if !visible {
 		x, y = -32001, -32001 // 屏外；控件保持 IsVisible=true 继续出帧
 	}
+	// 让位态（HTML 浮层开着）落位也压底：浮层期间窗口 resize 等触发的重落位
+	// 不得把面板提回顶。
+	ins := uintptr(0) // HWND_TOP：每次落位都把面板提回兄弟窗口顶（见上方 Z 序注释）
+	if p.app != nil && atomic.LoadInt32(&p.app.panelOverlayYield) != 0 {
+		ins = hwndBottom
+	}
 	// 强制一次真实位移（x+1 → x）：SetWindowPos 对相同坐标会被系统优化掉，
 	// 合成器偶发停帧（画面纯白、标题正常）后，没有真实的窗口位置事件就唤
 	// 不回来——实测同矩形重发不重绘，挪 1px 立即恢复。两步都在同一条 UI
-	// 消息里完成，中间不会发生绘制，肉眼不可见。insertAfter=0（HWND_TOP）：
-	// 每次落位都把面板提回兄弟窗口顶（见上方 Z 序注释）。
-	_, _, _ = procPanelSetWindowPos.Call(hwnd, 0, uintptr(x+1), uintptr(y), uintptr(w), uintptr(h),
+	// 消息里完成，中间不会发生绘制，肉眼不可见。
+	_, _, _ = procPanelSetWindowPos.Call(hwnd, ins, uintptr(x+1), uintptr(y), uintptr(w), uintptr(h),
 		swpNoActivate)
-	_, _, _ = procPanelSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+	_, _, _ = procPanelSetWindowPos.Call(hwnd, ins, uintptr(x), uintptr(y), uintptr(w), uintptr(h),
 		swpNoActivate)
 	if procPanelGetWindowRect.Find() == nil { // 临时诊断回读：SetWindowPos 之后窗口真实落在哪
 		var rr panelRect
@@ -566,6 +574,9 @@ func (p *browserPanel) applyRectOnUI() {
 var lastPanelReassertMs int64
 
 func (p *browserPanel) reassertTopOnUI() {
+	if p.app != nil && atomic.LoadInt32(&p.app.panelOverlayYield) != 0 {
+		return // HTML 浮层让位态：面板就该在主 WebView2 之下，激活/Z 序重申一概不做
+	}
 	now := time.Now().UnixMilli()
 	if now-atomic.LoadInt64(&lastPanelReassertMs) < 150 {
 		return
@@ -579,6 +590,42 @@ func (p *browserPanel) reassertTopOnUI() {
 	}
 	_, _, _ = procPanelSetWindowPos.Call(hwnd, 0, 0, 0, 0, 0,
 		swpNoSizeFlag|swpNoMoveFlag|swpNoActivate)
+}
+
+// YieldTop HTML 全屏浮层（设置等 .modal）的让位开关。桌面壳里 HTML 无法
+// 浮于原生子窗口之上（见文件头「布局同步」），全屏浮层要盖住浏览器只有把
+// 面板压到主 WebView2 之下——主 WebView2 铺满客户区且不透明，压底即整个被
+// 盖住，浮层（连同其遮罩）完整显示。前端 MutationObserver 监视 .modal 显隐
+// 上报 /api/browser/panel-overlay（browser_host.go 的 handleBrowserPanelOverlay
+// 置 App.panelOverlayYield 并遍历调这里）。让位标记在 App 级：浮层开着时才
+// 惰性创建的面板、或多会话切换到的面板，首次落位（applyRectOnUI）同样让位。
+func (p *browserPanel) YieldTop(yield bool) {
+	if p.dispatch == nil {
+		return
+	}
+	p.dispatch(func() { p.applyYieldOnUI(yield) })
+}
+
+// applyYieldOnUI 让位/恢复的 UI 线程动作（YieldTop 投递）。让位=纯 Z 序压底
+// （不碰矩形，规避拖动/落位的重入）；恢复走 applyRectOnUI 整链——提顶之外
+// 还有 +1px 强制位移，被盖住一阵的合成器帧面（万一停帧）靠它救回。
+func (p *browserPanel) applyYieldOnUI(yield bool) {
+	defer panelRecover("applyYieldOnUI")
+	if atomic.LoadInt32(&p.dragHold) != 0 {
+		return // 拖动中：标记已在 App 级，拖完 releaseAfterWindowDrag 的落位按它执行
+	}
+	p.stateMu.Lock()
+	hwnd, visible := p.hwnd, p.visible
+	p.stateMu.Unlock()
+	if hwnd == 0 || !visible {
+		return // 未创建/屏外面板：标记已在 App 级，下次落位生效
+	}
+	if yield {
+		_, _, _ = procPanelSetWindowPos.Call(hwnd, hwndBottom, 0, 0, 0, 0,
+			swpNoSizeFlag|swpNoMoveFlag|swpNoActivate)
+		return
+	}
+	p.applyRectOnUI()
 }
 
 // holdForWindowDrag / releaseAfterWindowDrag：用户拖动/缩放主窗口期间的面板让路。
@@ -784,27 +831,50 @@ func (p *browserPanel) onTitleChanged() {
 	p.app.broadcast(Event{Type: "browser_nav", URL: u, Title: t, SessionID: p.sid})
 }
 
-// onNewWindow 弹窗请求（target=_blank / window.open）：原地导航，不弹新窗。
-func (p *browserPanel) onNewWindow(args unsafe.Pointer) {
-	defer panelRecover("onNewWindow")
-	p.stateMu.Lock()
-	closing := p.closing
-	wv := p.wv
-	p.stateMu.Unlock()
-	if closing || wv == nil {
-		return
-	}
-	v := *(**nwrArgsVtbl)(args)
-	h := uintptr(args)
-	var uri *uint16
-	_, _, _ = v.getUri.Call(h, uintptr(unsafe.Pointer(&uri)))
-	u := readWVString(uri)
-	if u != "" && u != "about:blank" {
-		u16, _ := windows.UTF16PtrFromString(u)
-		_, _, _ = wvVtblOf(wv).navigate.Call(uintptr(unsafe.Pointer(wv)), uintptr(unsafe.Pointer(u16)))
-	}
-	_, _, _ = v.putHandled.Call(h, 1)
-}
+// blankInterceptorJS 文档创建时注入的新窗口语义收敛脚本：target=_blank 的
+// 链接点击（含 Ctrl/Shift 左键）、中键（auxclick）、_blank 表单与 window.open
+// 一律改为本面板原地导航——NewWindowRequested 不再触发。
+//
+// 为什么不用原生 NewWindowRequested 处理器：其 args vtbl 按 0.9.x 头文件序
+// 排布（get_Uri=槽3、put_Handled=槽5），新版运行时实际布局已变（get_Uri 碰
+// 巧仍在槽3，put_Handled 槽5 指向别处）——2026-11-18 实测点 target=_blank
+// 链接，put_Handled.Call 即 0xc0000005 写访问冲突，整进程无声闪退（recover
+// 兜不住硬件异常），详见《排查报告-20261118-右栏浏览器点超链接闪退》。逐槽
+// 重测的实证成本是整进程崩溃（与 desktop_navguard_windows.go 头注释同款结
+// 论），JS 拦截完全不碰 COM ABI，运行时升级免疫。漏网的浏览器内部路径走
+// WebView2 默认弹窗兜底（不崩，只是偶尔弹独立小窗）。
+const blankInterceptorJS = `(function(){
+  var toBlank = function(el){
+    if (!el || !el.closest) return null;
+    var a = el.closest('a[href]');
+    if (!a || a.hasAttribute('download')) return null;
+    var t = (a.target || '').toLowerCase();
+    if (t === '' || t === '_self' || t === '_parent' || t === '_top') return null;
+    return a;
+  };
+  document.addEventListener('click', function(e){
+    var a = toBlank(e.target);
+    if (a) { e.preventDefault(); location.href = a.href; }
+  }, true);
+  document.addEventListener('auxclick', function(e){
+    if (e.button !== 1) return;
+    var a = toBlank(e.target);
+    if (a) { e.preventDefault(); location.href = a.href; }
+  }, true);
+  document.addEventListener('submit', function(e){
+    var f = e.target;
+    if (!f || !f.tagName || f.tagName !== 'FORM') return;
+    var t = (f.target || '').toLowerCase();
+    if (t === '' || t === '_self' || t === '_parent' || t === '_top') return;
+    e.preventDefault();
+    var old = f.target; f.target = '_self';
+    if (f.requestSubmit) { f.requestSubmit(f.submitter || undefined); } else { f.submit(); }
+    f.target = old;
+  }, true);
+  try {
+    window.open = function(u){ if (u) location.href = String(u); return null; };
+  } catch (_) {}
+})();`
 
 // ---------- CDP 通道 ----------
 
@@ -829,7 +899,7 @@ func (p *browserPanel) callCDP(method string, params map[string]any) (json.RawMe
 	}
 	res := make(chan cdpResult, 1)
 	h := &cdpCompletedHandler{vtbl: &cdpCompletedVtblInst, ch: res}
-	// 引用保活（同 newWinHandler 的保活注释：COM 侧只存裸指针，Go 侧必须持有）：
+	// 引用保活（自制 COM 回调对象通例：COM 侧只存裸指针，Go 侧必须持有）：
 	// dispatch 闭包执行完即失引用，若 evaluate 跑数秒（重渲染+同步 XHR），期间
 	// GC 会把 h 当垃圾回收——原生完成回调踩已释放内存，整进程无声闪退、无堆栈
 	// 无事件（2026-10-14 19:56:44 与 20:04:27 两次实锤均落于此窗口期）。
@@ -1160,7 +1230,6 @@ func (p *browserPanel) closePanel(reason string) <-chan struct{} {
 		defer close(done)
 		defer func() { // 拆完就保活：原生侧还握着它的 handler 裸指针
 			retirePanelChromium(parts.chrome)
-			retireEvtHandler(parts.newWin)
 			retireEvtHandler(parts.title)
 		}()
 		defer func() {                          // 本次关闭收尾：清掉「关闭进行中」标记（等待重建的一方据此放行）
@@ -1198,8 +1267,8 @@ type panelParts struct {
 	ctl                 *edge.ICoreWebView2Controller
 	wv                  *edge.ICoreWebView2
 	chrome              *edge.Chromium // 绑定库实例：拆完后要保活（见 retirePanelChromium）
-	newWin, title       *evtHandler
-	newWinTok, titleTok int64
+	title    *evtHandler
+	titleTok int64
 	dispatch            func(f func())
 	live                bool // 取走前是否在运行：false=没开过/已在关，调用方据此幂等返回
 }
@@ -1276,8 +1345,8 @@ func (p *browserPanel) detach(done chan struct{}) panelParts {
 	defer p.stateMu.Unlock()
 	parts := panelParts{
 		hwnd: p.hwnd, ctl: p.ctl, wv: p.wv, chrome: p.chrome,
-		newWin: p.newWinHandler, title: p.titleHandler,
-		newWinTok: p.newWinToken, titleTok: p.titleToken,
+		title: p.titleHandler,
+		titleTok: p.titleToken,
 		dispatch: p.dispatch,
 		// 「有东西可取」就算在运行：不只看 started——创建链路超时返回后控件仍可能
 		// 稍晚落进字段（started 永远没置上），那种实例同样要把控件关掉、窗口拆掉；
@@ -1291,8 +1360,8 @@ func (p *browserPanel) detach(done chan struct{}) panelParts {
 	}
 	// 已在关的那次不动它的登记：并发的 Close / 前端收尾不该把等待者放走
 	p.hwnd, p.ctl, p.wv, p.chrome = 0, nil, nil, nil
-	p.newWinHandler, p.titleHandler = nil, nil
-	p.newWinToken, p.titleToken = 0, 0
+	p.titleHandler = nil
+	p.titleToken = 0
 	p.started, p.visible = false, false
 	p.url, p.title = "", ""
 	p.cssW, p.cssH = 0, 0
@@ -1336,11 +1405,6 @@ func (p *browserPanel) closeControllerOnUI(parts panelParts) (ex panelExiter) {
 		v = wvVtblOf(parts.wv)
 	}
 	if v != nil {
-		if parts.newWin != nil {
-			tok := parts.newWinTok
-			_, _, _ = v.removeNewWindowRequested.Call(
-				uintptr(unsafe.Pointer(parts.wv)), uintptr(unsafe.Pointer(parts.newWin)), uintptr(unsafe.Pointer(&tok)))
-		}
 		if parts.title != nil {
 			tok := parts.titleTok
 			_, _, _ = v.removeDocumentTitleChanged.Call(
@@ -1428,7 +1492,6 @@ func (p *browserPanel) releaseAfterMainLoopGone() {
 		_, _, _ = procPanelDestroyWindow.Call(parts.hwnd) // 已随父窗口销毁时是无害重复
 	}
 	retirePanelChromium(parts.chrome) // 同上：原生侧的 handler 裸指针还在，Go 侧不许回收
-	retireEvtHandler(parts.newWin)
 	retireEvtHandler(parts.title)
 }
 

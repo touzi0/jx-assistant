@@ -30,9 +30,10 @@ type StoredMessage struct {
 	SessionID  string `json:"sessionId"`
 	Seq        int64  `json:"seq"`
 	Kind       string `json:"kind"`
-	Origin     string `json:"origin,omitempty"` // summary 来源：auto | manual
+	Origin     string `json:"origin,omitempty"`  // summary 来源：auto | manual
 	Compact    string `json:"compact,omitempty"` // 规则压缩标记：非空=已折叠（"omit"=整行丢弃）；前端据此显示「已折叠」行，原文照常完整展示
 	CoversUpTo int64  `json:"coversUpTo,omitempty"`
+	CoversFrom int64  `json:"coversFrom,omitempty"` // 摘要覆盖起点 seq（与 coversUpTo 成对；auto 合并存累计起点，manual 存本次区间起点）
 	Superseded bool   `json:"superseded,omitempty"`
 	CreatedAt  string `json:"createdAt,omitempty"`
 	Thinking   string `json:"thinking,omitempty"` // assistant 该步的思考过程原文
@@ -330,6 +331,16 @@ var storeMigrations = []migration{
 		tolerant: true,
 		sql: []string{
 			`ALTER TABLE sessions ADD COLUMN voice_used INTEGER NOT NULL DEFAULT 0`,
+		},
+	},
+	{
+		// 摘要行的覆盖起点（与 covers_up_to 成对）：本次/累计压缩区间的下界
+		// seq。auto 合并存累计起点（合并链头部），manual 叠加存本次区间起点
+		//——增量式压缩的可检索标注（2026-11-11 用户要求），摘要文本头同写。
+		id:       "0016_message_covers_from",
+		tolerant: true,
+		sql: []string{
+			`ALTER TABLE messages ADD COLUMN covers_from INTEGER NOT NULL DEFAULT 0`,
 		},
 	},
 }
@@ -702,14 +713,91 @@ const sessionCols = `id, title, mode, workspace, parent_id, provider, model, per
 
 func (s *Store) Create(m *SessionMeta) error { return s.SaveMeta(m) }
 
+// dbExecer 是 *sql.DB 与 *sql.Tx 的共同执行面：会话行的写入 SQL 只此一份
+// （SaveMeta 单条写、CreateWithRows 事务内写，都走 upsertSession）。
+type dbExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// CreateWithRows 在一个事务里建会话并整批写入它的历史行（以及随分支继承过来的
+// 上传登记）：要么全有、要么全无。
+//
+// 为什么必须原子（2026-11-16 事故的两个根因都在这）：
+//  1. 列表里不会再出现「正文为空的半成品」——此前 sessions 行 0.04s 就落库可见，
+//     消息要十几秒才写完；用户在这个窗口里归档/删除它，就得到一条「能对话、但
+//     列表里找不到」的会话。
+//  2. 整批是一个提交——此前逐行 AppendRow 每行一次 fsync（实测 3.13ms/行，
+//     4400 行 = 13.9s），现在同一个父会话只要 0.2s 量级。
+//
+// uploads 由调用方先在事务外读好传进来（Store 的读方法自己取锁，事务内再读会死锁）；
+// 放进同一事务是因为「建好会话 → 复制上传登记」中间若被删除插队，那批登记就成了
+// 没有主人的死数据（实测：并发删除留下 3 条孤儿 uploads）。
+func (s *Store) CreateWithRows(m *SessionMeta, rows []*StoredMessage, uploads []*Upload) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // 已提交时是空操作
+	if err := upsertSession(tx, m); err != nil {
+		return err
+	}
+	if err := insertMessagesTx(tx, m.ID, rows); err != nil {
+		return err
+	}
+	for _, u := range uploads {
+		if _, err := tx.Exec(`INSERT INTO uploads (session_id, uid, orig_path, copy_path, name, size, created_at)
+			VALUES(?,?,?,?,?,?,?)`, m.ID, u.UID, u.OrigPath, u.CopyPath, u.Name, u.Size, u.CreatedAt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// insertMessagesTx 在事务内整批插入消息行（调用方负责提交）；口径与 appendRowLocked
+// 一致：只有用户输入与模型最终输出会刷新 sessions.updated_at（见 touchesActivity）。
+func insertMessagesTx(tx *sql.Tx, id string, rows []*StoredMessage) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	stmt, err := tx.Prepare(insertMessageSQL)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	touch := false
+	for _, sm := range rows {
+		args, err := messageInsertArgs(id, sm)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(args...); err != nil {
+			return err
+		}
+		if sm.touchesActivity() {
+			touch = true
+		}
+	}
+	if touch {
+		_, _ = tx.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, now(), id)
+	}
+	return nil
+}
+
 func (s *Store) SaveMeta(m *SessionMeta) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// 注意：下面的 UPDATE 刻意不写 status——它只由 UpdateStatus 维护（执行中/空闲）；
-	// 同理不写 voice_used——它只由 MarkVoiceUsed 单调置位（chat 上报路径），陈旧
-	// 内存对象全列回写不得把它冲回去。
-	// 否则 appendMessage 之类拿着陈旧内存对象回写，会把 running 冲成 idle，
-	// 导致「正在执行」在侧栏与重启恢复里都不生效。
+	return upsertSession(s.db, m)
+}
+
+// upsertSession 写会话行（列清单与 ON CONFLICT 的唯一来源）。
+// 注意：下面的 UPDATE 刻意不写 status——它只由 UpdateStatus 维护（执行中/空闲）；
+// 同理不写 voice_used——它只由 MarkVoiceUsed 单调置位（chat 上报路径），陈旧
+// 内存对象全列回写不得把它冲回去。
+// 否则 appendMessage 之类拿着陈旧内存对象回写，会把 running 冲成 idle，
+// 导致「正在执行」在侧栏与重启恢复里都不生效。
+func upsertSession(ex dbExecer, m *SessionMeta) error {
 	tools := ""
 	if len(m.Tools) > 0 {
 		if b, err := json.Marshal(m.Tools); err == nil {
@@ -729,7 +817,7 @@ func (s *Store) SaveMeta(m *SessionMeta) error {
 			remote = string(b)
 		}
 	}
-	_, err := s.db.Exec(`INSERT INTO sessions(`+sessionCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := ex.Exec(`INSERT INTO sessions(`+sessionCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET title=excluded.title, mode=excluded.mode,
 		workspace=excluded.workspace, parent_id=excluded.parent_id, provider=excluded.provider,
 		model=excluded.model, permission=excluded.permission, plan_mode=excluded.plan_mode,
@@ -756,7 +844,7 @@ func permOf(m *SessionMeta) string {
 }
 
 // TouchRunMeta 只回写运行期会变化的列（用量计数与 updated_at）。列所有权约定
-//（同 SaveMeta 之于 status 的先例）：配置列（权限/能力/模型/思考档位等）只归
+// （同 SaveMeta 之于 status 的先例）：配置列（权限/能力/模型/思考档位等）只归
 // 配置写入口（PATCH / 权限升级函数）全量写；运行体热路径（appendMessage 系列、
 // 流尾用量回调）只碰运行列——否则拿着陈旧内存对象的全列回写会把用户刚在面板上
 // 改好的权限静默覆盖回旧值（运行中改权限丢失的根因）。
@@ -861,6 +949,9 @@ func (s *Store) Delete(id string) error {
 		return err
 	}
 	_, _ = s.db.Exec(`DELETE FROM meta WHERE k=?`, "laststop:"+id) // 顺带清掉异常中断标记
+	// 会话附属数据（sessdata:<键>:<会话id>：待审批计划/标题钉住/组件插件覆盖…）
+	// 一并清掉——会话没了这些就是死数据（此前只清 laststop，sessdata 一直漏）。
+	_, _ = s.db.Exec(`DELETE FROM meta WHERE k LIKE 'sessdata:%:' || ?`, id)
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE id=?`, id)
 	return err
 }
@@ -1044,12 +1135,13 @@ func (sm *StoredMessage) touchesActivity() bool {
 	return false
 }
 
-func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
-	if sm.Seq == 0 {
-		if err := s.db.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?`, id).Scan(&sm.Seq); err != nil {
-			return err
-		}
-	}
+// insertMessageSQL 与 messageInsertArgs 是消息行写入的唯一来源：单行追加
+// （appendRowLocked）与建会话时整批灌入（insertMessagesTx）共用同一份列顺序。
+const insertMessageSQL = `INSERT INTO messages
+		(session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, covers_from, superseded, created_at, thinking)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+func messageInsertArgs(id string, sm *StoredMessage) ([]any, error) {
 	var content any
 	if sm.Content != nil {
 		content = sm.Text()
@@ -1058,7 +1150,7 @@ func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
 	if len(sm.ToolCalls) > 0 {
 		b, err := json.Marshal(sm.ToolCalls)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		toolCalls = string(b)
 	}
@@ -1066,12 +1158,21 @@ func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
 	if sm.Compact != "" {
 		compact = sm.Compact
 	}
-	_, err := s.db.Exec(`INSERT INTO messages
-		(session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, superseded, created_at, thinking)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, sm.Seq, sm.Role, content, toolCalls, sm.ToolCallID, sm.Kind, sm.Origin,
-		compact, sm.CoversUpTo, boolInt(sm.Superseded), sm.CreatedAt, sm.Thinking)
+	return []any{id, sm.Seq, sm.Role, content, toolCalls, sm.ToolCallID, sm.Kind, sm.Origin,
+		compact, sm.CoversUpTo, sm.CoversFrom, boolInt(sm.Superseded), sm.CreatedAt, sm.Thinking}, nil
+}
+
+func (s *Store) appendRowLocked(id string, sm *StoredMessage) error {
+	if sm.Seq == 0 {
+		if err := s.db.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?`, id).Scan(&sm.Seq); err != nil {
+			return err
+		}
+	}
+	args, err := messageInsertArgs(id, sm)
 	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(insertMessageSQL, args...); err != nil {
 		return err
 	}
 	// 只有用户输入与模型最终输出刷新「最近更新」时间（口径见 touchesActivity）
@@ -1088,14 +1189,14 @@ func boolInt(b bool) int {
 	return 0
 }
 
-const messageCols = `id, session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, superseded, created_at, thinking`
+const messageCols = `id, session_id, seq, role, content, tool_calls, tool_call_id, kind, origin, compact, covers_up_to, covers_from, superseded, created_at, thinking`
 
 func scanMessage(sc interface{ Scan(dest ...any) error }) (*StoredMessage, error) {
 	sm := &StoredMessage{}
 	var content, toolCalls, compact, thinking sql.NullString
 	var sup int
 	err := sc.Scan(&sm.ID, &sm.SessionID, &sm.Seq, &sm.Role, &content, &toolCalls,
-		&sm.ToolCallID, &sm.Kind, &sm.Origin, &compact, &sm.CoversUpTo, &sup, &sm.CreatedAt, &thinking)
+		&sm.ToolCallID, &sm.Kind, &sm.Origin, &compact, &sm.CoversUpTo, &sm.CoversFrom, &sup, &sm.CreatedAt, &thinking)
 	if err != nil {
 		return nil, err
 	}
@@ -1159,9 +1260,9 @@ func (s *Store) MessagesWithSeq(id string) ([]*StoredMessage, error) {
 // SummariesOf 取会话全部压缩摘要行（kind=summary，按 seq 升序）。会话详情接口
 // 用它把摘要行并入 UI 下发副本——前端要在压缩真实发生的位置显示常显的压缩
 // 卡片（覆盖到哪一条 + 展开看完整摘要）。MessagesWithSeq 的过滤口径不动
-//（历史读取工具等仍拿不到摘要行），只给界面这一份补齐。
+// （历史读取工具等仍拿不到摘要行），只给界面这一份补齐。
 func (s *Store) SummariesOf(id string) ([]*StoredMessage, error) {
-	rows, err := s.db.Query(`SELECT ` + messageCols + ` FROM messages WHERE session_id=? AND kind='summary' ORDER BY seq`, id)
+	rows, err := s.db.Query(`SELECT `+messageCols+` FROM messages WHERE session_id=? AND kind='summary' ORDER BY seq`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1174,6 +1275,7 @@ func (s *Store) SummariesOf(id string) ([]*StoredMessage, error) {
 	}
 	return out, rows.Err()
 }
+
 // RawMessages 分页读取原生历史（含摘要行，未做任何折叠），供历史查询工具与压缩使用。
 func (s *Store) RawMessages(id string, offset, limit int) ([]*StoredMessage, int, error) {
 	var total int
@@ -1200,7 +1302,7 @@ func (s *Store) RawMessages(id string, offset, limit int) ([]*StoredMessage, int
 	return out, total, rows.Err()
 }
 
-// MessageCount 返回会话的消息条数。数字经理主对话的版本清单只要条数、
+// MessageCount 返回会话的消息条数。长期助理主对话的版本清单只要条数、
 // 不读正文（那边一版几万条，读完只为数字数不值得）。
 func (s *Store) MessageCount(id string) (int, error) {
 	var n int
@@ -1760,6 +1862,58 @@ func (s *Store) CopyUploadsOnBranch(fromID, toID string) error {
 	return nil
 }
 
+// InheritMark 读会话的承接锚点（首行 kind=inherit 的正文）；没有则返回空串。
+func (s *Store) InheritMark(id string) (string, error) {
+	var content sql.NullString
+	err := s.db.QueryRow(`SELECT content FROM messages WHERE session_id=? AND kind='inherit' ORDER BY seq LIMIT 1`, id).Scan(&content)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return content.String, nil
+}
+
+// InheritRowsBefore 取父会话里 seq < beforeSeq 的可继承行（口径与派生完全一致：
+// 排除诊断工件 request/audit 与纯展示的 prompt 快照），按 seq 升序返回最后 limit
+// 条，并返回「这条之前还剩多少条」。数据源是子对话「承接自 … · 更早 N 条」的懒加载。
+func (s *Store) InheritRowsBefore(id string, beforeSeq int64, limit int) ([]*StoredMessage, int, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	const notArtifact = `kind NOT IN ('prompt','request','audit')`
+	rows, err := s.db.Query(`SELECT `+messageCols+` FROM messages
+		WHERE session_id=? AND seq<? AND `+notArtifact+` ORDER BY seq DESC LIMIT ?`, id, beforeSeq, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	out := []*StoredMessage{}
+	for rows.Next() {
+		sm, err := scanMessage(rows)
+		if err != nil {
+			rows.Close()
+			return nil, 0, err
+		}
+		out = append(out, sm)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	var left int
+	if len(out) > 0 {
+		if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE session_id=? AND seq<? AND `+notArtifact,
+			id, out[0].Seq).Scan(&left); err != nil {
+			return nil, 0, err
+		}
+	}
+	return out, left, nil
+}
+
 // DeleteUploadsForSession 删除会话时清掉它的上传登记。
 func (s *Store) DeleteUploadsForSession(sessionID string) error {
 	s.mu.Lock()
@@ -1899,6 +2053,11 @@ func (s *Store) DeletePendingJobsForSession(sessionID string) error {
 // SearchMessages 跨会话全文搜索（当前 LIKE 实现；个人规模数据足够，量大后可升 FTS）。
 // 搜索范围覆盖三列：消息正文（含工具结果行）、工具调用参数（tool_calls JSON）、
 // 思考过程（thinking）。ctxRadius 是命中片段的半径（<=0 时取默认短片段 90 字）。
+// 命中代表行的取舍（2026-11-19 修）：**会话内取最早命中**（原始记录），会话间
+// 按最近活动排序——此前取「最新命中」，而模型发起 search_sessions 时查询词本身
+// 就写在那条调用的参数里（自引用），永远是最新的，会把真正含原文的旧行挤出
+// 结果：搜「之前哪次说过 X」命中的却是「这次搜索」自己，顺着 seq 去读自然
+// 读不到原文。前端能显示的原文，搜索就必须能定位到（同一条 messages 行）。
 func (s *Store) SearchMessages(query string, limit, ctxRadius int) ([]SearchHit, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("query 不能为空")
@@ -1909,46 +2068,73 @@ func (s *Store) SearchMessages(query string, limit, ctxRadius int) ([]SearchHit,
 	if ctxRadius <= 0 {
 		ctxRadius = 90
 	}
+	like := "%" + query + "%"
+	// 第一步：每个命中会话的最早命中行 id，会话按更新时间倒序取 limit 个
+	idRows, err := s.db.Query(`
+		SELECT h.first_id FROM (
+			SELECT m.session_id AS session_id, MIN(m.id) AS first_id
+			FROM messages m
+			WHERE m.kind IN ('chat','report')
+			  AND (m.content LIKE ? OR m.tool_calls LIKE ? OR m.thinking LIKE ?)
+			GROUP BY m.session_id
+		) h JOIN sessions s ON s.id = h.session_id
+		ORDER BY s.updated_at DESC LIMIT ?`, like, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	ids := []int64{}
+	for idRows.Next() {
+		var id int64
+		if err := idRows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	idRows.Close()
+	if len(ids) == 0 {
+		return []SearchHit{}, nil
+	}
+	// 第二步：按行取详情（片段取自第一个命中的列：正文 > 调用参数 > 思考）
+	ph := make([]string, len(ids))
+	argsQ := make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		argsQ[i] = id
+	}
 	rows, err := s.db.Query(`
-		SELECT m.session_id, s.title, s.mode, m.seq, m.role, m.content, m.tool_calls, m.thinking
+		SELECT m.id, m.session_id, s.title, s.mode, m.seq, m.role, m.content, m.tool_calls, m.thinking
 		FROM messages m JOIN sessions s ON s.id = m.session_id
-		WHERE m.kind IN ('chat','report')
-		  AND (m.content LIKE '%' || ? || '%' OR m.tool_calls LIKE '%' || ? || '%' OR m.thinking LIKE '%' || ? || '%')
-		ORDER BY m.id DESC LIMIT ?`, query, query, query, limit*3)
+		WHERE m.id IN (`+strings.Join(ph, ",")+`)`, argsQ...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	hits := []SearchHit{}
+	byID := map[int64]*SearchHit{}
 	for rows.Next() {
+		var id int64
 		var h SearchHit
 		var content, toolCalls, thinking sql.NullString
-		if err := rows.Scan(&h.SessionID, &h.Title, &h.Mode, &h.Seq, &h.Role, &content, &toolCalls, &thinking); err != nil {
+		if err := rows.Scan(&id, &h.SessionID, &h.Title, &h.Mode, &h.Seq, &h.Role, &content, &toolCalls, &thinking); err != nil {
 			continue
 		}
-		// 片段取自第一个命中的列（按优先级：正文 > 调用参数 > 思考）
 		for _, src := range []string{content.String, toolCalls.String, thinking.String} {
 			if strings.Contains(src, query) {
 				h.Snippet = snippetAround(src, query, ctxRadius)
 				break
 			}
 		}
-		hits = append(hits, h)
+		byID[id] = &h
 	}
-	// 同一会话只留一条最佳命中（最新的），避免刷屏
-	seen := map[string]bool{}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 保持第一步的会话顺序（IN 查询不保序）
 	out := []SearchHit{}
-	for _, h := range hits {
-		if seen[h.SessionID] {
-			continue
-		}
-		seen[h.SessionID] = true
-		out = append(out, h)
-		if len(out) >= limit {
-			break
+	for _, id := range ids {
+		if h := byID[id]; h != nil {
+			out = append(out, *h)
 		}
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // snippetAround 截取命中位置附近的片段。

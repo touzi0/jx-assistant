@@ -456,6 +456,22 @@ func (r *CCPluginRegistry) stateOf(key string) (*ccPluginState, bool) {
 	return st, ok
 }
 
+// rootOf 返回一个已装插件的插件根目录（绝对路径；${CLAUDE_PLUGIN_ROOT}，
+// 市场上传时从这里现场打包）。安装记录缺失时 ok=false。
+func (r *CCPluginRegistry) rootOf(key string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	st, ok := r.state.Plugins[key]
+	if !ok {
+		return "", false
+	}
+	root := st.Path
+	if !filepath.IsAbs(root) {
+		root = filepath.Join(r.root, root)
+	}
+	return root, true
+}
+
 // InstallFromMarketplace 从已添加市场安装一个插件（解析条目 source 三形态）。
 func (r *CCPluginRegistry) InstallFromMarketplace(marketplaceID, pluginName string) (string, error) {
 	marketplaceID = ccSanitizeName(marketplaceID)

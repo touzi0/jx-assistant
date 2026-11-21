@@ -54,5 +54,6 @@ if (-not (Test-Path (Join-Path $sh "node_modules\electron\dist\electron.exe"))) 
 
 # 5) 启动（阻塞直到窗口关闭；Ctrl+C 结束会连带 taskkill 引擎树）
 $env:JX_GO_EXE = Join-Path $root "jx-assistant.exe"
+$env:JX_SKIP_MIGRATIONS = "1"   # 开发实例兜底闸：启动时整体跳过迁移（不碰技能目录与账本；正式版不设此变量，行为不变）
 Push-Location $sh
 try { npm start; if ($LASTEXITCODE -ne 0) { throw "npm start 失败（退出码 $LASTEXITCODE）" } } finally { Pop-Location }

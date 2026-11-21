@@ -34,7 +34,11 @@ data class Dev(
     val pairKey: String,   // 仅 relay
     val url: String,       // 仅 lan（完整入口）
     val addedAt: Long,
+    val alias: String = "", // 用户备注名（长按菜单「备注」设置；空 = 未设置）
 ) {
+    /** 统一显示名：备注优先（列表、菜单、设备页、分享选择都用它） */
+    fun displayName(): String = alias.ifBlank { name }
+
     /** 入口 URL：每次都带 #pk（localStorage 丢失也能自愈直连） */
     fun entryUrl(): String {
         if (kind == "lan") return url
@@ -71,6 +75,7 @@ object DeviceStore {
                         scheme = o.optString("scheme", "http"), host = o.getString("host"),
                         port = o.getInt("port"), pairKey = o.optString("pairKey", ""),
                         url = o.optString("url", ""), addedAt = o.optLong("addedAt", 0L),
+                        alias = o.optString("alias", ""),
                     )
                 )
             }
@@ -88,6 +93,7 @@ object DeviceStore {
                     .put("id", d.id).put("name", d.name).put("kind", d.kind)
                     .put("scheme", d.scheme).put("host", d.host).put("port", d.port)
                     .put("pairKey", d.pairKey).put("url", d.url).put("addedAt", d.addedAt)
+                    .put("alias", d.alias)
             )
         }
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
@@ -111,6 +117,16 @@ object DeviceStore {
     }
 
     fun byId(ctx: Context, id: String): Dev? = load(ctx).firstOrNull { it.id == id }
+
+    /** 设置/清除备注（空串 = 清除，恢复默认显示名）。返回是否找到了这台设备 */
+    fun setAlias(ctx: Context, id: String, alias: String): Boolean {
+        val devs = load(ctx)
+        val i = devs.indexOfFirst { it.id == id }
+        if (i < 0) return false
+        devs[i] = devs[i].copy(alias = alias.trim())
+        save(ctx, devs)
+        return true
+    }
 
     fun lastDevice(ctx: Context): String? =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_LAST, null)

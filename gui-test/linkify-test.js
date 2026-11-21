@@ -1,14 +1,18 @@
-// 链接化单测：从 app-core.js 原样抽取 inlineFmt 全套，验证路径/URL 识别
+// 链接化单测：从 app-core.js 抽取渲染器全套 + marked.lib.js，走 md() 全链路
+// 验证路径/URL 识别（换 marked 渲染器后行为与旧 inlineFmt 版一致；用例清单原样保留）
+// 用法：node gui-test/linkify-test.js
 const { readFileSync } = require('fs');
 const pathMod = require('path');
+const vm = require('vm');
 const src = readFileSync(pathMod.join(__dirname, '..', 'web', 'app-core.js'), 'utf8');
 const grab = (re) => { const m = src.match(re); if (!m) throw new Error('not found: ' + re); return m[0]; };
 const escFn = grab(/function esc\(s\) \{[\s\S]*?\n\}/);
-const consts = grab(/const FILE_PATH_RE = [^;]+;/);
-const codePathFn = grab(/function codeSpanIsPath\(c\) \{[\s\S]*?\n\}/);
-const pathLinksFn = grab(/function pathLinks\(seg\) \{[\s\S]*?\n\}/);
-const inlineFn = grab(/function inlineFmt\(s\) \{[\s\S]*?\n\}/);
-const fmt = new Function(escFn + '\n' + consts + '\n' + codePathFn + '\n' + pathLinksFn + '\n' + inlineFn + '\nreturn inlineFmt;')();
+const mdSec = grab(/\/\* ---------- Markdown 渲染[\s\S]*?\n\}(?=\n\nfunction relTime)/);
+const sandbox = {};
+vm.createContext(sandbox);
+vm.runInContext(readFileSync(pathMod.join(__dirname, '..', 'web', 'marked.lib.js'), 'utf8'), sandbox);
+vm.runInContext(escFn + '\n' + mdSec + '\nthis.md = md;', sandbox);
+const fmt = (s) => sandbox.md(s);
 
 const S = String.raw;
 let pass = 0, fail = 0;
@@ -33,7 +37,7 @@ const cases = [
 ];
 for (const [input, wantPath, wantUrl] of cases) {
   const html = fmt(input);
-  const paths = [...html.matchAll(/data-path="([^"]*)"/g)].map((m) => m[1].replace(/&amp;/g, '&'));
+  const paths = [...html.matchAll(/data-path="([^"]*)"/g)].map((m) => m[1]);
   const urlCount = (html.match(/class="ext-link"/g) || []).length;
   let ok;
   if (wantPath) ok = paths.length === 1 && paths[0] === wantPath && urlCount === wantUrl;
@@ -41,8 +45,8 @@ for (const [input, wantPath, wantUrl] of cases) {
   if (ok) pass++;
   else { fail++; console.log('FAIL', JSON.stringify(input), '->', JSON.stringify({ paths, urlCount })); }
 }
-// XSS：路径中的引号/尖括号不能逃出属性
-const xss = fmt(S`x/<img src=x onerror=alert(1)>.js "a".md`);
-const xssOk = !/<img/.test(xss.replace(/&lt;img/g, ''));
+// XSS：路径中的引号/尖括号不能逃出属性；输出的标签必须在渲染器白名单内
+const xss = fmt(S`x/<img src=x onerror=alert(1)>.js "a".md 与 <script>alert(2)</script>`);
+const xssOk = !/<img/.test(xss.replace(/&lt;img/g, '')) && !/<script/.test(xss.replace(/&lt;script/g, ''));
 console.log(`linkify: ${pass + (xssOk ? 1 : 0)} pass, ${fail + (xssOk ? 0 : 1)} fail（含 XSS 一例）`);
 if (fail || !xssOk) process.exit(2);

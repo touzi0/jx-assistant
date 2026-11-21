@@ -24,20 +24,30 @@ type fakePublishMarket struct {
 	srv    *httptest.Server
 	fields map[string]string
 	user   string // 收到的 X-Jxai-User 头（身份=发布者姓名）
+	device string // 收到的 X-Jxai-Device 头（三要素审计的设备名）
 	file   string
 	zip    []byte
 	code   int
 	errMsg string
 	hits   int
+	// entries 清单里的在架条目（type → 列表）：发布前同版本拦截的闸门读它；
+	// 不设则为空清单
+	entries map[string][]marketEntryIn
+	// reply 覆盖成功响应（默认 {entry:…}；测待审透传时给 pending+message）
+	reply map[string]any
 }
 
 func newFakePublishMarket(t *testing.T) *fakePublishMarket {
 	t.Helper()
-	fm := &fakePublishMarket{fields: map[string]string{}, code: 200}
+	fm := &fakePublishMarket{fields: map[string]string{}, code: 200, entries: map[string][]marketEntryIn{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /market/manifest.json", func(w http.ResponseWriter, r *http.Request) {
+		m := map[string]any{"name": "测试市场", "updatedAt": "2026-10-09T00:00:00Z", "skills": []marketEntryIn{}}
+		for typ, list := range fm.entries {
+			m[typ+"s"] = list
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"name":"测试市场","updatedAt":"2026-10-09T00:00:00Z","skills":[]}`)
+		_ = json.NewEncoder(w).Encode(m)
 	})
 	mux.HandleFunc("POST /api/market/publish", func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseMultipartForm(64 << 20); err != nil {
@@ -46,6 +56,7 @@ func newFakePublishMarket(t *testing.T) *fakePublishMarket {
 		}
 		fm.hits++
 		fm.user = r.Header.Get(marketUserHeader)
+		fm.device = r.Header.Get(marketDeviceHeader)
 		for _, k := range []string{"type", "id", "name", "version", "desc", "tags", "owner"} {
 			fm.fields[k] = r.FormValue(k)
 		}
@@ -60,6 +71,10 @@ func newFakePublishMarket(t *testing.T) *fakePublishMarket {
 			_ = json.NewEncoder(w).Encode(map[string]any{"error": fm.errMsg})
 			return
 		}
+		if fm.reply != nil {
+			_ = json.NewEncoder(w).Encode(fm.reply)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"entry": map[string]any{
 			"id": fm.fields["id"], "version": fm.fields["version"],
 			"zip": "/market/items/skill/" + fm.fields["id"] + "/" + fm.fields["version"] + ".zip",
@@ -72,7 +87,9 @@ func newFakePublishMarket(t *testing.T) *fakePublishMarket {
 
 func newPublishTestApp(t *testing.T, marketURL string) *App {
 	a := newMarketTestApp(t, marketURL)
-	a.Cfg.PublisherName = "张三" // 发布者姓名：身份头的来源
+	a.Cfg.PublisherName = "张三"                 // 发布者姓名：身份头的来源
+	a.Cfg.RemoteAccess.MyID = "jx-dev01"         // 远程接入设备号：设备头的来源
+	a.CfgPath = filepath.Join(t.TempDir(), "config.json")
 	return a
 }
 
@@ -201,6 +218,9 @@ func TestPublishInstalledSkill(t *testing.T) {
 	}
 	if fm.user != "张三" {
 		t.Fatalf("身份头应带发布者姓名，实得 %q", fm.user)
+	}
+	if fm.device != "jx-dev01" {
+		t.Fatalf("三要素审计应带 X-Jxai-Device 头（值=远程接入设备号），实得 %q", fm.device)
 	}
 	if fm.fields["owner"] != "" {
 		t.Fatalf("owner 不再走表单字段（身份在头里），实得 %q", fm.fields["owner"])

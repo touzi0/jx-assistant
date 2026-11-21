@@ -140,11 +140,19 @@ func TestAskAlertWakesWindowAndBeeps(t *testing.T) {
 
 	type frontCall struct{ title, text string }
 	front := make(chan frontCall, 4)
-	oldFront, oldBeep := alertFrontHook, askAlertBeep
+	oldFront, oldBeep, oldScreen := alertFrontHook, askAlertBeep, alertScreenHook
 	alertFrontHook = func(title, text string) { front <- frontCall{title, text} }
 	beeps := 0
 	askAlertBeep = func() { beeps++ }
-	defer func() { alertFrontHook, askAlertBeep = oldFront, oldBeep }()
+	// 全屏蒙层也换桩：跑测试不真弹原生窗口，只断言「到点确实去盖屏了、qid 正确」
+	type screenCall struct {
+		title, text, qid string
+	}
+	screen := make(chan screenCall, 4)
+	alertScreenHook = func(title, text, qid string, onDismiss func()) {
+		screen <- screenCall{title, text, qid}
+	}
+	defer func() { alertFrontHook, askAlertBeep, alertScreenHook = oldFront, oldBeep, oldScreen }()
 
 	ch, unsub := a.subscribe()
 	defer unsub()
@@ -166,6 +174,20 @@ func TestAskAlertWakesWindowAndBeeps(t *testing.T) {
 	}
 	if beeps != 1 {
 		t.Fatalf("到点应叮一声，实际 %d 次", beeps)
+	}
+
+	// 桌面全屏蒙层（第二处提醒）也在同一触发点盖屏：qid 必须是这轮的问题 id
+	//（前端收层时按它 POST 关闭，qid 错了关不掉）
+	select {
+	case got := <-screen:
+		if !strings.Contains(got.title, "坚祥数字助理") {
+			t.Fatalf("全屏蒙层标题不对: %q", got.title)
+		}
+		if got.qid != "q-wake" {
+			t.Fatalf("全屏蒙层 qid 应为这轮问题 id，实际 %q", got.qid)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("提醒到点没有盖全屏蒙层（主窗口被埋住时用户就看不见了）")
 	}
 
 	deadline := time.After(time.Second)

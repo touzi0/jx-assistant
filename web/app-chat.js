@@ -48,6 +48,10 @@ function detachComposerToWrap() {
 function resetEmpty() {
   detachComposerToWrap();
   state._pfxSid = null; // 回到首页：消息区的增量渲染缓存失效
+  state._batches = []; // 分批窗口一并作废（顶条收起，重开会话时重设）
+  state.older = undefined;
+  cancelReleaseOlder(mainView);
+  renderLoadOlderBar(mainView);
   $('msg-col').innerHTML =
     '<div class="home">' +
       '<div class="hero">' +
@@ -73,7 +77,7 @@ function resetEmpty() {
 /* ---------- 会话 ---------- */
 
 async function openAssistant() {
-  // 「跟数字经理对话」入口打开的是**当前版本**——哪一版由服务端记在库里
+  // 「跟长期助理对话」入口打开的是**当前版本**——哪一版由服务端记在库里
   // （/api/assistant/versions，见 assistant_versions.go）。这里绝不能自己从
   // 会话列表里挑：多版本下「按更新时间取第一个」会把用户刚聊过的那一版当成
   // 当前版本，切回老版本聊一句就顶掉新版本。
@@ -91,7 +95,7 @@ async function openAssistant() {
 // 「新工作任务」不立即建会话：留在首页聚焦输入框，发出第一条消息才真正创建
 function goHomeNewTask() {
   narrowClosePanels(); // 窄屏：从左栏浮层发起，选中目标即收起浮层
-  // 视图收口：市场/小程序平台已组件化（组件可能关闭或摘除，接口由组件挂 window，
+  // 视图收口：市场/企业小程序已组件化（组件可能关闭或摘除，接口由组件挂 window，
   // 不在场即跳过）——回首页即关掉占领主区的整页视图
   if (typeof marketOpen === 'function' && marketOpen() && typeof closeMarket === 'function') closeMarket();
   if (typeof sitesViewOpen === 'function' && sitesViewOpen() && typeof closeSites === 'function') closeSites();
@@ -104,6 +108,9 @@ function goHomeNewTask() {
   state._loading = false; // 在途加载态一并作废（回首页是同步完成的导航）
   rememberLastSession(''); // 明确回首页：下次打开从首页开始，不再恢复上次的对话
   state.cur = null;
+  // 回首页＝没有会话上下文：组件装配回到全局开关集（session:open 不会来，
+  // 这里显式重置；CX 不在场（老引擎壳）时跳过）
+  if (window.CX && CX.setSession) CX.setSession('');
   loadProgress();
   state.msgs = [];
   resetEmpty();
@@ -113,7 +120,8 @@ function goHomeNewTask() {
   $('input').focus();
 }
 
-async function openSession(id) {
+async function openSession(id, opts) {
+  const stay = !!(opts && opts.stay); // 停留本页的就地翻新：保视口/展开记忆/分批窗口
   narrowClosePanels(); // 窄屏：在左栏浮层里选中会话即收起浮层
   // 市场像一张对话页：打开任何对话即关掉它——两个视图均已组件化，接口不在场即跳过
   if (typeof marketOpen === 'function' && marketOpen() && typeof closeMarket === 'function') closeMarket();
@@ -133,12 +141,12 @@ async function openSession(id) {
   // （refreshCurrent 等）都以目标为准，旧会话的晚到事件不可能再把界面顶回去
   const brief = (state.sessions || []).find((s) => s.id === id);
   if (brief && (!state.cur || state.cur.id !== id)) optimisticSwitch(mainView, brief);
-  if (brief && brief.mode === 'assistant' && dollState === 'done') setFace('idle'); // 打开数字经理对话＝完成提醒已读：徽章清、小人回待机
+  if (brief && brief.mode === 'assistant' && dollState === 'done') setFace('idle'); // 打开长期助理对话＝完成提醒已读：徽章清、小人回待机
   // 右栏切到目标对话自己的状态（开合/视图/各视图选择；没记忆＝默认收起+空态）。
   // 放在乐观切换之后：各视图的就位逻辑以 state.cur 为准，此刻它已是目标对话
   if (oldSid !== id) rpRestoreSession(id);
   try {
-    await loadSessionInto(id, tok);
+    await loadSessionInto(id, tok, { stay: stay });
   } catch (e) {
     // 加载失败：留在目标会话的壳里，给原因与「重试」，绝不静默退回旧会话
     if (tok === navTok.main) showChatLoadError(mainView, e.message, () => {
@@ -166,11 +174,16 @@ function optimisticSwitch(view, brief) {
   st.msgs = [];
   st.pendingSteer = [];
   st.pendingQueue = [];
+  st.pendingVer = 0; // 换会话：版本基线清零，等整包加载重设（期间广播不被旧会话的 ver 挡掉）
   st.checkpoints = [];
   st.deliveries = [];
   st.streamText = '';
   st.streamThinking = '';
   st._pfxSid = null;
+  st._batches = []; // 分批窗口随会话作废（顶条与 older 由 loadSessionInto 重设）
+  st.older = undefined;
+  cancelReleaseOlder(view);
+  renderLoadOlderBar(view);
   st._loading = true; // renderMessages / reloadMessages 见此标记让路，别冲掉加载态
   applySessionChrome(view);
   showChatLoading(view);
@@ -204,21 +217,21 @@ function applySessionChrome(view) {
 }
 
 // 「数字助理主对话」在界面上的显示名：会话标题是创建主对话时写进会话 meta 的
-// 「数字助理主对话」（老会话里存的也是它），界面统一显示「跟数字经理对话」且
-// 「经理」两字加粗。这里只做显示层映射——内部标识（mode=assistant）、库里存的标题、
-// 以及所有按 mode/parentId 分流的功能逻辑都不动，所以旧会话不必重开、不用改数据，
-// 打开即显示新名。
-const ASSISTANT_MAIN_TITLE_HTML = '跟数字<b>经理</b>对话';
+// 「数字助理主对话」（老会话里存的也是它），界面统一显示「跟长期助理对话」（纯
+// 文本，与侧栏入口同款口径）。这里只做显示层映射——内部标识（mode=assistant）、
+// 库里存的标题、以及所有按 mode/parentId 分流的功能逻辑都不动，所以旧会话不必重
+// 开、不用改数据，打开即显示新名。
+const ASSISTANT_MAIN_TITLE = '跟长期助理对话';
 // 是否「数字助理主对话」本体（它名下的子对话有自己的标题，不套用这个名字）
 function isAssistantMainSession(s) {
   return !!s && s.mode === 'assistant' && !s.parentId;
 }
-// 顶栏会话标题：数字助理主对话恒显示新名（内部带 b 的加粗结构，故走 innerHTML），
-// 其余会话照原样显示自己的标题。空标题 = 刚建、还没发出第一条消息的新会话
+// 顶栏会话标题：数字助理主对话恒显示新名（纯文本，与侧栏入口同款），其余会话照
+// 原样显示自己的标题。空标题 = 刚建、还没发出第一条消息的新会话
 // （服务端起标题后就换成真标题）
 function applySessTitle(s) {
   const el = $('sess-title');
-  if (isAssistantMainSession(s)) el.innerHTML = ASSISTANT_MAIN_TITLE_HTML;
+  if (isAssistantMainSession(s)) el.textContent = ASSISTANT_MAIN_TITLE;
   else el.textContent = (s && s.title) || '新工作任务';
 }
 
@@ -281,8 +294,213 @@ function snapshotStale(view, sid, incoming) {
   return (inc[inc.length - 1].seq || 0) < (cur[cur.length - 1].seq || 0);
 }
 
-async function loadSessionInto(id, tok) {
-  const data = await api('/api/sessions/' + id);
+/* ---------- 分批加载（超长对话）：初始只取最近一批，上翻再取更早批次 ----------
+   口径：每批 1000 条；视口上方已加载不足 500 条即预取下一批（给远程/手机网络
+   留提前量，衔接无感）。DOM 只在头部前插（已渲染节点永不重建——分批的核心
+   收益），配合 content-visibility 离屏跳过布局；回到底部 60 秒不上翻即释放
+   上方批次（DOM 与内存回到基础窗，下次上翻按同一机制重新加载，展开记忆还在） */
+const LOAD_BATCH = 1000;
+const LOAD_BUFFER = 500;
+const RELEASE_OLDER_MS = 60000;
+
+// seq→已加载索引：滚动预取判定要知道「视口顶附近的消息离已加载窗口顶还有几条」
+function buildSeqIndex(view) {
+  const st = view.state;
+  st._seqIdx = new Map();
+  (st.msgs || []).forEach((m, i) => { if (m.seq != null) st._seqIdx.set(m.seq, i); });
+}
+
+// older（服务端 {count,sys,tools,envBoundary}）→ groupTurns 的分组基线（与
+// 子对话继承段同一接力机制）：批次头部的 prompt 变更行据此显示「变更行」而
+// 非「首见完整交代」。envBoundary 不在这里带：摘要行会混入分组输入，覆盖
+// 边界由 sumAt 扫描自动推进到位
+function olderBaseOf(o) {
+  if (!o || (!o.sys && !o.tools)) return null;
+  return {
+    sawPrompt: true,
+    lastSys: o.sys || '',
+    lastToolsJson: o.tools ? JSON.stringify(o.tools) : '',
+    lastTools: o.tools || null,
+  };
+}
+
+// 顶条（#load-older）：剩余提示 / 加载中转圈 / 到底隐藏。点击立即取上一批
+// （onclick 挂在 setupScrollTuck，条本身常驻 DOM、只换内容）
+function renderLoadOlderBar(view) {
+  const bar = viewEl(view, 'load-older');
+  if (!bar) return;
+  const st = view.state;
+  if (st._loadingOlder) {
+    bar.classList.remove('hidden');
+    bar.classList.add('loading');
+    bar.innerHTML = '<span class="cl-spin"></span>正在加载更早消息…';
+    return;
+  }
+  bar.classList.remove('loading');
+  if (!st.older || !(st.older.count > 0)) { bar.classList.add('hidden'); return; }
+  bar.classList.remove('hidden');
+  bar.textContent = '上面还有 ' + st.older.count + ' 条更早消息，上翻自动加载';
+}
+
+// 取上一批更早消息并前插渲染：网络只拉这一批（before_seq 从当前窗口首条向前），
+// 已渲染的旧节点一个不动，视口按新增高度补差（用户停在原处不跳）。批次含
+// inherit 标记行（已到会话最开头）时走一次全量渲染——继承段要折成「来自主
+// 对话」块、已加载头部的克隆历史行要折进去，头部必须重建（只发生在翻到头，
+// 此时消息已接近全量，一次性成本与旧版打开全量相当）。返回是否成功落地
+// （jumpToMessage 据此决定是否继续补齐到目标消息）。
+async function loadOlder(view) {
+  view = view || mainView;
+  const st = view.state;
+  if (!st.cur || !st.older || !(st.older.count > 0) || st._loadingOlder) return false;
+  if (st._loading || !st.msgs || !st.msgs.length) return false; // 整包在途：由加载方收口
+  const sid = st.cur.id;
+  const firstSeq = st.msgs[0].seq; // 慢网落地校验：窗口可能已被重开/重置
+  st._loadingOlder = true;
+  cancelReleaseOlder(view); // 上翻即取消「到顶释放」计时
+  renderLoadOlderBar(view);
+  try {
+    const d = await api('/api/sessions/' + sid + '?before_seq=' + firstSeq + '&limit=' + LOAD_BATCH);
+    if (!st.cur || st.cur.id !== sid || !st.msgs.length || st.msgs[0].seq !== firstSeq) return false;
+    const batch = d.messages || [];
+    if (!batch.length) { st.older = { ...st.older, count: 0 }; return false; }
+    const older = d.older ? { ...d.older, count: d.older.count || 0 } : { count: 0 };
+    if (batch[0].kind === 'inherit') {
+      st.msgs = batch.concat(st.msgs);
+      st.older = older;
+      st._batches = []; // 全量重排：批记账作废（renderMessages 重建分支同样清）
+      renderMessages(st.msgs, view);
+      buildSeqIndex(view);
+      return true;
+    }
+    // 普通批次：分组输入 = 新批 + 已加载的摘要/压缩账本行（这两类 builder 不产
+    // 条目、只按 coversUpTo/覆盖区间归位——卡片与账本挂到新批内的真实发生位置，
+    // 落库在末尾的行不会丢归位）。基线取当前 older.base（该批之前的状态）
+    const relisted = st.msgs.filter((m) => displayKindOf(m) === 'summary' || isCompactNoteRow(m));
+    const input = batch.concat(relisted);
+    const resultOf = {};
+    for (const m of input) { if (m.role === 'tool' && m.tool_call_id) resultOf[m.tool_call_id] = m; }
+    reportedSubs = scanReported(batch.concat(st.msgs)); // 子任务卡完成态按全量已加载口径
+    const turns = groupTurns(input, resultOf, olderBaseOf(st.older));
+    const frag = document.createDocumentFragment();
+    turns.forEach((turn, ti) => {
+      appendTurn(frag, turn, sid + ':' + (turn.userMsg ? turn.userMsg.seq : 'head' + ti), view, false);
+    });
+    st.msgs = batch.concat(st.msgs);
+    const nodes = frag.childNodes.length;
+    // 视口补偿：按锚元素 rect 差精确归位——scrollHeight 在 content-visibility
+    // 下是估算值（离屏内容按 200px/条占位），+= dh 会累积偏差；程序写 scrollTop
+    // 还会抑制原生滚动锚定。锚＝视口中线命中的消息列直接子元素（与 anchorSave
+    // 同法，但不用它的 250ms 活动守卫：上翻触发加载时用户往往刚滚过，不补就跳）
+    let anchorEl = null, anchorTop = 0;
+    if (view._pinned) {
+      const vr = view.scroll.getBoundingClientRect();
+      let el = document.elementFromPoint(vr.left + vr.width / 2, vr.top + vr.height / 2);
+      if (el && view.col.contains(el)) {
+        while (el && el.parentElement !== view.col) el = el.parentElement;
+        if (el && el.parentElement === view.col) { anchorEl = el; anchorTop = el.getBoundingClientRect().top; }
+      }
+    }
+    view._renderTs = Date.now(); // 渲染钳位豁免窗口（同 renderMessages：补差与补测余波不当用户滚动）
+    view.col.insertBefore(frag, view.col.firstChild);
+    if (anchorEl) {
+      const dy = anchorEl.getBoundingClientRect().top - anchorTop;
+      if (dy) view.scroll.scrollTop += dy; // 锚元素被内容增长推下多少就补多少，纹丝不动
+    }
+    st.older = older;
+    st._pfxLen = (st._pfxLen || 0) + batch.length; // 前缀复用记账：分界内容未变，索引整体平移
+    st._pfxNodes = (st._pfxNodes || 0) + nodes;
+    (st._batches || (st._batches = [])).unshift({ msgCount: batch.length, nodeCount: nodes });
+    buildSeqIndex(view);
+    scheduleFolds();
+    maybeLoadOlder(view); // 批到齐后缓冲仍不足（视口贴着窗顶）则继续取
+    return true;
+  } catch (e) {
+    return false; // 取不到就保持现状（顶条还在，可再点/再滚）
+  } finally {
+    st._loadingOlder = false;
+    renderLoadOlderBar(view);
+  }
+}
+
+// 滚动预取判定（rAF 节流）：视口顶附近的消息离已加载窗口顶不足 LOAD_BUFFER
+// 条 → 取上一批。视口顶条目身份靠回合碎片自带的 data-seq / data-key（回合键
+// sid:seq），再经 seq 索引换算条数——按「条」而非「像素」判缓冲，消息高矮
+// 不均时也稳定。
+const loadOlderRAF = {};
+function maybeLoadOlder(view) {
+  view = view || mainView;
+  if (loadOlderRAF[view.key]) return;
+  loadOlderRAF[view.key] = requestAnimationFrame(() => {
+    loadOlderRAF[view.key] = 0;
+    const st = view.state;
+    if (!st.cur || !st.older || !(st.older.count > 0) || st._loadingOlder || st._loading) return;
+    const vr = view.scroll.getBoundingClientRect();
+    // 采样点取视口上 1/4 线（顶部可能被更新横幅/其他浮层盖住，elementFromPoint
+    // 会命中浮层；1/4 线平时落在消息列里，语义＝「视口上部那条消息距窗口顶
+    // 不足 500 条即预取」，与像素阈值相比按条计数不受消息高矮影响）
+    let el = document.elementFromPoint(vr.left + vr.width / 2, vr.top + Math.max(60, vr.height * 0.25));
+    if (!el || !view.col.contains(el)) return;
+    while (el && el.parentElement !== view.col) el = el.parentElement;
+    if (!el || el.parentElement !== view.col) return;
+    let seq = el.dataset ? el.dataset.seq : '';
+    if (!seq && el.dataset && el.dataset.key) seq = el.dataset.key.split(':')[1];
+    if (!seq || seq.startsWith('head')) return; // 截断头回合（无用户消息）不做锚
+    const idx = st._seqIdx && st._seqIdx.get(+seq);
+    if (idx == null || idx >= LOAD_BUFFER) return;
+    loadOlder(view);
+  });
+}
+
+// 「到顶释放」：回到底部（贴底跟随）后 60 秒不再上翻，就把上方已加载批次放
+// 掉——超长会话翻过几批后 DOM 重新上万节点，日常底部阅读用不到；下次上翻按
+// 同一机制重新加载（展开记忆在，重建后形态一致）
+function armReleaseOlder(view) {
+  view = view || mainView;
+  const st = view.state;
+  if (!st._batches || !st._batches.length || st._relTimer) return;
+  st._relTimer = setTimeout(() => releaseOlder(view), RELEASE_OLDER_MS);
+}
+function cancelReleaseOlder(view) {
+  view = view || mainView;
+  clearTimeout(view.state._relTimer);
+  view.state._relTimer = 0;
+}
+function releaseOlder(view) {
+  const st = view.state;
+  st._relTimer = 0;
+  if (!st._batches || !st._batches.length || st._loadingOlder || st._loading) return;
+  if (view._pinned) return; // 钉住阅读（哪怕停在底部附近）不释放
+  const sc = view.scroll;
+  if (sc.scrollHeight - sc.scrollTop - sc.clientHeight > FOLLOW_RESUME) return; // 不在底部
+  let msgCount = 0, nodeCount = 0;
+  st._batches.forEach((b) => { msgCount += b.msgCount; nodeCount += b.nodeCount; });
+  st._batches = [];
+  const h0 = sc.scrollHeight;
+  const wasBottom = h0 - sc.scrollTop - sc.clientHeight <= FOLLOW_RESUME; // 释放只在贴底态发生
+  view._renderTs = Date.now();
+  let rm = nodeCount;
+  while (rm > 0 && view.col.firstChild) { view.col.removeChild(view.col.firstChild); rm--; }
+  // content-visibility 的 scrollHeight 是估算值，按 dh 补差会留缺口；贴底态
+  // 释放后直接贴新底（触发条件本就要求贴底，else 只是防御）
+  if (wasBottom) sc.scrollTop = sc.scrollHeight;
+  else if (h0 - sc.scrollHeight > 0) sc.scrollTop = Math.max(0, sc.scrollTop - (h0 - sc.scrollHeight));
+  st.msgs = st.msgs.slice(msgCount);
+  st._pfxLen = Math.max(0, st._pfxLen - msgCount);
+  st._pfxNodes = Math.max(0, st._pfxNodes - nodeCount);
+  // 未加载条数加回释放的批次；基线恢复为基础窗的（这些消息下次上翻重新加载）
+  st.older = { count: ((st.older && st.older.count) || 0) + msgCount, ...(st._baseWinBase || {}) };
+  buildSeqIndex(view);
+  renderLoadOlderBar(view);
+}
+
+async function loadSessionInto(id, tok, opts) {
+  // stay＝停留本页的就地翻新（事件驱动 refreshCurrent）：同会话时保留已上翻
+  // 加载的分批窗口与阅读状态；跨会话/首次打开照旧走全新加载
+  const stay = !!(opts && opts.stay) && !!state.cur && state.cur.id === id;
+  // 分批加载：只取最近 LOAD_BATCH 条（超长对话整包要几 MB，打开即卡）；上方
+  // 剩余的 older 信息由顶条与上翻预取接管。旧后端不认 tail 参数（返回全量且
+  // 无 older 字段）→ 安全降级为现状
+  const data = await api('/api/sessions/' + id + '?tail=' + LOAD_BATCH);
   // 已被更新的导航（切换/回首页）取代：晚到的旧响应不落地，否则会把界面顶回旧会话
   if (tok !== navTok.main) return;
   state._loading = false; // 数据落地：退出加载态（必须在 renderMessages 之前）
@@ -298,10 +516,27 @@ async function loadSessionInto(id, tok) {
   // 落盘必须在 cur 改写之前（见 optimisticSwitch 的注释）：列表里查不到 brief 时
   // 不走乐观切换，cur 此刻还是上一个对话——先把它输入框里的字落到它自己的草稿键
   flushMainDraft();
+  // stay 的分批合并：与 reloadMessages 同款——只重取基础窗，已上翻加载的头部
+  // （seq 小于新窗首条）原样保留，older 扣掉已加载部分
+  if (stay && state.msgs && state.msgs.length && data.messages && data.messages.length) {
+    const head = state.msgs.filter((m) => m.seq < data.messages[0].seq);
+    if (head.length) {
+      data.messages = head.concat(data.messages);
+      if (data.older) data.older = { ...data.older, count: Math.max(0, (data.older.count || 0) - head.length) };
+    }
+  }
   state.cur = data.meta;
   state.msgs = data.messages || [];
+  // 分批记账：本窗之上的未加载条数与基线（释放批次时恢复到它）、批栈清零
+  state.older = data.older ? { ...data.older, count: data.older.count || 0 } : undefined;
+  if (!stay || !state._batches || !state._batches.length) {
+    // 全新加载/没有已加载批：基础窗跟新（释放批次时恢复到它的基线）
+    state._baseWinBase = data.older ? { sys: data.older.sys, tools: data.older.tools } : undefined;
+    state._batches = stay ? (state._batches || []) : [];
+  }
   state.pendingSteer = (data.pending && data.pending.steer) || [];
   state.pendingQueue = (data.pending && data.pending.queue) || [];
+  state.pendingVer = (data.pending && data.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
   state.queuePaused = !!(data.pending && data.pending.paused);
   // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
   state.queueHeld = state.pendingQueue.length > 0 && !state.queuePaused &&
@@ -322,8 +557,11 @@ async function loadSessionInto(id, tok) {
   // 统一走那里）；这里只剩「本对话来了没自动开过的待审批计划」这一件事——
   // 它在恢复之后跑，必要时把右栏翻到计划视图（比恢复优先：审批等不起）
   maybeAutoOpenPlan();
-  renderMessages(state.msgs, mainView, { jump: true });
+  // stay（事件就地翻新）不 jump：钉住阅读、展开记忆与视口全保留；全新打开
+  // 照旧 jump 到底并清记忆
+  renderMessages(state.msgs, mainView, stay ? null : { jump: true });
   renderQueueDock(mainView);
+  renderLoadOlderBar(mainView); // 分批顶条：有余量则提示「上面还有 N 条」
   // 打开即视为已读：清红点与绿点
   delete dotDone[id];
   if (state.cur && state.cur.unread) {
@@ -804,16 +1042,85 @@ function setSecOpen(sec, open) {
   if (open) showEl(body); else hideEl(body);
 }
 
-/* 继承段：子对话开头的「来自主对话」历史，整段折叠成一条，点开是完整对话流。
-   内部复用主线渲染（用户气泡 + 回合渲染），所以外观与正文完全一致；
-   父对话的系统提示词快照行也在其中（一目了然「含系统提示词」）。
+// 承接段懒加载缓存：sid → {rows: 已加载的更早行（父会话 seq 空间）, from: 游标,
+// left: 还有多少条更早的, loading, inited}。只在本页内存里，刷新即回到「更最近 N 条」。
+const inheritOlderCache = new Map();
+
+function inheritOlderOf(sid, mark) {
+  let c = inheritOlderCache.get(sid);
+  if (!c) {
+    c = { rows: [], from: 0, left: 0, loading: false, inited: false };
+    inheritOlderCache.set(sid, c);
+  }
+  if (!c.inited && mark) {
+    c.from = mark.from || 0;
+    c.left = Math.max(0, (mark.total || 0) - (mark.count || 0));
+    c.inited = true;
+  }
+  return c;
+}
+
+// 承接段的「更早 N 条」：回父会话取一批更早的行（只读接口，契约见
+// server.go handleSessionInherit），存进内存缓存后整段重渲染。
+async function loadInheritOlder(sid, sec) {
+  const view = viewOf(sid);
+  const st = view && view.state;
+  if (!st || !st.msgs || !st.msgs.length) return;
+  const cache = inheritOlderOf(sid, null);
+  if (!cache.from || cache.loading) return;
+  cache.loading = true;
+  const more = sec && sec.querySelector('.inherit-more');
+  if (more) { more.disabled = true; more.textContent = '加载中…'; }
+  try {
+    const r = await fetch('/api/sessions/' + encodeURIComponent(sid) + '/inherit?before_seq=' + cache.from + '&limit=200');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const rows = data.messages || [];
+    if (rows.length) {
+      cache.rows = rows.concat(cache.rows);
+      cache.from = rows[0].seq; // 父会话 seq 空间里的新游标
+      cache.left = (data.older && data.older.count) || 0;
+    } else {
+      cache.left = 0;
+    }
+    cache.loading = false;
+    // 承接段属于「前缀」（会话开头的折叠段），前缀复用判定命中就不会重建它——
+    // 必须先把前缀记账作废，否则加载回来的更早历史画不出来、按钮永远停在「加载中」。
+    st._pfxSid = null;
+    renderMessages(st.msgs, view);
+  } catch (e) {
+    cache.loading = false;
+    if (more) { more.disabled = false; more.textContent = '加载失败，点击重试'; }
+  }
+}
+
+/* 继承段（承接段）：子对话开头的「承接自 XX 会话」的历史，整段折叠成一条，点开是
+   完整对话流。内部复用主线渲染（用户气泡 + 回合渲染），所以外观与正文完全一致。
+   2026-11-16 起派生只承接「摘要 + 摘要边界之后的原文」：更早的父会话历史按需经
+   GET /api/sessions/{id}/inherit 懒加载（锚点里的 from/total 是游标），点一次取一批，
+   取到的行存在本页内存（inheritOlderCache），不写库、不改会话消息。
    turns 由 renderMessages 分组后传入（分组状态上的基线随 turns.base 带出，
    供正文段接着比——子对话首条 prompt 快照与父相同时不再重复显示）。 */
-function inheritBlock(turns, items, sid) {
+function inheritBlock(turns, items, sid, mark) {
   const key = sid + ':inherit';
   const sec = document.createElement('div');
   sec.className = 'tf-sec inherit';
   sec.dataset.key = key;
+  mark = mark || {};
+  const cache = inheritOlderOf(sid, mark);
+  // 「更早 N 条」只在有承接锚点（from/total）时出现：旧版子对话把父历史整段复制了
+  // 进来，本来就没有更早的可加载。
+  const olderLeft = cache.left || 0;
+  if (mark.from || cache.rows.length) {
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'inherit-more';
+    more.textContent = cache.loading ? '加载中…'
+      : olderLeft > 0 ? '更早 ' + olderLeft + ' 条（点击加载）' : '没有更早的历史了';
+    more.disabled = olderLeft <= 0 || !!cache.loading;
+    if (!more.disabled) more.onclick = () => loadInheritOlder(sid, sec);
+    sec.appendChild(more);
+  }
   const bar = document.createElement('button');
   bar.type = 'button';
   bar.className = 'turn-fold';
@@ -821,7 +1128,9 @@ function inheritBlock(turns, items, sid) {
   label.className = 'tf-label';
   // 环境快照行不显示（与正文一致），计数按可见条数
   const n = items.filter((m) => m.kind !== 'env').length;
-  label.textContent = '来自主对话 · ' + n + ' 条（含系统提示词）';
+  label.textContent = mark.title
+    ? '承接自「' + mark.title + '」· 最近 ' + n + ' 条'
+    : '来自主对话 · ' + n + ' 条（含系统提示词）'; // 旧锚点（没有 title）退回旧文案
   bar.appendChild(label);
   bar.insertAdjacentHTML('beforeend', chev('tf-chev'));
   const body = document.createElement('div');
@@ -919,9 +1228,15 @@ const ROW_ITEM_BUILDERS = {
     if (m.content) st.cur.items.push({ k: 'text', seq: m.seq, m, text: String(m.content) });
     for (const tc of m.tool_calls || []) {
       const n = (tc.function && tc.function.name) || '';
+      // 工具行类型：派发类升子任务卡；exit_plan_mode 升计划卡——**后台审批的
+      // 回执对（origin=toolreport）同样升格**：它的 args 回显了 plan 全文、
+      // result 是审批结论，批准/否决后对话里要留一张带审批状态的完整计划卡
+      // （2026-11-19 起；此前回执对一律按普通工具行折叠，审批完对话里只剩
+      // 一行「退出计划模式」，见《消息类型规范.md》§1.4）。其余照普通工具行
+      // 折叠（run_command 后台回报等不升格任何卡）。
       st.cur.items.push({
-        k: (n === 'dispatch_task' || n === 'dispatch_sub' || n === 'send_to_session') ? 'subtask'
-          : (n === 'exit_plan_mode' ? 'plancard' : 'tool'),
+        k: ((n === 'dispatch_task' || n === 'dispatch_sub' || n === 'send_to_session') ? 'subtask'
+          : (n === 'exit_plan_mode' ? 'plancard' : 'tool')),
         seq: m.seq, tc, result: st.resultOf[tc.id],
       });
     }
@@ -1154,6 +1469,21 @@ function userBubble(m, view) {
   return wrap;
 }
 
+// 后台模型摘要压缩进行中的会话（与后端 compactRunning 同源，经 SSE 维护）：
+// 渲染消息操作条时据此还原「后台压缩中…」按钮态——切走对话再切回来，
+// DOM 重建后状态不丢；压缩完成/失败事件到达时移除并刷新
+const compactingSess = new Set();
+
+// 压缩完成后按会话所在视图刷新（主视图或右栏子面板），不切换视图
+function refreshAfterCompact(sid) {
+  if (mainView.state.cur && mainView.state.cur.id === sid) {
+    openSession(sid);
+  } else if (typeof subState !== 'undefined' && subState.cur && subState.cur.id === sid) {
+    refreshDrawer();
+    openSubSession(sid);
+  }
+}
+
 // 悬停操作（仅回合最终输出）：复制原文 / 手动压缩 / 分支 / 插件扩展位
 function msgActions(m, opts) {
   opts = opts || {};
@@ -1173,26 +1503,30 @@ function msgActions(m, opts) {
   const cb = document.createElement('button');
   cb.className = 'act-copy act-compact';
   const cbOrig = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v5"/><path d="m9.5 5.5 2.5 2.5 2.5-2.5"/><path d="M12 21v-5"/><path d="m9.5 18.5 2.5-2.5 2.5 2.5"/><path d="M4 12h16"/></svg>压缩';
+  const cbBusy = () => compactingSess.has(m.sessionId || (state.cur && state.cur.id));
   cb.innerHTML = cbOrig;
   cb.title = '折叠这一轮及更早的对话（这一轮本身也在内）：保留用户输入与正文、工具调用名与参数，去掉思考过程与工具结果。这一段都已折叠过时再点一次，才进一步只留用户输入与结论。原文可随时用历史查询工具搜回';
+  // 后台压缩进行中（本窗口点的或别处点的）：渲染恢复时还原按钮态
+  if (cbBusy()) { cb.textContent = '后台压缩中…'; cb.disabled = true; }
   cb.onclick = async () => {
-    if (!state.cur || state.streaming) return;
+    if (!state.cur || state.streaming) { toast('对话正在执行，等这一轮结束再压缩'); return; }
     const sid = m.sessionId || state.cur.id;
-    cb.textContent = '压缩中…';
+    cb.textContent = '后台压缩中…';
     cb.disabled = true;
     try {
-      await api('/api/sessions/' + sid + '/compact', { method: 'POST', body: JSON.stringify({ upTo: m.seq }) });
-      cb.textContent = '已压缩';
-      // 会话可能不在主视图（子面板消息的按钮）：各自刷新，不切换视图
-      if (mainView.state.cur && mainView.state.cur.id === sid) {
-        openSession(sid);
-      } else if (typeof subState !== 'undefined' && subState.cur && subState.cur.id === sid) {
-        refreshDrawer();
-        openSubSession(sid);
+      const r = await api('/api/sessions/' + sid + '/compact', { method: 'POST', body: JSON.stringify({ upTo: m.seq }) });
+      if (r && r.async) {
+        // 模型摘要已放后台（202 即回，大历史摘要要一两分钟）：不等它——登记
+        // 状态后即可切走干别的，完成/失败由 SSE session_updated 驱动刷新
+        compactingSess.add(sid);
+      } else {
+        // 规则折叠零模型调用、同步已完成：立即刷新
+        cb.textContent = '已压缩';
+        refreshAfterCompact(sid);
+        setTimeout(() => { cb.innerHTML = cbOrig; cb.disabled = false; }, 1500);
       }
-      setTimeout(() => { cb.innerHTML = cbOrig; cb.disabled = false; }, 1500);
     } catch (e) {
-      alert('压缩失败：' + e.message);
+      toast('压缩失败：' + e.message, 6000);
       cb.innerHTML = cbOrig;
       cb.disabled = false;
     }
@@ -1893,12 +2227,15 @@ function fdiffAlign(a, b) {
 // 随同一响应返回（t.current）。右栏页签可反复点开，数据在页签打开时拉取。
 let fvwSid = '', fvwPath = '', fvwCpId = 0, fvwWrap = false;
 
-function openFileDiff(view, path, cp) {
+async function openFileDiff(view, path, cp) {
+  // 正在编辑另一个文件：切换会丢弃编辑区里的内容，先确认（同一个文件则沿用编辑器）
+  if (fvwEditing && path !== fvwPath &&
+      !(await confirmCenter('「' + fvwPath + '」还有没保存的修改，切到另一个文件会丢弃它们。继续？'))) return;
+  if (path !== fvwPath) fvwExitEdit();
   fvwSid = view.state.cur.id;
   fvwPath = path;
   fvwCpId = cp.id || 0;
-  rpOpen('file');
-  loadFileDiff();
+  rpOpen('file'); // 页签的 onOpen 会 loadFileDiff（编辑中则不重拉，保住编辑器里的内容）
 }
 
 // 空态：还没在看任何文件（页签手动点开 / 数据不属于当前会话）
@@ -1910,18 +2247,21 @@ function showFvEmpty(text) {
   note.textContent = '';
   note.classList.add('hidden');
   note.classList.remove('bad');
+  note.classList.remove('ok');
   const body = $('fvw-body');
   body.innerHTML = '';
   const tip = document.createElement('div');
   tip.className = 'fvw-empty';
   tip.textContent = text;
   body.appendChild(tip);
+  fvwEditable = false;
+  fvwSyncEditBtn();
 }
 
 function loadFileDiff() {
   if (!fvwSid || !fvwPath || !fvwCpId) {
     showFvEmpty('还没有正在查看的文件。\n到对话里的「文件改动」面板点一个文件行，这里会打开它的本次改动（整文件红绿对比）。');
-    return;
+    return Promise.resolve();
   }
   const p = $('fvw-path');
   p.textContent = fvwPath;
@@ -1931,8 +2271,9 @@ function loadFileDiff() {
   note.textContent = '';
   note.classList.add('hidden');
   note.classList.remove('bad');
+  note.classList.remove('ok');
   $('fvw-body').innerHTML = '<div class="fvw-empty">正在读取快照与当前内容…</div>';
-  api('/api/sessions/' + fvwSid + '/file-version?path=' + encodeURIComponent(fvwPath) +
+  return api('/api/sessions/' + fvwSid + '/file-version?path=' + encodeURIComponent(fvwPath) +
     '&id=' + encodeURIComponent(fvwCpId))
     .then(renderFileDiff)
     .catch((err) => {
@@ -1942,6 +2283,8 @@ function loadFileDiff() {
       tip.className = 'fvw-empty';
       tip.textContent = '读取失败：' + err.message;
       $('fvw-body').appendChild(tip);
+      fvwEditable = false;
+      fvwSyncEditBtn();
     });
 }
 
@@ -1953,14 +2296,18 @@ function renderFileDiff(t) {
   const note = $('fvw-note');
   const notes = [];
   const say = () => {
+    note.classList.remove('ok');
     if (notes.length) { note.textContent = notes.join('；'); note.classList.remove('hidden'); }
     else { note.textContent = ''; note.classList.add('hidden'); }
   };
   const cur = t.current || {};
+  // 「编辑」入口的可用性：编辑的是**当前**文件（不是历史版本），存在且是文本才给
+  fvwEditable = !!(cur.exists && !cur.binary);
+  fvwSyncEditBtn();
   if (t.binary || (cur.exists && cur.binary)) {
     $('fvw-stat').textContent = '二进制文件 · 不支持文本对比';
     note.textContent = '这个文件的内容是二进制（改动前 ' + (t.binary ? fmtBytes(t.size || 0) : '未知') +
-      '，当前 ' + (cur.exists ? fmtBytes(cur.size || 0) : '已不存在') + '）。文件工具只支持文本类文件，请点顶栏「打开方式」用系统默认程序打开。';
+      '，当前 ' + (cur.exists ? fmtBytes(cur.size || 0) : '已不存在') + '）。文件工具只支持文本类文件，请点顶栏「打开」用系统默认程序打开。';
     note.classList.add('bad');
     note.classList.remove('hidden');
     body.innerHTML = '';
@@ -2019,7 +2366,7 @@ function renderFileDiff(t) {
   say();
 }
 
-// 顶栏：折行切换（长行横向滚动 ↔ 折行）、用系统默认应用打开当前文件
+// 顶栏：折行切换（长行横向滚动 ↔ 折行）、编辑模式、用系统默认应用打开当前文件
 // （open-path 用户手势直通端点，与浏览器页签「打开方式」同一链路）与重新读取
 $('fvw-wrap').onclick = () => {
   fvwWrap = !fvwWrap;
@@ -2027,26 +2374,188 @@ $('fvw-wrap').onclick = () => {
   $('fvw-wrap').title = fvwWrap ? '当前：长行折行显示（点击改为横向滚动）' : '当前：长行横向滚动（点击改为折行显示）';
   const tbl = $('fvw-body').querySelector('.fdiff-table');
   if (tbl) tbl.classList.toggle('wrap', fvwWrap);
+  $('fvw-editor').classList.toggle('wrap', fvwWrap);
 };
 $('fvw-sysopen').onclick = () => {
   if (!fvwSid || !fvwPath) return; // 空态（没在看任何文件）：无事可做
   api('/api/sessions/' + encodeURIComponent(fvwSid) + '/open-path', { method: 'POST', body: JSON.stringify({ path: fvwPath }) })
     .catch((e) => alert('打开失败：' + e.message));
 };
-$('fvw-reload').onclick = () => loadFileDiff();
+$('fvw-reload').onclick = () => { if (!fvwEditing) loadFileDiff(); };
+
+/* ---------- 编辑模式：最新全文 → textarea → 保存 / 取消 ----------
+   与只读 diff 共用同一个页签：进编辑后 diff 区让位、底部出现「保存 / 取消」。
+   数据走 GET/POST /api/sessions/{id}/file（fileedit.go）：读侧下发文件**当前
+   全文**与版本标识（hash + mtime），保存时带回——磁盘内容已被别的程序改过就
+   409 拒绝，界面上的旧稿绝不静默盖掉别人的新内容。保存前服务端自动把旧内容
+   存成该文件的历史版本（对话里「历史版本」里可回退）。
+   编辑中切换文件/会话/页签会丢弃未保存的内容（切换文件会先问一句）。 */
+let fvwEditing = false; // 编辑中：diff 区让位，textarea 接管
+let fvwSaving = false;  // 保存中：按钮禁用防连点
+let fvwEditable = false; // 当前文件可不可以编辑（存在 + 是文本）
+let fvwBase = null;     // 打开编辑时读到的版本标识：{ hash, mtime, lineEndings, text }
+
+// 「编辑」按钮可用性：编辑中或文件不可编辑（不存在 / 二进制 / 还没打开文件）就灰掉
+function fvwSyncEditBtn() {
+  const b = $('fvw-edit');
+  b.disabled = fvwEditing || !fvwEditable;
+  b.classList.toggle('on', fvwEditing);
+  b.textContent = fvwEditing ? '编辑中' : '编辑';
+}
+
+// 提示条：text 空 = 收起；bad=true 红底（编辑失败 / 冲突）
+function fvwSetNote(text, bad) {
+  const note = $('fvw-note');
+  note.textContent = text || '';
+  note.classList.toggle('hidden', !text);
+  note.classList.toggle('bad', !!bad);
+  note.classList.toggle('ok', !bad && !!text);
+}
+
+// 编辑态与只读态的界面切换（不碰数据，纯 DOM）
+function fvwEditMode(on) {
+  fvwEditing = on;
+  $('fvw-body').classList.toggle('hidden', on);
+  $('fvw-edit-wrap').classList.toggle('hidden', !on);
+  $('fvw-edit-bar').classList.toggle('hidden', !on);
+  // 编辑中不许「重新读取 / 打开方式 / 折行折行以外」搅局：重读会冲掉正在改的
+  // 内容，交给外部程序改会和编辑器里的稿子互相覆盖——都由保存/取消收尾
+  $('fvw-reload').disabled = on;
+  $('fvw-sysopen').disabled = on;
+  $('fvw-save').disabled = false;
+  $('fvw-cancel').disabled = false;
+  $('fvw-save').textContent = '保存';
+  $('fvw-editor').classList.toggle('wrap', fvwWrap);
+  fvwSyncEditBtn();
+}
+
+// 退出编辑态（取消 / 保存成功 / 切走会话都走这里）：回到只读 diff 视图
+function fvwExitEdit() {
+  if (!fvwEditing) return;
+  fvwEditMode(false);
+  fvwBase = null;
+  fvwSaving = false;
+  $('fvw-editor').value = '';
+  $('fvw-edit-hint').textContent = '';
+}
+
+// 进编辑：读文件当前全文（2MB 以内、文本），填进 textarea
+async function fvwOpenEdit() {
+  if (!fvwSid || !fvwPath || fvwEditing) return;
+  $('fvw-edit').disabled = true;
+  fvwSetNote('读取最新内容…');
+  try {
+    const d = await api('/api/sessions/' + encodeURIComponent(fvwSid) + '/file?path=' + encodeURIComponent(fvwPath));
+    fvwBase = { hash: d.hash || '', mtime: d.mtime || 0, lineEndings: d.lineEndings || 'lf', text: String(d.text ?? '') };
+    $('fvw-editor').value = fvwBase.text;
+    fvwEditMode(true);
+    $('fvw-edit-hint').textContent = '编辑中 · ' + (d.encoding || '文本') + ' · ' + fmtBytes(d.size || 0) +
+      ' · 保存前会自动留旧版本，可在对话里的「历史版本」回退';
+    fvwSetNote('');
+    const ta = $('fvw-editor');
+    ta.scrollTop = 0; ta.scrollLeft = 0;
+    ta.focus();
+  } catch (err) {
+    fvwSetNote(err.message || '读不到这个文件，无法编辑', true);
+    fvwSyncEditBtn();
+  }
+}
+
+// 保存：带打开时读到的版本标识回去，服务端校验磁盘没被别人改过才写
+async function fvwSaveEdit() {
+  if (!fvwEditing || fvwSaving || !fvwBase) return;
+  const ta = $('fvw-editor');
+  const text = ta.value;
+  const btn = $('fvw-save');
+  fvwSaving = true;
+  btn.disabled = true;
+  $('fvw-cancel').disabled = true;
+  btn.textContent = '保存中…';
+  $('fvw-edit-hint').textContent = '保存中…';
+  ta.disabled = true;
+  try {
+    const d = await api('/api/sessions/' + encodeURIComponent(fvwSid) + '/file', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: fvwPath, content: text,
+        hash: fvwBase.hash, mtime: fvwBase.mtime || 0, lineEndings: fvwBase.lineEndings,
+      }),
+    });
+    fvwBase = { hash: d.hash || '', mtime: d.mtime || 0, lineEndings: d.lineEndings || fvwBase.lineEndings, text };
+    fvwExitEdit();
+    ta.disabled = false;
+    await loadFileDiff(); // 只读视图按磁盘现状重画（行数统计、历史版本都跟着最新）
+    const saved = '已保存' + (d.versioned === false
+      ? '（文件快照已关闭，本次没留历史版本）'
+      : '（旧内容已存为该文件的历史版本，可在「历史版本」里回退）') + '：' + fvwPath;
+    const note = $('fvw-note');
+    note.textContent = note.classList.contains('hidden') ? saved : saved + '；' + note.textContent;
+    note.classList.remove('hidden', 'bad');
+    note.classList.add('ok');
+    toast('已保存：' + fvwPath);
+  } catch (err) {
+    // 失败时**保留编辑区内容**（用户打的字不能丢），只给原因与可操作的提示
+    ta.disabled = false;
+    btn.textContent = '保存';
+    btn.disabled = false;
+    $('fvw-cancel').disabled = false;
+    const conflict = err.status === 409;
+    $('fvw-edit-hint').textContent = conflict
+      ? '没有写回：磁盘上的文件已经变了（内容仍在编辑区，可复制备查）'
+      : '保存失败（内容仍在编辑区）';
+    fvwSetNote(err.message || '保存失败，请重试', true);
+  } finally {
+    fvwSaving = false;
+  }
+}
+
+// 取消：不动文件，直接回只读视图；有未保存修改先确认一次
+async function fvwCancelEdit() {
+  if (!fvwEditing || fvwSaving) return;
+  // 确认框是全局单例（confirmCenter 只留一个 resolver）：已经有一个在等回答时
+  // 不再叠一个，否则前一个永远不会被 resolve（连点「取消」就能踩到）
+  if (!$('confirm-modal').classList.contains('hidden')) return;
+  if (fvwBase && $('fvw-editor').value !== fvwBase.text) {
+    if (!(await confirmCenter('放弃对「' + fvwPath + '」的修改？\n文件保持原样，改过的内容不会保存。'))) return;
+  }
+  fvwExitEdit();
+  fvwSetNote('');
+  if (!$('fvw-body').querySelector('.fdiff-table, .fvw-empty')) loadFileDiff(); // 只读区空着才重取
+}
+
+$('fvw-edit').onclick = () => fvwOpenEdit();
+$('fvw-save').onclick = () => fvwSaveEdit();
+$('fvw-cancel').onclick = () => fvwCancelEdit();
+// 编辑区快捷键：Ctrl/Cmd+S 保存，Esc 取消（与对话里编辑消息同一套手感）。
+// Esc 必须就地 stopPropagation：document 上那条全局 Esc 处理器会关「正在打开的
+// 确认框」——我们的取消确认框正是在这次按键里同步打开的，不拦住就会被立刻关掉。
+$('fvw-editor').addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+    e.preventDefault();
+    e.stopPropagation();
+    fvwSaveEdit();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    fvwCancelEdit();
+  }
+});
 
 // 右栏页签注册：与子对话/计划同一套机制。会话态记"这个会话正在看哪个文件的
 // 哪次改动"，切走再切回（面板开着时 rpOpen 的 onOpen 会重拉）能回到原文件。
 rpRegister('file', {
   title: '文件', order: 2.5,
-  onOpen: () => { loadFileDiff(); },
+  onOpen: () => { if (!fvwEditing) loadFileDiff(); },
   saveSession: () => ({ sid: fvwSid, path: fvwPath, cpId: fvwCpId, wrap: fvwWrap }),
   restoreSession: (d) => {
+    fvwExitEdit(); // 换会话：编辑中的内容丢弃（编辑器不跨会话，也不留别人的稿子）
     fvwSid = (d && d.sid) || '';
     fvwPath = (d && d.path) || '';
     fvwCpId = (d && d.cpId) || 0;
     fvwWrap = !!(d && d.wrap);
     $('fvw-wrap').classList.toggle('on', fvwWrap);
+    fvwEditable = false;
+    fvwSyncEditBtn();
     // 数据不在这里拉：面板开着时 rpOpen('file') 的 onOpen 会 loadFileDiff；
     // 收着时等用户点开页签再拉（旧对话的正文不会被画出来）
   },
@@ -2711,6 +3220,7 @@ function renderMessages(msgs, view, opts) {
     // （#home-composer），这里绝不能拿 emptyHTML 顶掉它——销毁问候区等于销毁 #input
     if (!st.cur) return;
     st._pfxSid = null;
+    renderLoadOlderBar(view); // 空态没有「更早」可言：顶条收起
     box.innerHTML = view.emptyHTML;
     // 首条消息已发出、还没回显：空态（首页问候）下面也立显「发送中」占位
     const ps0 = pendingSendOf(st, msgs, (st.cur && st.cur.id) || '');
@@ -2736,20 +3246,29 @@ function renderMessages(msgs, view, opts) {
     Object.keys(turnOpen).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) delete turnOpen[k]; });
     Array.from(foldOpenMem.keys()).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) foldOpenMem.delete(k); });
     Array.from(procOpenMem.keys()).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) procOpenMem.delete(k); });
+    st._batches = []; // 全新加载：分批窗口重置（loadSessionInto 已设好新 older）
+    cancelReleaseOlder(view);
   }
   anchorSave(view); // 任何重建（前缀全量重建/尾部重建）之前锚定视口（仅钉住阅读时生效）
   // 子对话开头的继承段（后端克隆父对话时写入的标记行 + N 条历史）：
   // 折叠成一条「来自主对话」折叠条，其余消息照常渲染。继承段先分组，
   // 正文段从它分组后的基线接着比——子对话自己的 prompt 快照与父对话相同
   // 时不再重复显示「工具定义/系统提示词」（真变了才出变更行）。
-  let inherited = null, rest = msgs, off = 0, inhTurns = null;
+  let inherited = null, rest = msgs, off = 0, inhTurns = null, inhMark = null;
   if (msgs[0].kind === 'inherit') {
-    let n = 0;
-    try { n = JSON.parse(String(msgs[0].content ?? '{}')).count || 0; } catch (e) { /* 坏行就当没有继承段 */ }
+    let mark = {};
+    try { mark = JSON.parse(String(msgs[0].content ?? '{}')) || {}; } catch (e) { /* 坏行就当没有继承段 */ }
+    inhMark = mark;
+    const n = mark.count || 0;
     inherited = msgs.slice(1, 1 + n);
     rest = msgs.slice(1 + n);
     off = 1 + n;
+    // 懒加载过的更早历史（本页内存）：拼在承接段前面一起分组、一起折叠
+    const cache = inheritOlderOf(sid, mark);
+    if (cache.rows.length) inherited = cache.rows.concat(inherited);
     inhTurns = groupTurns(inherited, resultOf);
+  } else {
+    inheritOlderCache.delete(sid); // 不是子对话（或旧会话没有标记行）：缓存作废
   }
   const kRel = lastTurnStart(rest);
   const k = kRel < 0 ? off : off + kRel; // 前缀长度：无真实用户消息时继承段之后全算尾部
@@ -2760,7 +3279,7 @@ function renderMessages(msgs, view, opts) {
     && st._pfxNodes > 0 && box.children.length >= st._pfxNodes;
   if (!reusable) {
     box.innerHTML = '';
-    if (inhTurns) box.appendChild(inheritBlock(inhTurns, inherited, sid));
+    if (inhTurns) box.appendChild(inheritBlock(inhTurns, inherited, sid, inhMark));
     turns.forEach((turn, ti) => {
       if (ti === turns.length - 1) return; // 最后一回合属尾部
       appendTurn(box, turn, sid + ':' + (turn.userMsg ? turn.userMsg.seq : 'head' + ti), view, false);
@@ -2769,6 +3288,7 @@ function renderMessages(msgs, view, opts) {
     st._pfxLen = k;
     st._pfxSeq = msgs[k - 1] ? msgs[k - 1].seq : 0;
     st._pfxNodes = box.children.length;
+    st._batches = []; // 前缀重建（编辑重发/切回）：批记账对应的旧节点已不存在
   }
   // 尾部每次全量重建：最后一回合（流式中走尾部窗口）+ 待生效插话。
   // 渲染前记时间戳：移除尾部的瞬间内容变矮，浏览器会把 scrollTop 钳到临时
@@ -2795,6 +3315,27 @@ function renderMessages(msgs, view, opts) {
   // 数字助理派发注入的插话（kind=aiuser）按「AI 用户」气泡渲染（右对齐偏白，
   // 落库后形态一致）；report 类系统通知仍走 sysnote 那套左对齐通知。
   (st.pendingSteer || []).forEach((pm) => {
+    if (pm.toolName) {
+      // 合成工具回执对（后台回执）在等注入：一条通知样式的占位，落库后由
+      // message 事件替换成正式的工具行（参数+结果折叠）——不画用户气泡
+      const nw = document.createElement('div');
+      nw.className = 'msg sysnote pending-steer';
+      nw.dataset.pendingSteer = pm.id;
+      const nb = document.createElement('div');
+      nb.className = 'bubble';
+      const badge = document.createElement('span');
+      badge.className = 'q-badge q-badge-steer';
+      badge.textContent = '后台回执待注入';
+      nb.appendChild(badge);
+      const prev = document.createElement('span');
+      const txt = String(pm.content || '');
+      prev.textContent = ' ' + pm.toolName + '：' + (txt.length > 160 ? txt.slice(0, 160) + '…' : txt);
+      prev.title = txt;
+      nb.appendChild(prev);
+      nw.appendChild(nb);
+      tail.appendChild(nw);
+      return;
+    }
     if (pm.kind === 'report') {
       const nw = document.createElement('div');
       nw.className = 'msg sysnote';
@@ -2846,6 +3387,7 @@ function renderMessages(msgs, view, opts) {
   followScroll(view, jump);
   anchorRestore(view); // 钉住阅读时按锚点补差（followScroll 在钉住态不写 scrollTop，不会互相覆盖）
   scheduleFolds(); // 气泡折叠：渲染完按实际高度重算（主对话与右栏子对话列都算）
+  buildSeqIndex(view); // seq→索引：滚动预取判定用（msgs 变化的主路径都走这里刷新）
 }
 
 /* ---------- 回合过程区：一条渲染路径，两套可见策略 ---------- */
@@ -3042,6 +3584,42 @@ function connectEvents() {
   } catch (e) { /* 不支持 SSE 时退化为手动刷新 */ }
 }
 
+/* ---------- 远程壳「刷新」：重连 + 补拉（jx-link 首页浮条右侧那颗刷新按钮） ----------
+   手机远程访问时断的往往不是「页面」，而是两条长连接：全局事件流 /api/events 与
+   当前会话的执行流。它们各自有重连，但真掉线过一轮之后状态未必都对得上（SSE 垫片
+   3 秒自连、执行流接不回就只剩一页静态消息）。用户点刷新要的是「现在就对一次」，
+   而不是整页 reload——整页 reload 会把他打到一半的输入与滚动位置一起清掉。
+   所以这里只做三件事，别的一概不动：
+   ① 关掉旧的 /api/events 连接重建（远程模式下它就是 remote-boot 的
+      RemoteEventSource 垫片：close 会停掉它的重连定时器，不会留下两条流；
+      重连成功的 onopen 顺带补拉审批/提问清单）；
+   ② 当前会话若正跟着执行流，先断掉这条本地流，再按后端是否还在跑重新接；
+   ③ reloadMessages 把断线期间漏掉的消息补回来（会话清单也顺手对一次）。
+   探不到电脑端就直接抛出去：由壳提示「网络未恢复」并给整页刷新的兜底。 */
+async function reconnectRemote() {
+  const view = mainView;
+  const sid0 = view.state.cur && view.state.cur.id;
+  try { if (eventStream) eventStream.close(); } catch (e) { /* 已经断了 */ }
+  eventStream = null;
+  connectEvents();                  // ① 事件流重建
+  const probe = api('/api/status'); // 「网络恢复了吗」的判据：电脑端答得上话
+  if (sid0) detachStream(view);     // ② 断掉本地这条流；后端执行照旧跑，不受影响
+  await probe;
+  await loadSessions();             // 断线期间可能新建/改名/归档过会话
+  if (!sid0 || !view.state.cur || view.state.cur.id !== sid0) return; // 首页或已切走
+  if (await backendRunning(sid0, view)) attachRun(view); // 还在跑：接回执行流（内部先 reloadMessages）
+  else await reloadMessages(view);                       // ③ 没在跑：补拉当前会话
+}
+
+// 壳调用的入口（DeviceActivity 用 evaluateJavascript 注入）：结果要回给原生壳，所以
+// 走 JXLink 桥的 refreshDone——浏览器里没有这个桥，只留一行日志，页面本身不受影响。
+window.jxRemoteRefresh = function () {
+  const done = (ok) => {
+    try { if (window.JXLink && window.JXLink.refreshDone) window.JXLink.refreshDone(!!ok); } catch (e) { /* 桥不在：忽略 */ }
+  };
+  reconnectRemote().then(() => done(true), (e) => { console.warn('[JX] 远程刷新失败', e); done(false); });
+};
+
 function removeLive(view) {
   clearTimeout(livePendingTimer); // 降频档的补渲染定时器随 live 清场一起作废
   livePendingTimer = 0;
@@ -3060,7 +3638,9 @@ const navTok = { main: 0, sub: 0 };
 
 function refreshCurrent() {
   if (navBusy.main) return; // 正在切换：别插队
-  if (state.cur && !state.streaming) openSession(state.cur.id);
+  // 事件驱动的就地翻新走 stay：保留视口（钉住阅读不被拽到底）、展开记忆与
+  // 已上翻加载的分批窗口（旧路径 jump 全重置——子对话回报一多阅读就被打断）
+  if (state.cur && !state.streaming) openSession(state.cur.id, { stay: true });
 }
 
 // 事件驱动的整包重取节流（见《前端渲染性能分析-主对话卡顿.md》）：子对话回报/
@@ -3156,8 +3736,8 @@ function handleGlobalEvent(ev) {
       break;
     case 'pending':
       // 插话/排队队列变化：只更新对应的那个视图（自己窗口的操作也会推回来，天然多端一致）
-      if (state.cur && ev.sessionId === state.cur.id) applyPending(mainView, ev.pending);
-      if (subState.cur && ev.sessionId === subState.cur.id) applyPending(subView, ev.pending);
+      if (state.cur && ev.sessionId === state.cur.id) applyPending(mainView, ev.pending, ev.sessionId);
+      if (subState.cur && ev.sessionId === subState.cur.id) applyPending(subView, ev.pending, ev.sessionId);
       break;
     case 'stopped':
       // 用户显式停止（runtime.go 终态广播）：不算「完成未查看」，只刷列表
@@ -3200,15 +3780,28 @@ function handleGlobalEvent(ev) {
         loadSessions().then(() => applySessionPermFromList(ev.sessionId));
       }
       refreshDrawer();
+      // 后台模型摘要压缩的状态机（手动/提前自动压缩 202 即回、goroutine 悄悄跑）：
+      // started 登记并翻新出「后台压缩中…」按钮态；完成（reason=compact）或失败
+      // 移除登记——多窗口/切走对话再切回都靠这张表还原状态
+      const creason = ev.data && ev.data.reason;
+      if (creason === 'compact_started') {
+        compactingSess.add(ev.sessionId);
+      } else if (creason === 'compact' || creason === 'compact_failed') {
+        compactingSess.delete(ev.sessionId);
+      }
+      if (creason === 'compact_failed') {
+        toast('后台压缩失败：' + ((ev.data && ev.data.error) || '未知原因'), 8000);
+      }
       // 压缩改写了历史（reason=compact：compact 标记 UPDATE、摘要行落库，均不
       // 改变消息条数与末条 seq）——前缀缓存主动作废，否则前缀复用判定永远命中，
       // 边界处的「已折叠」行与压缩卡片在流式期间与就地翻新中出不来（要等切换
       // 会话/刷新页面才全量重建）。作废后：非流式由下方 refreshCurrentSoon 立即
       // 重建；流式中等下一条 message 事件或 done 后的翻新落地
-      if (ev.data && ev.data.reason === 'compact') {
+      if (creason === 'compact') {
         if (viewing) mainView.state._pfxSid = null;
         if (subViewing) subView.state._pfxSid = null;
       }
+      if ((creason === 'compact_started' || creason === 'compact_failed') && subViewing && !subState.streaming) refreshCurrentSub();
       if (viewing && !state.streaming) refreshCurrentSoon();
       break;
     case 'title':
@@ -3235,6 +3828,10 @@ function handleGlobalEvent(ev) {
     case 'question_resolved':
       removeQuestion(ev.questionId);
       break;
+    case 'async_ask_changed':
+      // 后台等待项增/删/处理：面板那一栏跟着刷新
+      loadProgress();
+      break;
     case 'question_deadline':
       // 停表广播（本窗口或其他端触发的）：就地更新倒计时显示，不重建卡片
       //（重建会丢自由输入框的焦点）
@@ -3242,8 +3839,8 @@ function handleGlobalEvent(ev) {
         const q = state.questions.find((x) => x.id === ev.questionId);
         if (q && !q.timerHeld) { q.timerHeld = true; q.deadlineMs = 0; }
         if (q) document.querySelectorAll('.q-card[data-qid="' + ev.questionId + '"]').forEach((card) => {
-          const chip = card.querySelector('.q-count');
-          if (chip) paintQCount(chip, q, Date.now());
+          // 折叠态那一行也有一枚倒计时：一起刷（见 askFoldDecor）
+          card.querySelectorAll('.q-count').forEach((chip) => paintQCount(chip, q, Date.now()));
           const stop = card.querySelector('.q-stop');
           if (stop) stop.classList.add('hidden');
         });
@@ -3252,6 +3849,11 @@ function handleGlobalEvent(ev) {
     case 'ask_alert':
       // 久等未答的声光提醒（叮声后端已响）：全屏闪烁 + 朗读，点击跳去作答
       showAskAlert(ev);
+      break;
+    case 'ask_alert_dismiss':
+      // 桌面全屏蒙层（后端的第二处提醒）被点掉了：主窗口这层一起收——
+      // 两处提醒任意点一处、两边同退（另一半边见 hideAskAlert 里的 POST）
+      hideAskAlert();
       break;
     case 'children':
       // 本会话有子进程起/停：刷新进度面板底部的「运行中的程序」
@@ -3471,7 +4073,9 @@ function planPendingIdOf(plan) {
 }
 
 // 计划卡：标题 + 首段 + 「查看计划」（打开右栏并定位到这一份）。正文取不到
-// （参数是坏行）时退回普通工具行，别造一张空卡。
+// （参数是坏行）时退回普通工具行，别造一张空卡。result 非空 = 已有审批结论
+// （同步调用的返回文本 / 后台回执对的回执正文）：头部亮出「计划已审批 /
+// 未通过 / 已取消」状态——用户批完一眼看到结论，而不是永远停在「计划已提交」。
 function planCardRow(tc, seq, result) {
   let plan = '';
   try { plan = String(JSON.parse((tc && tc.function && tc.function.arguments) || '{}').plan || '').trim(); } catch (e) { plan = ''; }
@@ -3479,13 +4083,23 @@ function planCardRow(tc, seq, result) {
   const info = planSummaryOf(plan);
   const pendingId = planPendingIdOf(plan);
   const sid = (result && result.sessionId) || (state.cur && state.cur.id) || '';
+  // 审批状态：还在等 → 待审批；有结果文本 → 按结论词归类；两者皆无（刚提交
+  // 且提问卡已收的间隙）→ 维持「计划已提交」
+  const resText = result && typeof result.content === 'string' ? result.content : '';
+  let label = '计划已提交', badge = '';
+  if (pendingId) {
+    badge = '<span class="pc-badge">待审批</span>';
+  } else if (resText) {
+    if (/已通过|批准了|已批准/.test(resText)) { label = '计划已审批'; badge = '<span class="pc-badge ok">已通过</span>'; }
+    else if (/已取消|取消了/.test(resText)) { label = '计划已取消'; badge = '<span class="pc-badge">已取消</span>'; }
+    else if (/未通过|没有批准|未批准/.test(resText)) { label = '计划未通过'; badge = '<span class="pc-badge">未通过</span>'; }
+  }
   const card = document.createElement('div');
-  card.className = 'plan-card' + (pendingId ? ' pending' : '');
+  card.className = 'plan-card' + (pendingId ? ' pending' : (label === '计划已审批' ? ' approved' : ''));
   if (seq != null) card.dataset.seq = seq;
   const head = document.createElement('div');
   head.className = 'pc-head';
-  head.innerHTML = '<b>计划已提交</b>' +
-    (pendingId ? '<span class="pc-badge">待审批</span>' : '');
+  head.innerHTML = '<b>' + label + '</b>' + badge;
   const body = document.createElement('div');
   body.className = 'pc-body';
   body.innerHTML = '<p class="pc-title">' + esc(info.title) + '</p>' +
@@ -3535,6 +4149,7 @@ function removeApproval(id) {
   hideAskAlertIfMatched(id); // 声光提醒正为它闪着：审批已决定/超时收卡，收起并取消朗读
   state.approvals = state.approvals.filter((a) => a.id !== id);
   askDraftClear(id);
+  askFolded.delete('a:' + id); // 卡没了，折叠状态也一并清掉（同一 id 不会再来）
   renderPanels();
 }
 
@@ -3564,12 +4179,16 @@ async function decideApproval(id, approved, always) {
 
 function pushQuestion(ev) {
   if (!ev.questionId || state.questions.some((q) => q.id === ev.questionId)) return;
+  // 后台等待项（async-ask/async-perm/async-plan）：与同步提问同一张卡，只是
+  // 来源标记不同——无倒计时（到期只回执、不视为放行），标题带「（后台）」
+  const isAsync = ev.kind === 'async-ask' || ev.kind === 'async-perm' || ev.kind === 'async-plan';
   state.questions.push({
     id: ev.questionId, sessionId: ev.sessionId || '', sessionTitle: ev.title || '',
-    kind: ev.kind || 'ask', question: ev.summary || '', plan: ev.plan || '',
+    kind: ev.kind === 'async-ask' ? 'ask' : (ev.kind || 'ask'), owner: isAsync ? 'async' : '',
+    question: ev.summary || '', plan: ev.plan || '',
     options: ev.options || [],
-    deadlineMs: ev.deadlineMs || 0, timerHeld: !!ev.held, // 倒计时（仅 ask/enter-plan 有）
-    noTimeout: !!ev.noTimeout, // 模型显式不限时（timeout_sec=0）：一直等用户作答
+    deadlineMs: isAsync ? 0 : (ev.deadlineMs || 0), timerHeld: isAsync ? false : !!ev.held, // 倒计时（仅 ask/enter-plan 有）
+    noTimeout: isAsync ? true : !!ev.noTimeout, // 模型显式不限时（timeout_sec=0）：一直等用户作答；后台项一律不限时
   });
   renderPanels();
   noteFreshPlanQuestions(); // 新到达的计划：右栏切到这一份（别停在上次看的那版）
@@ -3578,21 +4197,33 @@ function pushQuestion(ev) {
 
 function removeQuestion(id) {
   const q = state.questions.find((x) => x.id === id);
-  if (q && q.kind === 'plan') stashPlanDoc(q); // 提问没了，计划本身要留在右栏（持久化）
+  if (q && (q.kind === 'plan' || q.kind === 'async-plan')) stashPlanDoc(q); // 提问没了，计划本身要留在右栏（持久化）
   hideAskAlertIfMatched(id); // 声光提醒正为它闪着：问题解决了就收起
   state.questions = state.questions.filter((x) => x.id !== id);
   askDraftClear(id);
+  askFolded.delete('q:' + id); // 卡没了，折叠状态也一并清掉（同一 id 不会再来）
+  if (openedAsync.delete(id) || (q && q.owner === 'async')) loadProgress(); // 后台项处理完：面板那一行同步消失
   renderPanels();
 }
 
 async function loadQuestions() {
   try {
     const d = await api('/api/questions');
-    state.questions = (d.questions || []).map((q) => ({
-      id: q.id, sessionId: q.sessionId, sessionTitle: q.sessionTitle || '',
-      kind: q.kind || 'ask', question: q.question || '', plan: q.plan || '', options: q.options || [],
-      deadlineMs: q.deadlineMs || 0, timerHeld: !!q.timerHeld, noTimeout: !!q.noTimeout,
-    }));
+    state.questions = (d.questions || []).map((q) => {
+      const item = {
+        id: q.id, sessionId: q.sessionId, sessionTitle: q.sessionTitle || '',
+        kind: q.kind === 'async-ask' ? 'ask' : (q.kind || 'ask'), owner: q.owner || '',
+        question: q.question || '', plan: q.plan || '', options: q.options || [],
+        deadlineMs: q.deadlineMs || 0, timerHeld: !!q.timerHeld, noTimeout: !!q.noTimeout,
+      };
+      if (item.owner === 'async') { item.deadlineMs = 0; item.timerHeld = false; item.noTimeout = true; }
+      return item;
+    });
+    // 用户已经点开的后台项不在 /api/questions 里（它们只在面板列着），轮询后补回来
+    const seen = new Set(state.questions.map((q) => q.id));
+    for (const a of pgAsks) {
+      if (openedAsync.has(a.id) && !seen.has(a.id)) state.questions.push(asyncToQuestion(a));
+    }
     renderPanels();
     noteFreshPlanQuestions(); // 新到达的计划（含重启后拉回的待审批）：右栏切到这一份
     maybeAutoOpenPlan();
@@ -3602,8 +4233,9 @@ async function loadQuestions() {
 async function decideQuestion(id, answer) {
   const q = state.questions.find((x) => x.id === id);
   if (q && q.kind === 'plan') stashPlanDoc(q); // 先留一份副本，批/驳之后右栏仍看得到
-  // 「忽略计划」= 搁置：后端要保留这份计划（它仍在等处置），所以这里不做乐观移除
+  // 「取消计划」：后端要保留这份计划（它仍在等处置），所以这里不做乐观移除
   // ——移除早了会让用户以为计划没了；批/驳才移除（后端也会确认）。
+  // 提交值仍是 __ignore__（后端语义不变，只改了给人看的文案）。
   if (answer !== '__ignore__') removeQuestion(id); // 先乐观移除，避免双击
   try {
     await api('/api/questions/' + id, { method: 'POST', body: JSON.stringify({ answer }) });
@@ -3672,6 +4304,89 @@ function askPending(view) {
   return !!bar && !bar.classList.contains('hidden');
 }
 
+/* ---------- 卡片折叠成一行（三类卡共用：计划审批 / 权限审批 / 提问） ----------
+   用户口径：卡贴在输入框上方时，常常想先看上面刚输出的正文——所以要像右下角那个
+   角标询问框一样能收成一行（只占一行高），点这一行再展开。
+   · 折叠是按卡片 key（审批 a:<id> / 提问 q:<id>）记住的：轮询/SSE 重绘会重建节点，
+     状态按 id 回放，绝不因为刷新弹回展开；切走再切回来也一样；
+   · 折叠纯视觉：输入框里的字照旧在（草稿按 id 存 sessionStorage），倒计时、提交、
+     角标/提醒一概不受影响；
+   · 默认（没折过）完全展开，外观与行为与加这个按钮之前一致。 */
+const askFolded = new Set(); // 卡片 key → 用户已折叠
+
+// 折叠后那一行的「类型 + 摘要」（摘要超长由 CSS 省略号截断，全文进 title）
+function askFoldMeta(e) {
+  const it = e.it || {};
+  if (e.type === 'approval') {
+    const sum = [it.tool, it.summary].filter(Boolean).join(' · ');
+    return { label: '🔐 需要批准', sum: sum || '有个操作等你批准',
+      full: [it.summary, it.reason].filter(Boolean).join('｜') };
+  }
+  const kind = it.kind || 'ask';
+  if (kind === 'plan') {
+    const info = planSummaryOf(it.plan || '');
+    return { label: '📋 计划待审批', sum: info.title || it.question || '待审批的计划',
+      full: info.desc || info.title || '' };
+  }
+  if (kind === 'async-plan') {
+    const info = planSummaryOf(it.plan || '');
+    return { label: '📋 计划审批（后台）', sum: info.title || it.question || '待审批的计划',
+      full: info.desc || info.title || '' };
+  }
+  if (kind === 'enter-plan') return { label: '🧭 进入计划模式？', sum: it.question || '', full: it.question || '' };
+  if (kind === 'async-perm') return { label: '🔐 权限审批（后台）', sum: it.question || '', full: it.question || '' };
+  return { label: '❓ 助手提问', sum: it.question || '', full: it.question || '' };
+}
+
+// 折叠态的切换：只改卡片的 class 与记忆表，别的什么都不动
+function askSetFolded(card, on) {
+  const key = card.dataset.askkey || '';
+  if (key) { if (on) askFolded.add(key); else askFolded.delete(key); }
+  card.classList.toggle('folded', !!on);
+}
+
+function askFoldBtn(card) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'ap-fold-btn';
+  b.textContent = '—'; // 与右下角角标堆那个折叠按钮同一套观感（一样的短横、一样的圆角描边）
+  b.title = '折叠成一行：先把上面刚输出的正文看完，点折叠后的那一行随时展开';
+  b.onclick = (ev) => { ev.stopPropagation(); askSetFolded(card, true); };
+  return b;
+}
+
+// 折叠后露出的那一行（展开态完全不参与布局）：点它展开，不触发整卡点击（计划卡）
+function askFoldDecor(card, e) {
+  const key = askCardKey(e);
+  card.dataset.askkey = key;
+  const meta = askFoldMeta(e);
+  const fold = document.createElement('button');
+  fold.type = 'button';
+  fold.className = 'ap-fold';
+  fold.title = '展开这张卡（看完整内容并作答）';
+  fold.innerHTML =
+    '<span class="ap-fold-kicker">' + esc(meta.label) + '</span>' +
+    '<span class="ap-fold-sum">' + esc(meta.sum) + '</span>' +
+    '<span class="ap-fold-hint">点击展开</span>' +
+    '<span class="ap-fold-go">›</span>';
+  const sumEl = fold.querySelector('.ap-fold-sum');
+  if (key && !sumEl.textContent) sumEl.textContent = '（无摘要）';
+  if (meta.full) sumEl.title = meta.full;
+  // 倒计时在折叠态也要看得见（折叠只藏卡片正文，不藏「还剩几秒」）：同一张卡里
+  // 所有 .q-count 都由 ticker 就地刷写，这里再放一枚即可（见 askEnsureTicker）
+  if (card.querySelector('.q-count')) {
+    const c2 = document.createElement('span');
+    c2.className = 'q-count';
+    fold.insertBefore(c2, fold.querySelector('.ap-fold-hint'));
+    paintQCount(c2, e.it, Date.now());
+    askEnsureTicker();
+  }
+  fold.onclick = (ev) => { ev.stopPropagation(); askSetFolded(card, false); };
+  card.appendChild(fold);
+  card.classList.toggle('folded', askFolded.has(key)); // 重绘/切回会话时按 id 回放
+  return card;
+}
+
 function buildApprovalCard(e, own) {
   const ap = e.it;
   const card = document.createElement('div');
@@ -3680,6 +4395,10 @@ function buildApprovalCard(e, own) {
   const head = document.createElement('div');
   head.className = 'ap-head';
   head.innerHTML = '<b>需要批准</b>' + (ap.tool ? '<span>' + esc(ap.tool) + '</span>' : '');
+  const hright = document.createElement('div');
+  hright.className = 'ap-head-right';
+  hright.appendChild(askFoldBtn(card));
+  head.appendChild(hright);
   card.appendChild(head);
   const body = document.createElement('div');
   body.className = 'ap-body';
@@ -3696,7 +4415,7 @@ function buildApprovalCard(e, own) {
     b.onclick = () => decideApproval(ap.id, b.dataset.act !== 'deny', b.dataset.act === 'always');
   });
   card.appendChild(acts);
-  return card;
+  return askFoldDecor(card, e);
 }
 
 /* ---------- 提问卡倒计时（ask_user_question 的 timeout_sec） ----------
@@ -3738,8 +4457,8 @@ function askHoldTimer(id) {
   q.timerHeld = true;
   q.deadlineMs = 0;
   document.querySelectorAll('.q-card[data-qid="' + id + '"]').forEach((card) => {
-    const chip = card.querySelector('.q-count');
-    if (chip) paintQCount(chip, q, Date.now());
+    // 展开态与折叠态各有一枚倒计时（折叠那一行也显示剩余时间）：一起刷
+    card.querySelectorAll('.q-count').forEach((chip) => paintQCount(chip, q, Date.now()));
     const stop = card.querySelector('.q-stop');
     if (stop) stop.classList.add('hidden');
   });
@@ -3876,11 +4595,21 @@ function speakAskAlert(gen) {
 
 // hideAskAlert 关闭提醒层并清干净定时器与音频（点击/Esc/问题解决共用）：
 // 关掉之后在途的朗读请求一律作废（代次 +1）——15 秒内取消就不会出声。
+// 层真的可见时还会通知后端把**桌面全屏蒙层**（同一次提醒的第二处）一起关掉
+//（qid 匹配当前轮才关：上一轮迟到的请求不许把刚弹出的新一轮蒙层误关）。
 function hideAskAlert() {
   const ov = $('ask-alert');
+  const wasVisible = ov && !ov.classList.contains('hidden');
+  const closingQid = askAlertQid;
   if (ov) {
     ov.classList.add('hidden');
     ov.classList.remove('solid'); // 关掉即恢复原界面（下次重新从淡压暗慢慢渐变）
+  }
+  if (wasVisible) {
+    fetch('/api/alert/screen', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ qid: closingQid }),
+    }).catch(() => { /* 老版本后端没这个接口：主窗口层照常收；全屏蒙层点一下即关 */ });
   }
   askAlertGen++; // 同时作废还没跑到的「加 .solid」那一帧（rAF 里比对代次）
   if (askAlertSettleTimer) { clearTimeout(askAlertSettleTimer); askAlertSettleTimer = 0; }
@@ -3937,22 +4666,29 @@ document.addEventListener('click', (e) => {
 
 function buildQuestionCard(e, own) {
   const q = e.it;
-  const isPlan = q.kind === 'plan';
+  const isPlan = q.kind === 'plan' || q.kind === 'async-plan';
   const isEnter = q.kind === 'enter-plan';
+  const isPerm = q.kind === 'async-perm';
   const card = document.createElement('div');
   card.className = 'ap-card q-card' + (isPlan ? ' plan' : '') + (q.sessionId === own ? '' : ' from-other');
   if (q.sessionId !== own) card.appendChild(askSrcStrip(q.sessionId, q.sessionTitle));
   const head = document.createElement('div');
   head.className = 'ap-head';
-  head.innerHTML = '<b>' + (isPlan ? '计划审批' : (isEnter ? '进入计划模式？' : '助手提问')) + '</b>';
+  head.innerHTML = '<b>' + (isPerm ? '权限审批（后台）'
+    : (isPlan ? (q.kind === 'async-plan' ? '计划审批（后台）' : '计划审批')
+      : (isEnter ? '进入计划模式？' : (q.owner === 'async' ? '助手提问（后台）' : '助手提问')))) + '</b>';
+  // 头部右侧（倒计时 / 停止 / 折叠）：成组靠右，折叠按钮永远是最后一个
+  const hright = document.createElement('div');
+  hright.className = 'ap-head-right';
+  head.appendChild(hright);
   card.appendChild(head);
   // 倒计时 + 停止按钮（计划审批与显式不限时没有表可停，只显示 ∞）：
   // data-qid 是倒计时就地刷写的定位锚；悬停/轻触卡片即停表（单向），停止按钮同效。
-  if (!isPlan && (q.deadlineMs || q.timerHeld || q.noTimeout)) {
+  if (!isPlan && !isPerm && (q.deadlineMs || q.timerHeld || q.noTimeout)) {
     card.dataset.qid = q.id;
     const count = document.createElement('span');
     count.className = 'q-count';
-    head.appendChild(count);
+    hright.appendChild(count);
     if (!q.noTimeout) { // 不限时没有停止按钮（也没必要挂悬停停表）
       const stop = document.createElement('button');
       stop.type = 'button';
@@ -3960,13 +4696,14 @@ function buildQuestionCard(e, own) {
       stop.title = '停止计时：不限时作答，选完选项即止';
       stop.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>';
       stop.onclick = (ev) => { ev.stopPropagation(); askHoldTimer(q.id); };
-      head.appendChild(stop);
+      hright.appendChild(stop);
       card.addEventListener('mouseenter', () => askHoldTimer(q.id));
       card.addEventListener('touchstart', () => askHoldTimer(q.id), { passive: true });
     }
     askEnsureTicker();
     paintQCount(count, q, Date.now());
   }
+  hright.appendChild(askFoldBtn(card));
 
   if (isPlan) {
     // 计划：这里只给摘要，全文在右栏「计划」视图（Markdown 渲染，可反复打开）
@@ -3987,11 +4724,11 @@ function buildQuestionCard(e, own) {
       (v) => decideQuestion(q.id, v || '（未填写具体意见）')));
     const acts = document.createElement('div');
     acts.className = 'ap-actions';
-    // 三个动作：修改（带反馈文本）、忽略计划（本轮就此停下、计划仍留着）、批准执行。
+    // 三个动作：修改（带反馈文本）、取消计划（本轮就此停下、计划仍留着）、批准执行。
     const ig = document.createElement('button');
     ig.className = 'ghost';
-    ig.textContent = '忽略计划';
-    ig.title = '搁置这份计划：本轮对话到此结束（等同点「停止」），计划仍留在这里，随时可以再批准或修改';
+    ig.textContent = '取消计划';
+    ig.title = '取消这份计划：本轮对话到此结束（等同点「停止」），计划仍留在这里，随时可以再批准或修改';
     ig.onclick = (e) => { e.stopPropagation(); decideQuestion(q.id, '__ignore__'); };
     // 整张卡可点 → 打开这份计划（输入框与按钮自己拦下冒泡，不误触）
     card.classList.add('clickable');
@@ -4009,13 +4746,30 @@ function buildQuestionCard(e, own) {
     acts.appendChild(ig);
     acts.appendChild(ok);
     card.appendChild(acts);
-    return card;
+    return askFoldDecor(card, e);
   }
 
   const body = document.createElement('div');
   body.className = 'ap-body';
   body.innerHTML = '<p>' + esc(q.question || '') + '</p>';
   card.appendChild(body);
+  if (isPerm) {
+    // 后台权限审批：两个按钮，点「允许」后端立刻把会话权限调宽（不是打标记）
+    const acts = document.createElement('div');
+    acts.className = 'ap-actions';
+    const no = document.createElement('button');
+    no.className = 'ghost';
+    no.textContent = '拒绝';
+    no.onclick = (ev) => { ev.stopPropagation(); decideQuestion(q.id, '__deny__'); };
+    const ok = document.createElement('button');
+    ok.className = 'ok';
+    ok.textContent = '允许（立即生效）';
+    ok.onclick = (ev) => { ev.stopPropagation(); decideQuestion(q.id, '__approve__'); };
+    acts.appendChild(no);
+    acts.appendChild(ok);
+    card.appendChild(acts);
+    return askFoldDecor(card, e);
+  }
   const opts = q.options || [];
   if (!isEnter && opts.length) {
     const box = document.createElement('div');
@@ -4049,7 +4803,7 @@ function buildQuestionCard(e, own) {
     acts.appendChild(ok);
     card.appendChild(acts);
   }
-  return card;
+  return askFoldDecor(card, e);
 }
 
 // 一个视图的浮窗渲染：增/删/改都只动该动的那张卡，其余节点一个都不碰
@@ -4527,7 +5281,7 @@ $('plan-note-open').onclick = async () => {
 $('plan-feedback').addEventListener('input', (e) => {
   if (planCur && planCur.pendingId) askDraftSet(planCur.pendingId, e.target.value);
 });
-$('plan-ignore').onclick = () => { if (planCur && planCur.pendingId) decideQuestion(planCur.pendingId, '__ignore__'); };
+$('plan-cancel').onclick = () => { if (planCur && planCur.pendingId) decideQuestion(planCur.pendingId, '__ignore__'); };
 $('plan-approve').onclick = () => { if (planCur && planCur.pendingId) decideQuestion(planCur.pendingId, '__approve__'); };
 $('plan-reject').onclick = () => {
   if (!planCur || !planCur.pendingId) return;
@@ -4564,6 +5318,9 @@ const PG_PAD = 24;   // 内容列自身的内边距：留白不够时可以借�
 
 let pgItems = [];    // 最近一次取到的进度项（空 = 没有进度项）
 let pgRuns = [];     // 本会话「运行中的程序」（在跑的子进程）；两者都空才整体隐藏
+let pgAsks = [];     // 本会话「后台等待项」（挂出去等人的询问/审批/计划）
+// 用户点了「查看」的后台等待项（id）：卡片就地弹到输入框上方，处理完自动收
+const openedAsync = new Set();
 let pgFold = null;   // 用户显式选择：null=自动；true=展开；false=收起
 let pgDrawn = null;  // 上次画出来的展开态（留白变化时只在翻转时才重画）
 
@@ -4585,11 +5342,12 @@ function pgExpanded(mt) { return pgFold === null ? mt.auto : pgFold; }
 async function loadProgress() {
   const panel = $('progress-panel');
   if (!panel) return;
-  if (!state.cur) { pgItems = []; pgRuns = []; pgFold = null; drawProgress(); return; }
+  if (!state.cur) { pgItems = []; pgRuns = []; pgAsks = []; pgFold = null; drawProgress(); return; }
   try {
     const d = await api('/api/sessions/' + state.cur.id + '/progress');
     pgItems = d.progress || [];
     pgRuns = d.running || [];
+    pgAsks = d.asks || [];
   } catch (e) { /* 会话不存在/服务离线：维持上一次的样子 */ }
   drawProgress();
 }
@@ -4617,8 +5375,8 @@ function scheduleRunTick() {
 function drawProgress() {
   const panel = $('progress-panel');
   if (!panel) return;
-  const items = pgItems, runs = pgRuns;
-  if (!items.length && !runs.length) { panel.classList.add('hidden'); panel.innerHTML = ''; pgDrawn = null; return; }
+  const items = pgItems, runs = pgRuns, asks = pgAsks;
+  if (!items.length && !runs.length && !asks.length) { panel.classList.add('hidden'); panel.innerHTML = ''; pgDrawn = null; return; }
   const mt = pgMetrics() || { width: PG_W, auto: false };
   const open = pgExpanded(mt);
   pgDrawn = open;
@@ -4628,6 +5386,7 @@ function drawProgress() {
   const running = runs.filter((r) => r.state === 'running').length;
   if (!open) {
     panel.innerHTML = '<button type="button" class="pg-pill" title="展开进度清单">进度'
+      + (asks.length ? '<span class="pg-ask-dot"></span>' + asks.length + ' 待处理' : '')
       + (running ? '<span class="pg-run-dot"></span>' + running + ' 个在跑' : '')
       + chev('pg-chev') + '</button>';
     panel.querySelector('.pg-pill').onclick = () => { pgFold = true; drawProgress(); };
@@ -4668,8 +5427,39 @@ function drawProgress() {
     }
     html += '</ul>';
   }
+  if (asks.length) {
+    // 横线隔开：最下面专放「后台等待项」——挂出去等用户处理的询问/审批/计划。
+    // 与「运行中的程序」同一套视觉：摘要 + 已等时长，悬停该行才出现「查看」，
+    // 点它就把那张卡弹到输入框上方（与真实发起时完全一样的那张卡）。
+    html += '<div class="pg-sep"></div>'
+      + '<div class="pg-runs-head">后台等待项<span class="pg-runs-n">' + asks.length + ' 条待处理</span></div>'
+      + '<ul class="pg-runs pg-asks">';
+    for (const a of asks) {
+      // 已打开判定：手动点过「查看」，或这张卡已经在输入框上方（2026-11-18 起
+      // 挂出即自动弹卡）——两种来源都算，按钮如实显示「已打开」
+      const isOpen = openedAsync.has(a.id) || state.questions.some((q) => q.id === a.id);
+      const kindLabel = a.kind === 'async-perm' ? '审批' : (a.kind === 'async-plan' ? '计划' : '询问');
+      const icon = a.kind === 'async-perm' ? '🔐' : (a.kind === 'async-plan' ? '📋' : '❓');
+      const sum = a.kind === 'async-perm'
+        ? ('把会话提到「' + permLabelOf(a.target) + '」')
+        : (a.kind === 'async-plan' ? (planSummaryOf(a.plan || '').title || '待审批的计划') : (a.question || ''));
+      html += '<li class="pg-run pg-ask">'
+        + '<span class="pg-run-label">' + icon + ' ' + esc(kindLabel) + '</span>'
+        + '<span class="pg-run-cmd" title="' + esc(sum) + '">' + esc(sum.length > 40 ? sum.slice(0, 40) + '…' : sum) + '</span>'
+        + '<span class="pg-run-time"><span class="pg-run-elapsed">已等 ' + fmtElapsed(a.waitingSec) + '</span>'
+        + '<button type="button" class="pg-ask-open' + (isOpen ? ' is-open' : '') + '" data-id="' + esc(a.id) + '"'
+        + ' title="' + (isOpen ? '已在输入框上方打开这张卡' : '打开这张卡，就地回答/批准') + '">' + (isOpen ? '已打开' : '查看') + '</button>'
+        + '</span></li>';
+    }
+    html += '</ul>';
+  }
   panel.innerHTML = html;
   panel.querySelector('.progress-head').onclick = () => { pgFold = false; drawProgress(); };
+  // 后台等待项：「查看」→ 把那一条的卡片弹到输入框上方（与真实发起时同一张卡），
+  // 用户就地处理；处理完由 question_resolved 事件收卡、列表随之消失
+  for (const b of panel.querySelectorAll('.pg-ask-open')) {
+    b.onclick = () => openAsyncCard(b.dataset.id);
+  }
   // 运行中的程序：停止按钮 → 真正终止（后台作业优雅取消、子进程强杀），后端
   // 会向本会话投【用户停止程序】注记（不触发 AI 对话）；列表由 children 事件刷新，
   // 这里的 loadProgress 只是成功后的即时反馈
@@ -4685,10 +5475,42 @@ function drawProgress() {
   scheduleRunTick();
 }
 
+/* ---------- 后台等待项：挂出即弹卡 + 面板里的「查看」随时找回 ----------
+   后台询问/审批/计划挂出时（asyncAdd 广播 question_required），与真实发起
+   完全一样的那张卡直接弹在所属会话的输入框上方（可折叠成一行，不挡对话）；
+   卡被折起来/别的窗口错过广播时，进度面板里列一条，点「查看」就地打开——
+   卡片的形态、提交接口与真实发起时完全一致（都是 state.questions +
+   POST /api/questions/{id}）。 */
+function permLabelOf(t) {
+  if (t === 'full' || t === 'danger-full-access') return '完全访问';
+  if (t === 'read-only') return '全电脑只读';
+  return '修改工作区';
+}
+
+// 后台条目 → 提问项的形态（喂给既有的卡片渲染与提交逻辑）
+function asyncToQuestion(a) {
+  const kind = a.kind === 'async-plan' ? 'async-plan' : (a.kind === 'async-perm' ? 'async-perm' : 'ask');
+  return {
+    id: a.id, sessionId: a.sessionId || '', sessionTitle: '',
+    kind, question: a.question || '', plan: a.plan || '', options: a.options || [],
+    allowFree: a.allowFree !== false, owner: 'async',
+    target: a.target || '', deadlineMs: 0, timerHeld: false, noTimeout: true,
+  };
+}
+
+function openAsyncCard(id) {
+  const a = pgAsks.find((x) => x.id === id);
+  if (!a) return;
+  openedAsync.add(id);
+  if (!state.questions.some((q) => q.id === id)) state.questions.push(asyncToQuestion(a));
+  renderPanels();
+  loadProgress(); // 行内按钮就地翻成「已打开」
+}
+
 // 留白变了（缩放窗口、开关左右栏、拖拽调宽对话列）：宽度跟着变；自动档下展开态翻转
 // 才重画，其余情况只改宽度不动 DOM
 function syncProgress() {
-  if (!pgItems.length && !pgRuns.length) return;
+  if (!pgItems.length && !pgRuns.length && !pgAsks.length) return;
   const mt = pgMetrics();
   if (!mt) return;
   const panel = $('progress-panel');
@@ -4924,6 +5746,7 @@ function runHintOff(view) {
 
 function setStreamUI(on, view) {
   view = view || mainView;
+  if (on) streamAlive(view); // 一条新流开始跑：静默时间从这里重新计时（看门狗用，见「会话流健康看门狗」）
   // 发送按钮保持可用：执行中发送 = 插话或排队（常规页「对话中途发送行为」）
   view.stopBtn.classList.toggle('hidden', !on);
   if (!on) view.hint.textContent = '';
@@ -4959,6 +5782,17 @@ function handleEvent(ev, view) {
       if (view.state.pendingSend && ev.message && ev.message.role === 'user') {
         view.state.pendingSend = null;
       }
+      // 插话落库兜底：正式消息到达即摘掉同内容的虚线插话框。实框走本流
+      // （message 事件），虚框清理靠全局总线的 pending 广播——两条通道独立，
+      // 广播在断线重连窗口/订阅者跟不上被丢帧时，实框已现、虚框残留成双框
+      // （插话打断模型流的瞬间事件最密集，最易撞上）。按内容本地摘除
+      // （pruneLandedSteer），pending 广播正常到达时快照整体覆盖，两边不冲突。
+      if (ev.message && ev.message.role === 'user'
+        && typeof ev.message.content === 'string') pruneLandedSteer(view, ev.message.content);
+      // 合成回执对（toolreport）落库为 assistant+tool 两行：tool 行到达时同样
+      // 对一次账，pending 广播被丢帧也不留「后台回执待注入」幽灵占位
+      if (ev.message && ev.message.role === 'tool' && ev.origin === 'toolreport'
+        && typeof ev.message.content === 'string') pruneLandedSteer(view, ev.message.content);
       if (view.state.attached) {
         // 跟随别的连接发起的执行：以服务端为准整体重取，避免与已落库内容重复
         //（节流合并：汇报轮里几十条 message 事件连发，不再每条整包拉一次）
@@ -4971,6 +5805,10 @@ function handleEvent(ev, view) {
       if (ev.seq) ev.message.seq = ev.seq;
       if (ev.kind) ev.message.kind = ev.kind; // 行类型：与存储 kind 一致（契约见《消息类型规范.md》）
       if (ev.origin) ev.message.origin = ev.origin;
+      // 新回合开始（用户消息回显）：关注点回到尾部，顺手放掉上方已加载批次
+      // （贴底跟随态才生效，钉住阅读不动）。赶在下一条 push 触发前缀判定之前：
+      // 释放后索引同步平移，渲染仍走尾部重建快路径，批记账不会作废
+      if (ev.message && ev.message.role === 'user') releaseOlder(view);
       view.state.msgs.push(ev.message);
       renderMessages(view.state.msgs, view);
       break;
@@ -4981,7 +5819,7 @@ function handleEvent(ev, view) {
       liveRender(view);
       break;
     case 'pending': // 插话/排队队列变化（自己发的、别的窗口发的、服务端排水的都在这里）
-      applyPending(view, ev.pending);
+      applyPending(view, ev.pending, ev.sessionId);
       break;
     case 'stopped':
       view.hint.textContent = ev.error || '已停止';
@@ -5070,6 +5908,11 @@ function pendingHint(view, text) {
    带「重试」按钮（重试不再重复落库用户消息，后台直接带着当前上下文再跑一轮）。
    正常完成与用户手动停止都不产生任何内容。 ---------- */
 
+// NO_CHANNEL_HINT 后端「还没有可用的模型通道」报错的文案特征（Go 侧常量
+// ErrNoModelChannelText，见 llm.go）：命中的报错条挂「接入公司通道」按钮，
+// 省得用户去翻设置。改文案要两边一起改。
+const NO_CHANNEL_HINT = '还没有可用的模型通道';
+
 function showRunError(view, text) {
   view = view || mainView;
   const box = viewEl(view, 'run-error');
@@ -5090,6 +5933,19 @@ function showRunError(view, text) {
   retry.type = 'button';
   retry.textContent = '重试';
   retry.onclick = () => retryRun(view);
+  // 没有模型通道（出厂不预置通道，新装没接公司通道就是这种态）：直接给入口，
+  // 点一下打开接入公司浮窗，不用先去设置里找向导。
+  let wizard = null;
+  if (text.indexOf(NO_CHANNEL_HINT) >= 0) {
+    wizard = document.createElement('button');
+    wizard.className = 're-btn re-retry';
+    wizard.type = 'button';
+    wizard.textContent = '接入公司通道';
+    wizard.onclick = () => {
+      hideRunError(view, true);
+      if (typeof openWizard === 'function') openWizard();
+    };
+  }
   // 反馈：把这条报错一键带进 设置→关于 的反馈表单（远程用户的主报修通道）
   const fb = document.createElement('button');
   fb.className = 're-btn re-retry';
@@ -5107,7 +5963,13 @@ function showRunError(view, text) {
   close.onclick = () => hideRunError(view, true);
   box.appendChild(icon);
   box.appendChild(msg);
+  if (wizard) box.appendChild(wizard);
   box.appendChild(retry);
+  // 报错条按钮的组件插槽（2026-11-13 充值组件）：主程序不判定「余额不足」也
+  // 不认识充值组件，只广播本条报错的文本与容器——组件自己按词表（与 llm.go
+  // quotaWords 同源）决定要不要在「重试」旁加「去充值」。组件关闭时无人监听，
+  // 按钮自然不存在。
+  if (window.JX && typeof JX.emit === 'function') JX.emit('run:error', { text, box, view });
   box.appendChild(close);
 }
 
@@ -5128,8 +5990,10 @@ function hideRunError(view, remember) {
 // ① 整包路：新版本可用，「确认更新」直接下载安装包；
 // ② 就绪路（u.pendingRestart）：主程序已静默交换，「立即重启」经助手接力生效，
 //    「稍后」等下次自然重启。在线时由 update_available/update_ready 门铃事件
-//    触发，刚打开页面时从 /api/status 的 update 恢复。
-function showUpdateBanner(u) {
+//    触发，刚打开页面时从 /api/status 的 update 恢复。force=true 为用户主动
+//    唤起（左下角更新胶囊）：无视本版「稍后」记录强制弹出——胶囊是随时再入
+//    的入口，不能点了没反应。
+function showUpdateBanner(u, force) {
   syncUpdatePill(u);
   if (!u || !u.latest) return;
   const bar = document.getElementById('update-banner');
@@ -5137,8 +6001,9 @@ function showUpdateBanner(u) {
   const actions = bar.querySelector('.ub-actions');
   if (!actions) return;
   if (u.pendingRestart && u.pendingVersion) {
-    // 就绪横幅：本版本点过「稍后」不再弹（下次新版本重新提醒）
-    try { if (localStorage.getItem('jxUbLater') === u.pendingVersion) return; } catch (e) {}
+    // 就绪横幅：本版本点过「稍后」不再自动弹（下次新版本重新提醒）；胶囊
+    // 主动唤起（force）不受此限——那是用户明确要看，横幅必须出来
+    try { if (!force && localStorage.getItem('jxUbLater') === u.pendingVersion) return; } catch (e) {}
     bar.querySelector('.ub-text').innerHTML =
       '新版本 <b>' + esc(u.pendingVersion) + '</b> 已就绪（当前 ' + esc(u.current || '') +
       '），重启软件后生效' +
@@ -5154,8 +6019,9 @@ function showUpdateBanner(u) {
       (u.notes ? '　<span class="ub-notes">' + esc(String(u.notes).slice(0, 80)) + '</span>' : '');
     bar.dataset.mode = 'installer';
     bar.dataset.download = u.downloadUrl || '';
-    bar.dataset.url = u.url || '';
-    actions.innerHTML = '<button class="ub-confirm" type="button">确认更新</button>';
+    // 没挂安装包附件（分块发布）就不放「确认更新」：点了也没有可下载的东西，
+    // 更不能退回去打开发布页窗口（2026-11-21 用户反馈：更新就更新，别弹窗口）
+    actions.innerHTML = u.downloadUrl ? '<button class="ub-confirm" type="button">确认更新</button>' : '';
   }
   bar.classList.remove('hidden');
 }
@@ -5180,12 +6046,12 @@ function syncUpdatePill(u) {
 }
 document.getElementById('btn-update')?.addEventListener('click', (e) => {
   e.stopPropagation(); // 拦住外层设置按钮的默认打开路径，只唤起更新横幅
-  if (curUpdateState) showUpdateBanner(curUpdateState);
+  if (curUpdateState) showUpdateBanner(curUpdateState, true); // 主动唤起：无视「稍后」必弹
 });
 document.getElementById('btn-update')?.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') {
     e.preventDefault(); e.stopPropagation();
-    if (curUpdateState) showUpdateBanner(curUpdateState);
+    if (curUpdateState) showUpdateBanner(curUpdateState, true);
   }
 });
 
@@ -5217,10 +6083,14 @@ $('update-banner').addEventListener('click', (e) => {
       jxDownload(dl);
       bar.querySelector('.ub-text').innerHTML =
         '正在后台下载新版本安装包，下载完成后将自动运行安装…';
-      actions.innerHTML = '';
-    } else if (bar.dataset.url) {
-      jxOpenPage(bar.dataset.url); // 没挂附件就退回发布页
-      bar.classList.add('hidden');
+      const acts = bar.querySelector('.ub-actions');
+      if (acts) acts.innerHTML = ''; // 防重复点击再次发起下载
+    } else {
+      // 没挂安装包附件：不打开发布页（发布页是给人手工看版本与下载的，不是
+      // 更新流程的界面），就地一行说明收场
+      bar.querySelector('.ub-text').textContent = '这个版本没有整包安装包（分块发布），无需手动操作';
+      const acts = bar.querySelector('.ub-actions');
+      if (acts) acts.innerHTML = '';
     }
   }
 });
@@ -5234,22 +6104,23 @@ async function retryRun(view) {
   view.state.streaming = true;
   view._pinned = false; // 主动重试：恢复跟随
   setStreamUI(true, view);
-  view.state.abort = new AbortController();
+  const abort = new AbortController(); // 这条流自己的取消器：收尾时据此辨认界面是否已换了流
+  view.state.abort = abort;
   view.state.streamText = '';
   view.state.streamThinking = '';
   let aborted = false;
   try {
     const res = await fetch(`/api/sessions/${cur.id}/retry`, {
-      method: 'POST', signal: view.state.abort.signal,
+      method: 'POST', signal: abort.signal,
     });
     if (!res.ok) throw new Error(res.statusText || '重试失败');
-    await consumeStream(res, view, cur.id);
+    await consumeStream(res, view, cur.id, abort);
   } catch (e) {
     if (e.name === 'AbortError') aborted = true;
     // 慢网下请求失败可能晚于切走：报错条只落在仍停在这个会话的界面上
     else if (view.state.cur && view.state.cur.id === cur.id) showRunError(view, '重试失败：' + e.message);
   }
-  await endTurn(view, aborted, { sid: cur.id, abort: view.state.abort });
+  await endTurn(view, aborted, { sid: cur.id, abort });
 }
 
 // endTurn 一轮结束后的收尾（send / retry / edit / attach 共用）：收流式、对齐状态、刷新周边。
@@ -5361,12 +6232,14 @@ function renderQueueDock(view) {
     const txt = document.createElement('span');
     txt.className = 'qd-text';
     const qdPrev = qdPreviewText(pm.content); // 摘要跳过块开头，直接显示用户正文
-    txt.textContent = qdPrev.length > 200 ? qdPrev.slice(0, 200) + '…' : qdPrev;
+    const qdLabel = pm.toolName ? '【后台回执·' + pm.toolName + '】' : ''; // 合成回执对排队项：标明身份
+    const qdBody = qdPrev.length > 200 ? qdPrev.slice(0, 200) + '…' : qdPrev;
+    txt.textContent = qdLabel + qdBody;
     txt.title = pm.content;
     li.appendChild(txt);
     li.appendChild(qdAction('steer', view, pm, '插话发送：模型输出中立即打断生效；工具执行中等下一步调用模型', '', '立即插话'));
-    // 编辑只给自己发的排队项（kind 空/chat）；数字助理派发注入的不参与
-    if (!pm.kind || pm.kind === 'chat') {
+    // 编辑只给自己发的排队项（kind 空/chat）；数字助理派发注入的与后台回执对不参与
+    if ((!pm.kind || pm.kind === 'chat') && !pm.toolName) {
       li.appendChild(qdAction('edit', view, pm, '退回输入框编辑', '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>'));
     }
     li.appendChild(qdAction('remove', view, pm, '移出队列', '<path d="M6 6l12 12M18 6L6 18"/>'));
@@ -5442,11 +6315,13 @@ function qdClearDropMarks(ul) {
 
 // 拖拽排序落地：move 成功后直接应用服务端返回的 pending 快照（多窗口一致）
 async function movePendingTo(view, id, before) {
+  const sid = view.state.cur && view.state.cur.id; // 请求时定格：响应在途时界面可能已切走
+  if (!sid) return;
   try {
-    const d = await api('/api/sessions/' + view.state.cur.id + '/pending', {
+    const d = await api('/api/sessions/' + sid + '/pending', {
       method: 'POST', body: JSON.stringify({ id, action: 'move', before: before || '' }),
     });
-    applyPending(view, d.pending);
+    if (view.state.cur && view.state.cur.id === sid) applyPending(view, d.pending, sid);
   } catch (e) {
     pendingHint(view, '排序失败：' + e.message);
   }
@@ -5466,27 +6341,30 @@ function qdAction(action, view, pm, title, path, label) {
 }
 
 async function pendingAction(view, id, action) {
+  const sid = view.state.cur && view.state.cur.id; // 请求时定格：响应在途时界面可能已切走
+  if (!sid) return;
+  const sameView = () => view.state.cur && view.state.cur.id === sid;
   if (action === 'pause' || action === 'resume') {
     // 队列级开关（不需要消息 id）：暂停后本轮跑完保留不续发；恢复时空闲即接着发
     try {
-      const d = await api('/api/sessions/' + view.state.cur.id + '/pending', {
+      const d = await api('/api/sessions/' + sid + '/pending', {
         method: 'POST', body: JSON.stringify({ id: '', action }),
       });
-      applyPending(view, d.pending);
-      pendingHint(view, action === 'pause' ? '已暂停队列：本轮结束后排队消息保留不发送' : '已继续队列：排队消息将依次发送');
+      if (sameView()) applyPending(view, d.pending, sid);
+      if (sameView()) pendingHint(view, action === 'pause' ? '已暂停队列：本轮结束后排队消息保留不发送' : '已继续队列：排队消息将依次发送');
     } catch (e) {
-      pendingHint(view, '操作失败：' + e.message);
+      if (sameView()) pendingHint(view, '操作失败：' + e.message);
     }
     return;
   }
   try {
-    const d = await api('/api/sessions/' + view.state.cur.id + '/pending', {
+    const d = await api('/api/sessions/' + sid + '/pending', {
       method: 'POST', body: JSON.stringify({ id, action }),
     });
-    applyPending(view, d.pending);
-    pendingHint(view, action === 'steer' ? '已提前为插话：模型输出中立即打断生效' : '已移出队列');
+    if (sameView()) applyPending(view, d.pending, sid);
+    if (sameView()) pendingHint(view, action === 'steer' ? '已提前为插话：模型输出中立即打断生效' : '已移出队列');
   } catch (e) {
-    pendingHint(view, '操作失败：' + e.message);
+    if (sameView()) pendingHint(view, '操作失败：' + e.message);
   }
 }
 
@@ -5507,7 +6385,7 @@ async function editPendingMsg(view, pm) {
       method: 'POST', body: JSON.stringify({ id: pm.id, action: 'remove' }),
     });
     if (!view.state.cur || view.state.cur.id !== sid) return;
-    applyPending(view, d.pending);
+    applyPending(view, d.pending, sid);
     view.input.value = pm.content;
     clearQuote(view); // 退回的消息文本里已带「用户引用：」段：别在胶囊上再叠一层
     autoGrow(view.input);
@@ -5519,9 +6397,18 @@ async function editPendingMsg(view, pm) {
   }
 }
 
-// 待生效消息快照入视图（服务端下发或接口返回）：只对当前会话生效
-function applyPending(view, pending) {
+// 待生效消息快照入视图（服务端下发或接口返回）：只对当前会话生效。
+// sessionId 是快照所属会话（响应/广播都可能晚于界面切换到达）：对不上直接
+// 丢弃——旧会话的插话快照若落到新会话上，画出的「插话中」虚线框没有任何
+// 事件会来摘（摘框广播按 sessionId 路由），幽灵框就是这么来的。
+// 版本门：服务端每次队列变更都递增 ver，晚到的旧快照（取值早于排水、投递
+// 晚于新快照——interject 响应与 pending 广播并发时投递顺序不定）一并丢弃。
+function applyPending(view, pending, sessionId) {
   if (!pending) return;
+  if (sessionId && (!view.state.cur || view.state.cur.id !== sessionId)) return;
+  const ver = pending.ver | 0;
+  if (ver > 0 && (view.state.pendingVer || 0) >= ver) return; // 旧快照回放：不落地
+  if (ver > 0) view.state.pendingVer = ver;
   view.state.pendingSteer = pending.steer || [];
   view.state.pendingQueue = pending.queue || [];
   view.state.queuePaused = !!pending.paused;
@@ -5530,29 +6417,70 @@ function applyPending(view, pending) {
   if (view.state.cur) renderMessages(view.state.msgs, view);
 }
 
+// pruneLandedSteer 摘掉「正文已作为用户消息落库」的插话虚线框，返回是否有摘除。
+// 虚线框只属于还没送达的插话；消息一旦落库（打断注入、下一步注入都一样），
+// 正常气泡随即到达，框必须退场。两个消费点：①message 事件里作为广播丢失的
+// 双保险（插话打断模型流的瞬间事件最密集，pending 广播可能被丢帧）——landed
+// 传刚到的这条正文（此刻它还没 push 进 msgs）；②sendMidrun 的响应回画后对账
+// ——慢链路/远程中继下 interject 响应在手时插话往往已注入生效（摘框事件早已
+// 发过），照（可能过期的）快照或回显画上去就成了无人再摘的幽灵框。
+function pruneLandedSteer(view, landed) {
+  const st = view.state;
+  if (!st.pendingSteer || !st.pendingSteer.length) return false;
+  const isLanded = (c) => c === landed || st.msgs.some((m) => {
+    if (typeof m.content !== 'string') return false;
+    if (m.role === 'user') return m.content === c;
+    if (m.role === 'tool' && m.origin === 'toolreport') {
+      if (m.content === c) return true;
+      // 超长后台回执落库前被 clipToolResult 截断（128KB 上限）：原文以落库文本
+      // 开头且确实够长才算同一条，避免误伤普通插话
+      return c.length > 120000 && m.content.length < c.length && c.startsWith(m.content);
+    }
+    return false;
+  });
+  const before = st.pendingSteer.length;
+  st.pendingSteer = st.pendingSteer.filter((p) => !isLanded(p.content));
+  return st.pendingSteer.length < before;
+}
+
 // 执行中发出的消息：按「对话中途发送行为」插话或排队（两种模式都在服务端排队）
 // 默认值=等待排队：新装/没设置过 jx.midrun 时排队；只有用户在设置里显式选过
 // 「插话」（localStorage 里存了 interject）才走 steer。手动切换照旧存同一个键。
 async function sendMidrun(content, viaInput, view, voiceUsed) {
   view = view || mainView;
+  const sid = view.state.cur && view.state.cur.id; // 发送时定格：响应在途时界面可能已切走
+  if (!sid) return;
   const mode = lsGet('jx.midrun', 'queue') === 'interject' ? 'steer' : 'queue';
   try {
-    const d = await api('/api/sessions/' + view.state.cur.id + '/interject', {
+    const d = await api('/api/sessions/' + sid + '/interject', {
       method: 'POST', body: JSON.stringify({ content, mode, voiceUsed: !!voiceUsed }),
     });
     if (!d.accepted) { pendingHint(view, '发送失败：该会话当前不接受消息'); return; }
-    // 本地立即出效果（插话贴到对话末尾，排队进坞）；服务端的 pending 广播可能
-    // 先于本次响应到达，按 id 去重，避免同一条显示两次
-    const known = view.state.pendingSteer.concat(view.state.pendingQueue).some((p) => p.id === d.id);
-    if (!known) {
-      const pm = { id: d.id, content: content, createdAt: '' };
-      if (d.mode === 'steer') view.state.pendingSteer.push(pm);
-      else view.state.pendingQueue.push(pm);
-    }
-    renderQueueDock(view);
+    // 画不画「插话中」虚线框以响应里的服务端快照为准（不按 mode 盲回显）：steer
+    // 打断后的排水落库极快，慢链路下响应到手时插话往往已注入生效——快照里已没
+    // 它就别画。快照是服务端**写响应时刻**的值，中继/慢网在途延迟仍可能让它过期
+    // （版本门拦旧回放），画完再用 pruneLandedSteer 对一次账（正文已落库的不画），
+    // 三保险后才可靠。
     view._pinned = false; // 插话/排队展示在对话末尾：恢复跟随看得到回执
-    renderMessages(view.state.msgs, view);
-    pendingHint(view, d.mode === 'steer' ? '已插话：模型输出中立即打断生效；工具执行中等下一步调用模型' : '已排队：本轮结束后自动发送');
+    // 响应只在仍停在这个会话时落地（backendRunning 同款纪律）：切走后旧会话的
+    // 插话快照会把虚线框画到新会话上，且新会话永远等不来摘框事件
+    if (view.state.cur && view.state.cur.id === sid) {
+      if (d.pending) {
+        applyPending(view, d.pending, sid); // 与 pending 广播同一份快照结构，整体覆盖即去重（内含重绘）
+      } else {
+        // 兜底（老后端无快照字段）：沿用本地回显 + 广播按 id 去重
+        const known = view.state.pendingSteer.concat(view.state.pendingQueue).some((p) => p.id === d.id);
+        if (!known) {
+          const pm = { id: d.id, content: content, createdAt: '' };
+          if (d.mode === 'steer') view.state.pendingSteer.push(pm);
+          else view.state.pendingQueue.push(pm);
+        }
+        renderQueueDock(view);
+        renderMessages(view.state.msgs, view);
+      }
+      if (d.mode === 'steer' && pruneLandedSteer(view)) renderMessages(view.state.msgs, view);
+      pendingHint(view, d.mode === 'steer' ? '已插话：模型输出中立即打断生效；工具执行中等下一步调用模型' : '已排队：本轮结束后自动发送');
+    }
   } catch (e) {
     pendingHint(view, '发送失败：' + e.message);
     return;
@@ -5560,7 +6488,7 @@ async function sendMidrun(content, viaInput, view, voiceUsed) {
   if (viaInput) {
     view.input.value = ''; clearQuote(view); autoGrow(view.input);
     delete view.input.dataset.jxVoice; // 语音标记已随本条消息上报，随之退场
-    if (view === mainView) clearSessionDraftLS(view.state.cur.id); else clearSubDraftLS(view.state.cur.id);
+    if (view === mainView) clearSessionDraftLS(sid); else clearSubDraftLS(sid); // 按发送时的会话清草稿：切走后 cur 已是新会话，不能清新会话的
   }
 }
 
@@ -5666,8 +6594,17 @@ async function prepareSend(forceContent, view) {
       // 没选中子对话：懒创建（与主对话首页同款）——发出第一条消息才真正建
       // 子对话（继承主对话上下文）并就地打开，消息照发，不提前留空会话；
       // 无主对话可挂靠或创建失败由 newAuxChat 就地提示，输入内容保留、本轮中止
+      const typedText = input.value; // 空态里打进来的这句话
       await newAuxChat();
       if (!view.state.cur) { if (armed) runHintOff(view); return; }
+      // 懒创建走的是 openSubSession，它按「切换会话即整体换草稿」的铁律把输入框
+      // 换成新子对话的空草稿——空态里刚打的这句话会被一并清掉，下面组装正文就
+      // 只剩空串（后端以 content 不能为空拒收），右栏留下一个「话没发出去」的空
+      // 子对话。这条消息是用户点发送之前就写好的，与切换会话无关：放回输入框，
+      // 后面组装正文、发送失败兜底都还认输入框这一处。
+      input.value = typedText;
+      autoGrow(input);
+      persistSubDraftLS(); // 放回的字同样落盘：万一这次发送失败，切走再回来还在
     }
   }
   // 附件先落盘：注记要拼进消息头（真实落盘文件名/uid/判重说明上传完才知道），
@@ -5723,6 +6660,7 @@ async function send(forceContent, view) {
   const pre = await prepareSend(forceContent, view);
   if (!pre) return;
   const { input, content, sid, fromInput } = pre;
+  const abort = view.state.abort; // 这条流自己的取消器（prepareSend 建好）：收尾时据此辨认界面是否已换了流
 
   let aborted = false;
   // 服务端是否已收下这条消息：handleChat 在返回响应头之前就完成了落库并启动
@@ -5736,14 +6674,14 @@ async function send(forceContent, view) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, voiceUsed: !!pre.voiceUsed }),
-      signal: view.state.abort.signal,
+      signal: abort.signal,
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       throw new Error(d.error || res.statusText);
     }
     accepted = true;
-    await consumeStream(res, view, sid);
+    await consumeStream(res, view, sid, abort);
   } catch (e) {
     if (e.name === 'AbortError') {
       aborted = true; // 用户主动停止（已另行请求后端停止）：排队消息保留
@@ -5764,7 +6702,7 @@ async function send(forceContent, view) {
       if (!accepted) {
         try {
           const d = await api('/api/sessions/' + sid);
-          if (d.pending && view.state.cur && view.state.cur.id === sid) applyPending(view, d.pending);
+          if (d.pending && view.state.cur && view.state.cur.id === sid) applyPending(view, d.pending, sid);
           running = !!(d.running || (d.meta && d.meta.status === 'running'));
           accepted = userChatLanded(d.messages || [], content);
         } catch (e2) { /* 探测也失败（服务不可达）：按没收下处理，走下面的兜底 */ }
@@ -5785,7 +6723,7 @@ async function send(forceContent, view) {
       }
     }
   }
-  await endTurn(view, aborted, { sid, abort: view.state.abort });
+  await endTurn(view, aborted, { sid, abort });
 }
 
 /* ---------- 编辑历史用户消息并重发（语义对齐 ZCode 的 editUserQuery：
@@ -5900,7 +6838,8 @@ async function resendEdit(m, content, view, mode) {
   view.state.streaming = true;
   view._pinned = false; // 编辑重发也是自己的动作：恢复跟随
   setStreamUI(true, view);
-  view.state.abort = new AbortController();
+  const abort = new AbortController(); // 这条流自己的取消器：收尾时据此辨认界面是否已换了流
+  view.state.abort = abort;
   view.state.streamText = '';
   view.state.streamThinking = '';
   if (view === mainView) JX.emit('send', { content });
@@ -5911,7 +6850,7 @@ async function resendEdit(m, content, view, mode) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ seq: m.seq, content, workspaceMode: wm }),
-      signal: view.state.abort.signal,
+      signal: abort.signal,
     });
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
@@ -5922,7 +6861,7 @@ async function resendEdit(m, content, view, mode) {
       }
       throw new Error(d.error || res.statusText);
     }
-    await consumeStream(res, view, sid);
+    await consumeStream(res, view, sid, abort);
     return true;
   };
   try {
@@ -5936,7 +6875,7 @@ async function resendEdit(m, content, view, mode) {
       showRunError(view, '编辑发送失败：' + e.message); // 真实失败进报错条，不插进对话区
     }
   }
-  await endTurn(view, aborted, { sid, abort: view.state.abort });
+  await endTurn(view, aborted, { sid, abort });
   return !aborted;
 }
 
@@ -5945,15 +6884,27 @@ async function resendEdit(m, content, view, mode) {
 // consumeStream 读一条 SSE 响应直到流结束，每帧交给 handleEvent。
 // sid 是这条流所属的会话：中途切到别的会话后本函数立刻收手——帧不能再写进
 // 新会话的界面（后端执行不受影响，回来时重新接上即可）。
-async function consumeStream(res, view, sid) {
+// abort 是这条流自己的取消器：界面已经放弃它（看门狗重建/切走）时，即便假死的
+// 连接事后又活过来，字节也只读不落地——同一条会话不能有两个消费方往界面上写。
+// 每收到一段字节就把「最后收到数据的时间」刷新一次（含服务端每 15s 一个的
+// ": ping" 注释帧），看门狗据此判活。
+async function consumeStream(res, view, sid, abort) {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (e) {
+      if (abort && view.state.abort !== abort) return; // 已放弃这条流：断开不算错
+      throw e;
+    }
+    if (chunk.done) break;
+    if (abort && view.state.abort !== abort) return;  // 界面已换过流：丢弃
     if (sid && (!view.state.cur || view.state.cur.id !== sid)) return; // 已切走：丢弃
-    buf += dec.decode(value, { stream: true });
+    streamAlive(view);
+    buf += dec.decode(chunk.value, { stream: true });
     let idx;
     while ((idx = buf.indexOf('\n\n')) >= 0) {
       const frame = buf.slice(0, idx).trim();
@@ -5986,7 +6937,7 @@ async function backendRunning(sid, view) {
   try {
     const d = await api('/api/sessions/' + sid);
     // 慢网下响应可能晚于导航：pending 属于被探测的会话，只对仍停在它上面的界面生效
-    if (d.pending && v.state.cur && v.state.cur.id === sid) applyPending(v, d.pending);
+    if (d.pending && v.state.cur && v.state.cur.id === sid) applyPending(v, d.pending, sid);
     return !!(d.running || (d.meta && d.meta.status === 'running'));
   } catch (e) { return false; }
 }
@@ -6001,21 +6952,46 @@ async function refreshIfDangling(view) {
 }
 
 // reloadMessages 只重取当前会话的消息与待生效队列（不触发接流，避免与 attachRun 互相递归）
-async function reloadMessages(view) {
+// opts.sinceSeq：增量补拉——带上界面已有的最后一条消息序号，只把这条之后的新消息
+// 追加进列表（流重建自愈用）。服务端详情接口只支持 tail / before_seq，所以请求还是
+// 那一个基础窗，但「要哪一段」由这里的序号判定：窗口起点盖住了断点就追加、不重取
+// 历史（DOM 前缀照旧复用，视口原地不动）；盖不住（断流期间新增超过一个窗口）才退回
+// 整窗对齐，宁可多取一次也不让中间缺条。
+async function reloadMessages(view, opts) {
   view = view || mainView;
   if (!view.state.cur) return;
   if (view.state._loading) return; // 会话正在整包加载：由 loadSessionInto 收口，不并发重取
+  const sinceSeq = (opts && opts.sinceSeq) || 0;
   const nav = navTok[view.key]; // 导航令牌：慢网下响应可能晚于切走/回首页，落地前必须复验
   try {
-    const d = await api('/api/sessions/' + view.state.cur.id);
+    // 分批口径：只重取基础窗（tail），已上翻加载的头部原样保留——attached 事件
+    // 刷新不再把整段历史反复拉回（这正是主对话被事件轰炸时最大的流量来源）
+    const d = await api('/api/sessions/' + view.state.cur.id + '?tail=' + LOAD_BATCH);
     // 已被更新的导航取代：晚到的旧会话数据不落地——否则 state.cur 被旧 meta 复活、
     // 界面被旧消息顶回旧会话，正是远程访问时「切过去又被跳回来」的根源
     if (nav !== navTok[view.key]) return;
-    if (snapshotStale(view, view.state.cur.id, d.messages)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
+    const incoming = d.messages || [];
+    const delta = sinceSeq > 0 && incoming.length > 0 && incoming[0].seq <= sinceSeq;
+    if (delta) {
+      // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）
+      view.state.msgs = view.state.msgs.concat(incoming.filter((m) => (m.seq || 0) > sinceSeq));
+    } else {
+      if (snapshotStale(view, view.state.cur.id, incoming)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
+      const head = incoming.length ? view.state.msgs.filter((m) => m.seq < incoming[0].seq) : [];
+      if (head.length) {
+        d.messages = head.concat(incoming);
+        if (d.older) d.older = { ...d.older, count: Math.max(0, (d.older.count || 0) - head.length) };
+      } else if (d.older) {
+        view.state._baseWinBase = { sys: d.older.sys, tools: d.older.tools }; // 基础窗边界前移（无上翻历史）：释放基线跟到最新
+      }
+      view.state.older = d.older ? { ...d.older, count: d.older.count || 0 } : undefined;
+      renderLoadOlderBar(view);
+      view.state.msgs = d.messages || [];
+    }
     view.state.cur = d.meta;
-    view.state.msgs = d.messages || [];
     view.state.pendingSteer = (d.pending && d.pending.steer) || [];
     view.state.pendingQueue = (d.pending && d.pending.queue) || [];
+    view.state.pendingVer = (d.pending && d.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
     view.state.checkpoints = d.checkpoints || [];
     view.state.deliveries = d.deliveries || [];
     // 上一轮失败过就继续显示报错条（刷新/切换回来都还在，方便接着重试）
@@ -6026,7 +7002,7 @@ async function reloadMessages(view) {
 }
 
 // attachRun 接上一个正在执行的会话的事件流（页面刷新/流断开后继续跟随输出）
-async function attachRun(view) {
+async function attachRun(view, opts) {
   view = view || mainView;
   const cur = view.state.cur;
   if (!cur || view.state.streaming) return;
@@ -6038,11 +7014,11 @@ async function attachRun(view) {
   view.state.streamThinking = '';
   hideRunError(view); // 执行还在跑：报错条收掉
   setStreamUI(true, view);
-  await reloadMessages(view); // 先对齐到服务端现状，再接流
+  await reloadMessages(view, opts); // 先对齐到服务端现状（可带 sinceSeq 只补增量），再接流
   try {
     const res = await fetch(`/api/sessions/${cur.id}/stream`, { signal: abort.signal });
     if (!res.ok || !res.body) throw new Error(res.statusText || '无法接上执行流');
-    await consumeStream(res, view, cur.id);
+    await consumeStream(res, view, cur.id, abort);
   } catch (e) {
     if (e.name !== 'AbortError') console.warn('[JX] 接回执行流失败', e);
   }
@@ -6066,6 +7042,114 @@ async function attachRun(view) {
     if (await backendRunning(cur.id, view)) attachRun(view);
   }
 }
+
+/* ---------- 会话流健康看门狗（远程/手机端「假死」根治） ----------
+   手机息屏或切到后台再回来，远程隧道上的那条会话流会「假死」：读流挂在一次
+   永不到达的 read 上，既不报错也不结束——下面的重连逻辑永远等不到触发，界面
+   就停在旧内容，只能退出重进或整页刷新。两条长连接的重连机制各管各的
+   （/api/events 有垫片 3s 自连，会话流断了有 reloadMessages 兜底），所以这里
+   补的是「假死」这一种：用一个时间戳判活，该断的主动断掉再重建。
+   判活口径：服务端 serveRun 每 15s 必发一个 ": ping" 注释帧，生成中也持续有
+   delta，所以界面侧 25 秒收不到任何字节＝这条流已经死了（正常执行绝不会）。
+   动手口径：只在「有流在跑 + 真的静默」时动手，空闲会话不重连；页面在后台不动手
+   （后台定时器被系统压制、网络也可能被挂起），留给回前台的那一次检查统一处理。
+   重建不是整页刷新：掐掉这条流 → 按后端状态接回/补拉 → 只补最后一条消息之后的
+   增量，已上翻的历史与视口原地不动。 */
+const STREAM_SILENT_MS = 25000;    // 静默多久判死（服务端 15s 一个 ping，留一倍余量）
+const STREAM_REVIVE_GAP_MS = 5000; // 同一会话两次重建的最小间隔（抖动时只重建一次）
+const STREAM_TICK_MS = 5000;       // 看门狗扫描间隔
+
+const streamReviveAt = new Map();  // 会话 id → 上次重建时间（节流按会话算，主/子视图共用）
+
+// 有字节到达＝这条流还活着（consumeStream 每段都会调；setStreamUI(true) 在每条
+// 新流开始时也刷一次，静默从那一刻起算）
+function streamAlive(view) { view._lastDataAt = Date.now(); }
+// 还没收到过任何字节（时间戳为空）＝这条流刚开始，按健康算
+function streamSilentMs(view) { return Date.now() - (view._lastDataAt || Date.now()); }
+// 界面已有的最后一条消息序号：补拉增量的起点
+function lastSeqOf(view) {
+  const msgs = view.state.msgs || [];
+  return msgs.length ? (msgs[msgs.length - 1].seq || 0) : 0;
+}
+
+// reviveSessionStream 把假死的那条流捅死重开：掐掉读取 → 探后端 → 接回或补拉。
+// 返回是否真的动过手（节流挡下时返回 false，调用方不必管）。
+async function reviveSessionStream(view, why) {
+  view = view || mainView;
+  const sid = view.state.cur && view.state.cur.id;
+  if (!sid || view._reviving) return false;
+  const now = Date.now();
+  if (now - (streamReviveAt.get(sid) || 0) < STREAM_REVIVE_GAP_MS) return false; // 抖动：5 秒内只重建一次
+  streamReviveAt.set(sid, now);
+  view._reviving = true;
+  const lastSeq = lastSeqOf(view);
+  console.info('[JX] 会话流重建：' + why + '（会话 ' + sid + '，从消息序号 ' + lastSeq + ' 之后补拉）');
+  view._lastDataAt = Date.now(); // 新一轮计时从这里起算
+  try {
+    if (view.state.streaming) detachStream(view); // 只掐界面这条读取：后端执行照旧跑
+    if (await backendRunning(sid, view)) {
+      // 会话还在跑：接回执行流（先按序号补增量对齐，服务端再把进行中的半句补发过来）
+      if (view.state.cur && view.state.cur.id === sid && !view.state.streaming) {
+        attachRun(view, { sinceSeq: lastSeq });
+      }
+    } else {
+      // 会话已经跑完（结束信号随那条死掉的流一起丢了）：补拉一次把结果落出来
+      await reloadMessages(view, { sinceSeq: lastSeq });
+      if (view === mainView) { loadSessions(); refreshCtxChip(); }
+      else { refreshDrawer(); refreshCtxChip(subView); }
+    }
+  } catch (e) {
+    console.warn('[JX] 会话流重建失败', e);
+  } finally {
+    view._reviving = false;
+  }
+  return true;
+}
+
+// 看门狗：有流在跑 + 真的静默 → 判死重建；空闲会话、正常生成中的会话都不碰。
+// 页面在后台时整轮跳过：后台定时器被系统压制、网络也可能被挂起，那种「静默」
+// 不代表流死了，交给回前台的那一次体检统一处理。
+function streamWatchdogTick() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+  for (const view of foldViews()) {
+    if (!(view.state.streaming && view.state.cur)) continue;
+    if (streamSilentMs(view) <= STREAM_SILENT_MS) continue;
+    reviveSessionStream(view, '静默 ' + Math.round(streamSilentMs(view) / 1000) + ' 秒（界面仍是执行态）');
+  }
+}
+
+// 回前台/网络恢复时的体检：有流在跑就查它活没活（不健康立刻重建）；没有本地流
+// 而会话其实还在跑（执行体在服务端，脱手了）就接回去；空闲会话只探一次、不重建。
+async function resumeStreamCheck(why) {
+  for (const view of foldViews()) {
+    const sid = view.state.cur && view.state.cur.id;
+    if (!sid) continue;
+    if (view.state.streaming) {
+      if (streamSilentMs(view) > STREAM_SILENT_MS) await reviveSessionStream(view, why);
+      continue;
+    }
+    if (view._wakeBusy) continue;
+    view._wakeBusy = true;
+    try {
+      const running = await backendRunning(sid, view);
+      if (running && view.state.cur && view.state.cur.id === sid && !view.state.streaming) {
+        console.info('[JX] ' + why + '：会话仍在执行，接回执行流（会话 ' + sid + '）');
+        attachRun(view, { sinceSeq: lastSeqOf(view) });
+      }
+    } finally {
+      view._wakeBusy = false;
+    }
+  }
+}
+
+// 三个转折点：页面变可见（息屏/切后台回来）、bfcache 恢复、网络恢复。
+// 都只做一次体检，不复位任何界面状态。
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) resumeStreamCheck('页面回到前台');
+});
+window.addEventListener('pageshow', () => resumeStreamCheck('页面从后台恢复'));
+window.addEventListener('online', () => resumeStreamCheck('网络恢复'));
+setInterval(streamWatchdogTick, STREAM_TICK_MS);
 
 // stopRun 显式停止：后端执行体独立于页面，必须让服务端停——本地只是等着这条流自己收尾
 // （取消会立刻作用到模型流/工具/等待，服务端写入的收尾记录也就随流到达）。
@@ -6155,9 +7239,9 @@ function renderCtxTip(view) {
     '<div class="ctx-ops">' +
       (running ? '<span class="ctx-ops-hint">执行中，等这一轮结束再压缩</span>' : '') +
       '<button type="button" class="ctx-compact" data-ctx-compact="1"' + (off ? ' disabled' : '') +
-        ` title="${running ? '会话正在执行，等这一轮结束再压缩' : '压缩当前对话：从最后一轮往上全部压掉（最后一轮本身也在内，会先问一次）'}">` +
+        ` title="${running ? '会话正在执行，等这一轮结束再压缩' : '提前自动压缩：不等阈值到点，立即按设置的保留字数执行一次自动压缩（规则折叠或模型摘要，按当前设置的模式选路）'}">` +
         CTX_COMPACT_ICON +
-        '<span class="cc-t">' + (busy ? '压缩中…' : '压缩') + '</span>' +
+        '<span class="cc-t">' + (busy ? '压缩中…' : '提前自动压缩') + '</span>' +
       '</button>' +
     '</div>' +
     '<div class="ctx-bar" title="已用 ' + pct + '%，灰色为未占用">';
@@ -6238,13 +7322,14 @@ function lastRoundSeq(view) {
   return 0;
 }
 
-// 明细卡顶部的「压缩」：压缩**当前视图这个会话**的上下文。
-// 口径与「最后一轮正文输出下方那个压缩按钮」完全一致（用户 2026-10-25 明确要求）：
-// 把 upTo 所在轮（含）及更早的回合全部压缩——这里 upTo 传最后一轮的 seq，于是从
-// 最后一轮往上、连最后一轮自己在内全压掉；**不是**自动压缩那种「按字数留最近一截」，
-// 所以不带 upTo 的空请求体不用（空体＝自动压缩的保留窗口口径）。
-// · 接口就用现成的 POST /api/sessions/{id}/compact（body.upTo 指定压到哪一轮，语义
-//   由后端确定：规则模式即时折叠、模型模式出摘要，前端不另造规则）；
+// 明细卡顶部的「提前自动压缩」：对**当前视图这个会话**手动点火一次自动压缩
+// 线路（用户 2026-11-09 要求；此前它与「最后一轮正文输出下方那个压缩按钮」同款
+// 走手动全量线路，现已分开——输出下方那个仍是手动全量，这里走自动线路）：
+// · 接口 POST /api/sessions/{id}/autocompact（后端 autoCompactKick：与阈值触发的
+//   自动压缩同一套动作——按设置的保留字数从最新一轮往前数、装得下的整轮保留，
+//   更早的压缩；规则折叠还是模型摘要按当前设置的模式选路，前端不另造规则。
+//   规则折叠同步完成；模型摘要 202 转后台执行，完成/失败经 session_updated 事件
+//   驱动刷新，这里不等待）；
 // · 先居中确认（用户明确在意误操作：位置放顶部 + 点一次确认，两道都上）；
 // · 执行中不压：正在跑的一轮还在往历史里写，后端也会 409，前端先拦并说人话；
 // · 完成后重拉 /api/sessions/{id}/context（refreshCtxChip）刷新这张卡，再轻提示
@@ -6263,8 +7348,8 @@ async function compactFromCtxPanel(view) {
     await confirmCenter('这个对话还没有可压缩的回合。', true);
     return;
   }
-  const ok = await confirmCenter('压缩当前对话的上下文？\n从最后一轮往上，整个对话都会被压缩（最后一轮本身也在内）；' +
-    '原始消息仍可用历史检索工具查回。');
+  const ok = await confirmCenter('提前执行一次自动压缩？\n按设置的保留字数保留最近几轮原文不动，更早的内容压缩掉' +
+    '（规则折叠或模型摘要，按当前设置的模式选路）；原始消息仍可用历史检索工具查回。');
   if (!ok) return;
   const before = (lastCtx[view.key] && lastCtx[view.key].total) || 0;
   ctxCompactBusy[view.key] = true;
@@ -6272,9 +7357,14 @@ async function compactFromCtxPanel(view) {
   // 收工：按钮回到可用（成功失败都走，成功时卡片已被 refreshCtxChip 重画过一遍也无妨）
   const restore = () => { ctxCompactBusy[view.key] = false; renderCtxTip(view); };
   try {
-    const r = await api('/api/sessions/' + cur.id + '/compact', {
-      method: 'POST', body: JSON.stringify({ upTo }),
-    });
+    const r = await api('/api/sessions/' + cur.id + '/autocompact', { method: 'POST' });
+    if (r && r.async) {
+      // 模型摘要已转后台（202 即回，大历史摘要要一两分钟）：不在这里等结果，
+      // 登记状态后即可去干别的，完成/失败由 SSE 驱动对话区翻新
+      compactingSess.add(cur.id);
+      toast('已转入后台压缩，完成后对话区自动刷新', 5000);
+      return; // finally 恢复按钮
+    }
     await refreshCtxChip(view); // 重拉 /context：卡片里的数字与分类条按压缩后的状态重画
     const after = (lastCtx[view.key] && lastCtx[view.key].total) || 0;
     toast(compactResultMsg(r, before, after), 6000);
@@ -6297,7 +7387,7 @@ async function compactFromCtxPanel(view) {
 function compactResultMsg(r, before, after) {
   const what = (r && r.folded)
     ? '已折叠 ' + r.folded + ' 个回合'
-    : '已把整个对话压缩成摘要';
+    : (r && r.scope === 'auto' ? '已把较早历史压缩成摘要' : '已把整个对话压缩成摘要');
   const from = before ? fmtTokens(before) : '—';
   const to = after ? fmtTokens(after) : '—';
   const saved = (before && after && before > after) ? before - after : 0;
@@ -6886,7 +7976,10 @@ function modelNameOf(key) {
   return (hit && (hit.modelName || hit.modelId)) || mid;
 }
 
-const THINK_LABELS = { enabled: '思考·开', disabled: '思考·关', low: '思考·低', medium: '思考·中', high: '思考·高', max: '思考·深' };
+// 思考档位中文文案：语义准确、大小阶梯一目了然（低/中/高/最大；max 译
+//「最大」——「深」「最高」都与「高」分不清大小）。厂家特有档位不在表里
+// 的原样显示。
+const THINK_LABELS = { enabled: '思考·开', disabled: '思考·关', low: '思考·低', medium: '思考·中', high: '思考·高', max: '思考·最大' };
 
 // 当前生效的思考档位（会话级 / 首页草稿 / 指定视图的会话）
 function curThinking(view) {
@@ -6995,6 +8088,18 @@ function renderModelPop(view) {
     html += `<button class="pop-item model-item ${k === cur ? 'sel' : ''}${modelPopExpand === k && hasLv ? ' exp' : ''}${m.providerOff ? ' off' : ''}" data-key="${esc(k)}"><span>${esc(m.modelName || m.modelId)}</span>${hasLv ? arrow : ''}</button>`;
   }
   pop.innerHTML = html;
+  if (!(state.models || []).length) {
+    // 新装未接公司通道、也没自己添加通道：菜单只剩「默认（未配置）」会让用户
+    // 不知道下一步做什么，直接把「接入公司通道」做成可点的行。
+    pop.insertAdjacentHTML('beforeend',
+      '<button class="pop-item model-wizard" type="button">接入公司通道…</button>' +
+      '<div class="pop-group">还没有模型通道：也可以到「设置 · 模型」自己添加一个提供方</div>');
+    const wiz = pop.querySelector('.model-wizard');
+    if (wiz) wiz.onclick = () => {
+      closePopovers();
+      if (typeof openWizard === 'function') openWizard();
+    };
+  }
   pop.querySelectorAll('.model-item').forEach((b) => {
     const key = b.dataset.key;
     // 悬停整行：有档位就在右侧浮出它的思考档位，悬到无档位的行则收起（仅真 hover 指针）
@@ -7492,6 +8597,15 @@ function syncPlusChecks(view) {
   $('pm-plan-check').textContent = s.planMode ? '✓' : '';
   $('pm-goal-check').textContent = s.goalMode ? '✓' : '';
   $('pm-remote-check').textContent = remote ? '✓' : '';
+  // 「本对话的组件与插件」只属于主对话区且要有当前会话（子对话区与首页不显示：
+  // 组件装配跟主会话走，从子对话区改它反而说不清改的是谁）
+  const cxItem = $('pm-cxsession');
+  if (cxItem) {
+    const hasSession = view === mainView && !!cur;
+    cxItem.classList.toggle('hidden', !hasSession);
+    $('pm-cxsession-check').textContent =
+      hasSession && window.CX && CX.sessionCustom ? '✓' : '';
+  }
 }
 
 function openPlusMenu(view) {
@@ -7873,8 +8987,9 @@ function renderAttachments(view) {
 }
 
 /* 粘贴与拖拽投放：都只入附件区，不碰工作区。
-   粘贴只吃剪贴板里的文件对象（截图、网页复制的图片），纯文本粘贴原样放行；
-   从资源管理器复制文件再粘贴时 Chromium 只给路径文本、拿不到文件对象，本轮不做。 */
+   粘贴吃剪贴板里的文件对象（截图、网页复制的图片、资源管理器复制的文件——
+   WebView2/Chromium 157 实测 CF_HDROP 也会读成 File 对象送到 paste 事件，证据
+   见 gui-test/ctxmenu-paste-diag.mjs），纯文本粘贴原样放行。 */
 function setupAttachDrop(view) {
   // 投放目标是输入卡本身，不是 composer-wrap：首页时输入卡被搬进页面中央的问候区
   // （wrap 里根本没有它），绑在 wrap 上会漏掉首页那次投放
@@ -8100,6 +9215,13 @@ function setupWidthHandles() {
     wrap.parentNode.insertBefore(zone, wrap);
     zone.appendChild(wrap);
   }
+  // 拖拽跟随不依赖 setPointerCapture：把手只有 10px 宽，捕获一旦失效，move 事件
+  // 只剩「指针正压在把手上」的窄窗才有——2026-11-08 远程实报：经网关打开的页面
+  // 上捕获静默不生效，对话区把手的 ×2 增益让把手以与指针同速跑离，拖几个像素
+  // 就再也跟不上（「能动很小一点，离开就不跟」）。改为拖动期间由 window 接管
+  // move/up：指针下无论是什么元素，事件都冒泡到 window，捕获在不在都持续跟随；
+  // setPointerCapture 保留为增强（本地可用时，指针拖出窗口外也不断流）。
+  // 三处分割条（对话区/右栏/左栏）同一模式，见 app-right.js / app-left.js。
   for (const side of ['left', 'right']) {
     const h = document.createElement('div');
     h.className = 'w-handle ' + side;
@@ -8113,7 +9235,7 @@ function setupWidthHandles() {
       h.classList.add('dragging');
       try { h.setPointerCapture(e.pointerId); } catch (err) { /* 旧浏览器忽略 */ }
     });
-    h.addEventListener('pointermove', (e) => {
+    window.addEventListener('pointermove', (e) => {
       if (!h.classList.contains('dragging')) return;
       const dx = (e.clientX - startX) * 2 * (side === 'right' ? 1 : -1); // 居中对称放大
       setContentWidth(startW + dx);
@@ -8123,8 +9245,8 @@ function setupWidthHandles() {
       h.classList.remove('dragging');
       setContentWidth(contentWidth(), true); // 松手落盘
     };
-    h.addEventListener('pointerup', up);
-    h.addEventListener('pointercancel', up);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
     h.addEventListener('dblclick', () => {
       document.documentElement.style.removeProperty('--content-w');
       lsSet('jx.contentWidth', null);
@@ -8240,6 +9362,8 @@ function setupScrollTuck() {
   for (const view of [mainView, subView]) {
     setupAttachDrop(view); // 附件区：粘贴图片与拖拽投放（两个视图各挂一套）
     setupInputMarks(view); // 标记胶囊：背衬层渲染与光标原子策略（两个视图各挂一套）
+    const lob = viewEl(view, 'load-older');
+    if (lob) lob.onclick = () => loadOlder(view); // 顶条点击：立即取上一批
     let lastY = view.scroll.scrollTop;
     // 跟随钉住的手势入口：滚轮上翻/触摸上滑立即钉住（无论离底多近——否则
     // 一步滚轮增量会被下一次跟随吃掉）；拖滚动条/键盘翻页由下方 scroll 兜底。
@@ -8279,6 +9403,11 @@ function setupScrollTuck() {
       const synthetic = ts - (view._renderTs || 0) < 350 || ts < (view._progUntil || 0);
       if (!synthetic && dist > FOLLOW_PIN_DIST) { view._pinned = true; view._pinTs = ts; }
       else if (!synthetic && dist < FOLLOW_RESUME && ts - (view._pinTs || 0) > PIN_GUARD_MS) view._pinned = false;
+      // 分批加载：上翻接近已加载窗口顶即预取上一批（缓冲 500 条）；贴底跟随时
+      // 武装「到顶释放」计时（60 秒不上翻就把上方批次放掉），一旦离底立刻取消
+      maybeLoadOlder(view);
+      if (dist > FOLLOW_PIN_DIST) cancelReleaseOlder(view);
+      else if (!view._pinned && dist < FOLLOW_RESUME) armReleaseOlder(view);
       // 回到底部按钮：滚离底部出现，靠近底部消失（滞回）
       const was = !!view._jumpShow;
       const now = was ? dist > JUMP_HIDE : dist > JUMP_SHOW;
@@ -8387,6 +9516,13 @@ for (const v of [mainView, subView]) {
 $('pm-export').onclick = () => doExport('md');
 $('pm-export-json').onclick = () => doExport('json');
 $('pm-remote').onclick = () => { remoteFormPrefill(); openPopover('remote-pop', viewEl(popView, 'btn-plus')); };
+// 本对话的组件与插件：会话级覆盖浮窗（app-cxsession.js）。从加号菜单进，
+// 先收掉弹层再开浮窗（modal 与 popover 互不打架）
+$('pm-cxsession').onclick = () => {
+  if (!(popView === mainView && state.cur)) return; // 只在主对话区且有会话时可见
+  closePopovers();
+  openCXSessionUI();
+};
 $('remote-badge').onclick = () => { remoteFormPrefill(); openPopover('remote-pop', $('remote-badge')); };
 $('rm-auth').addEventListener('change', syncRemoteFormVis);
 $('rm-test').onclick = testRemote;
@@ -8486,7 +9622,7 @@ document.addEventListener('keydown', (e) => {
    断线退避重连、时长倒计时徽标、一次性轻提示）已整体搬进「语音（朗读与听写）」
    组件：组件/voice/client.js。两个语音输入按钮的 DOM 仍在 index.html（位置、样式、
    图标全不变），但默认带 .hidden——按钮属于组件，组件加载成功才揭开并接管行为；
-   组件关掉（设置 → 内置组件）或没加载到页面 = 按钮整组不出现。 */
+   组件关掉（设置 → 组件）或没加载到页面 = 按钮整组不出现。 */
 /* ---------- 上下文圆环：悬停出明细卡（卡片顶部带「压缩」）----------
    交互就一套悬停：鼠标进圆环出卡片，从圆环挪到卡片上不消失（CSS 的 :hover 认整棵
    子树，圆环与卡片之间那 10px 空隙由 .ctx-tip::before 的透明块补上），离开圆环和

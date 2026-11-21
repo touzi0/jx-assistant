@@ -1,6 +1,6 @@
-// sitesproxy.go —— 小程序平台（jxai-server 的 /sites 网页托管平台）内嵌半边。
+// sitesproxy.go —— 企业小程序（jxai-server 的 /sites 网页托管平台）内嵌半边。
 //
-// 设计意图（2026-10-30 用户口径）：小程序平台必须像企业技能市场一样**在应用内
+// 设计意图（2026-10-30 用户口径）：企业小程序必须像企业技能市场一样**在应用内
 // 打开**，不能跳系统浏览器。此前 iframe 直连服务端 HTTPS 会被浏览器自己的证书
 // 校验静默拒绝（自签证书/用 IP 访问域名证书，连"继续访问"按钮都没有）——企业技能
 // 市场从来没这个问题，因为它从不让前端直连服务端：全部经本端 Go 的
@@ -50,7 +50,7 @@ func (a *App) handleSitesProxy(w http.ResponseWriter, r *http.Request) {
 	if target == nil {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte("还没配置市场服务器：请到 设置 · 网络访问 填「市场服务器」，小程序平台与它同一台服务端。"))
+		_, _ = w.Write([]byte("还没配置市场服务器：请到 设置 · 网络访问 填「市场服务器」，企业小程序与它同一台服务端。"))
 		return
 	}
 	proxy := &httputil.ReverseProxy{
@@ -82,7 +82,7 @@ func (a *App) handleSitesProxy(w http.ResponseWriter, r *http.Request) {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = w.Write([]byte("小程序平台连不上服务端（" + target.Host + "）：" + err.Error()))
+			_, _ = w.Write([]byte("企业小程序连不上服务端（" + target.Host + "）：" + err.Error()))
 		},
 	}
 	proxy.ServeHTTP(w, r)

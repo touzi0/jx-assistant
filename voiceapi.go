@@ -264,8 +264,10 @@ func speechXMLEscape(s string) string {
 // ---------- HTTP 处理器 ----------
 
 // voiceOn 组件开关自查（组件关掉时语音端点一并消失，口径同 todo/git 面板）。
+// 生效口径含会话级覆盖：某会话把全局关着的语音打开时，端点要能服务
+// （请求不带会话，按「全局或任一会话要它」放行；关掉的对话里按钮已热卸载）。
 func (a *App) voiceOn(w http.ResponseWriter) bool {
-	if a.Components == nil || !a.Components.IsEnabled(voiceComponentID) {
+	if a.Components == nil || !a.cxoComponentLive(voiceComponentID) {
 		writeErr(w, 404, "组件已停用或不存在")
 		return false
 	}
@@ -314,7 +316,9 @@ func (a *App) handleVoiceTTS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Cache-Control", "no-store")
 	flusher, _ := w.(http.Flusher)
+	wrote := false
 	err := synthesizeEdge(ctx, text, voice, rateAttr, func(chunk []byte) error {
+		wrote = true
 		if _, werr := w.Write(chunk); werr != nil {
 			return werr
 		}
@@ -323,9 +327,16 @@ func (a *App) handleVoiceTTS(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	})
-	// 头已发出后失败只能断流（客户端表现为下载中断），日志留现场
 	if err != nil {
 		log.Printf("[语音] 朗读失败: %v", err)
+		// 一个字节都没下发过（典型：微软对新域名限流 429、后备旧域名 403）：
+		// 响应头还没真正发出，如实把错误码回报前端。旧版在这里什么都不写，
+		// net/http 自动补 200 空体——前端把 0 字节 blob 当成功音频去播，播放
+		// 失败即整条朗读链被砍（「读几句就停」的放大器）。已经发过音频的
+		// 中途失败仍只能断流（头与部分数据已在路上，状态码改不了了）。
+		if !wrote {
+			writeErr(w, 502, "朗读服务暂时不可用："+err.Error())
+		}
 	}
 }
 

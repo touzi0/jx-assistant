@@ -165,7 +165,9 @@ func TestVoiceTTSErrors(t *testing.T) {
 	if w := doJSON(t, a.handleVoiceTTS, "POST", "/api/voice/tts", strings.NewReader("xx")); w.Code != 400 {
 		t.Fatalf("非法 JSON 应 400，得 %d", w.Code)
 	}
-	// 端点不可达：头已定，合成失败走断流（不出 5xx，也不 panic）——两代通道全挂
+	// 端点不可达：一个字节都没下发过，失败如实回 502 JSON（旧版不写错误码、
+	// 回 200 空体——前端把 0 字节 blob 当成功音频去播，播放失败即整条朗读链
+	// 被砍，是「读几句就停」的放大器）——两代通道全挂
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(403)
 	}))
@@ -175,8 +177,11 @@ func TestVoiceTTSErrors(t *testing.T) {
 	edgeTTSBaseFallback, edgeTTSBase = mock, mock
 	defer func() { edgeTTSBaseFallback, edgeTTSBase = oldFB, old }()
 	w := doJSON(t, a.handleVoiceTTS, "POST", "/api/voice/tts", strings.NewReader(`{"text":"hi"}`))
-	if w.Code != 200 || w.Body.Len() != 0 {
-		t.Fatalf("失败应断流（200/空体），得 %d / %d 字节", w.Code, w.Body.Len())
+	if w.Code != 502 || !strings.Contains(w.Body.String(), "朗读服务暂时不可用") {
+		t.Fatalf("未下发字节的失败应回 502 带错误信息，得 %d: %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("错误响应应为 JSON，得 %s", ct)
 	}
 }
 

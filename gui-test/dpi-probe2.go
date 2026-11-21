@@ -73,7 +73,7 @@ func main() {
 }
 
 func findMain() uintptr {
-	title := "坚祥数字助理GO"
+	title := "AI数字助理"
 	var mainWnd uintptr
 	cb := syscall.NewCallback(func(h, l uintptr) uintptr {
 		if vis, _, _ := pIsVisible.Call(h); vis == 0 {

@@ -26,7 +26,6 @@ type UpdateState struct {
 	Available   bool   `json:"available"`             // 最新版本比当前新
 	Latest      string `json:"latest,omitempty"`      // 最新版本号（tag_name，去 v 前缀）
 	Notes       string `json:"notes,omitempty"`       // 发布说明（body 截断）
-	URL         string `json:"url,omitempty"`         // 发布页（html_url）
 	DownloadURL string `json:"downloadUrl,omitempty"` // 安装包直链（完整安装路：横幅「确认更新」与设置页按钮共用）
 	PublishedAt string `json:"publishedAt,omitempty"`
 	Current     string `json:"current"`             // 当前运行版本
@@ -37,6 +36,9 @@ type UpdateState struct {
 	PendingRestart bool              `json:"pendingRestart,omitempty"` // engine 已交换，重启后生效
 	PendingVersion string            `json:"pendingVersion,omitempty"`
 	Applied        map[string]string `json:"applied,omitempty"` // 已静默应用的组件块 id→版本
+	// ComponentsPending 运行中占着目录、已下载暂存、等下次启动落地的组件块
+	// （id→版本）。设置页只在有内容时安静显示一行，不当错误报。
+	ComponentsPending map[string]string `json:"componentsPending,omitempty"`
 }
 
 var (
@@ -249,18 +251,22 @@ func (a *App) checkUpdateOnce(url string) {
 	}
 	setUpdateError("")
 	// 分块静默更新（update_blocks.go）：附件里有 blocks.json 时先取清单——
-	// 清单覆盖 engine 且自动模式开启则抑制「新版本可用」整包横幅（改走静默
-	// 应用 + update_ready 就绪横幅）；清单缺失/失败完全回退整包路
+	// 自动模式下分块发布整版走静默路（engine 交换出 update_ready 就绪横幅、
+	// 组件静默落地），「新版本可用·确认更新」整包横幅一律抑制，不再只看
+	// engine 块是否更新：组件-only 发布（engine 同版、只发 voice 等组件块）
+	// 同样没有用户可做的事，横幅上的「确认更新」没有安装包可下，只会把用户
+	// 引去打开发布页（2026-11-21 用户反馈：弹出发布页窗口吓人——更新就更新，
+	// 不该开窗口）。清单缺失/失败完全回退整包路；engine 块应用失败由
+	// applyBlocksPlan 补发 update_available 回退整包横幅。
 	blocks := fetchUpdateBlocks(rel, url)
 	if blocks != nil {
 		updateMu.Lock()
 		updateState.BlocksMode = true
 		updateMu.Unlock()
 	}
-	silentEngine := blocks != nil && a.silentUpdateEnabled() &&
-		blocks.Engine != nil && versionCompare(blocks.Engine.Version, appVersion) > 0
-	applyUpdateInfo(a, rel, url, silentEngine)
-	if blocks != nil && a.silentUpdateEnabled() {
+	silentBlocks := blocks != nil && a.silentUpdateEnabled()
+	applyUpdateInfo(a, rel, url, silentBlocks)
+	if silentBlocks {
 		a.applyBlocksPlan(blocks, rel, url)
 	}
 }
@@ -287,11 +293,12 @@ func applyUpdateInfo(a *App, rel releaseInfo, sourceURL string, suppressBanner b
 	updateMu.Lock()
 	updateState.Latest = latest
 	updateState.Notes = notes
-	updateState.URL = publicizeURL(rel.HTMLURL, sourceURL)
 	updateState.DownloadURL = download
 	updateState.PublishedAt = rel.PublishedAt
-	updateState.Available = versionCompare(latest, appVersion) > 0
-	shouldNotify := updateState.Available && updateNotified != latest && !suppressBanner
+	// suppressBanner 时连 Available 一起关：整包横幅与左下角「更新」胶囊都以
+	// 它为开关，只压事件不压状态的话，刷新页面又会从 /api/status 弹回来
+	updateState.Available = !suppressBanner && versionCompare(latest, appVersion) > 0
+	shouldNotify := updateState.Available && updateNotified != latest
 	if shouldNotify {
 		updateNotified = latest
 	}
