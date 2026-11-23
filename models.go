@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -256,7 +257,7 @@ func guessModelMeta(id string) (ctx int, images bool) {
 		return false
 	}
 	images = has("4o", "gpt-4-turbo", "gpt-4.1", "gpt-5", "o3", "o4-mini", "claude",
-		"gemini", "glm-4v", "glm-5.3-flash", "qwen-vl", "-vl-", "vision", "llava", "pixtral", "grok-4", "vlmodel",
+		"gemini", "glm-4v", "glm-5.3-flash", "glm-5.4", "qwen-vl", "-vl-", "vision", "llava", "pixtral", "grok-4", "vlmodel",
 		// DeepSeek 仅 flash 支持图片输入（官方 /v1/models 的 input_modalities: text+image）；
 		// v4-pro 与老 deepseek-chat/reasoner/coder 均为纯文本，不列。
 		"deepseek-flash")
@@ -285,6 +286,12 @@ func guessModelMeta(id string) (ctx int, images bool) {
 		return 16384, images
 	case has("glm-4v"):
 		return 8192, true
+	case has("glm-5.4"):
+		// 5.4（2026-11 上线）：1M 上下文 + 原生多模态（模型卡片标注 1M／视觉）。
+		// 注意智谱的 /models 只返回 id/object/created/owned_by，上下文与模态
+		// 一个字段都不给，全靠这张表按型号登记——新版本上线必须在这里补一行，
+		// 否则会落到下面的通用分支，把我们不知道的模型报成 128K 纯文本。
+		return 1048576, images
 	case has("glm-5.3"):
 		return 1048576, images // 5.3 系上下文 1M（模型卡片），flash 为多模态
 	case has("glm-4"), has("glm-5"):
@@ -373,7 +380,7 @@ func guessReasoningLevels(protocol, id string) []string {
 }
 
 // effectiveReasoningLevels 取模型思考档位的最终展示/使用值：存储值优先
-//（「拉取模型」固化的服务端真实 supported_levels），但存储值是当前按
+// （「拉取模型」固化的服务端真实 supported_levels），但存储值是当前按
 // 协议+ID 推断结果的子集时视为过时的自动推断，跟随本版本推断刷新——档位
 // 没有手工编辑入口，存量配置里的值全是程序写入的（保存兜底会把 guess 写死进
 // config），guess 修正后老配置必须能跟着升级，否则用户永远看不到新档位。
@@ -510,12 +517,66 @@ func pingModel(p *ProviderCfg, model string) error {
 	return nil
 }
 
-// FetchModels 从提供方拉取可用模型清单（GET {baseURL}/models），
-// 新条目按 ID 猜测上下文窗口与图片能力自动填好。
+// flexStrings 是 JSON 形态不固定的字符串列表字段（/models 里的 modalities
+// 一类）：同样是「这个模型支持哪些输入模态」，老式端点写 ["text","image"]，
+// 聚合网关写 {"input":["text","image"],"output":["text"]}，也有的模型整个
+// 字段不写。硬绑 []string 时，只要清单里有一个模型写法不同，整份响应就
+// 反序列化失败、一个模型都拉不到（用户实际踩到过），所以这里统一摊平成扁平
+// 字符串列表：
+//   - 字符串 → 单个元素；数组 → 逐项摊平
+//   - 对象   → 按 key 字典序摊平各值（input 排在 output 前，结果与 map 随机序无关）
+//   - null / 缺失 / 数字等非字符串 → 忽略，不报错
+//
+// 消费方只关心「里面有没有 image」「有哪些思考档位」，摊平后语义不变。
+type flexStrings []string
+
+func (f *flexStrings) UnmarshalJSON(b []byte) error {
+	*f = appendFlexStrings(nil, b)
+	return nil
+}
+
+// appendFlexStrings 把一个 JSON 值里的字符串摊平追加到 dst。
+func appendFlexStrings(dst []string, raw json.RawMessage) []string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return dst
+	}
+	switch raw[0] {
+	case '"':
+		var s string
+		if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+			dst = append(dst, s)
+		}
+	case '[':
+		var items []json.RawMessage
+		if json.Unmarshal(raw, &items) == nil {
+			for _, it := range items {
+				dst = appendFlexStrings(dst, it)
+			}
+		}
+	case '{':
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) == nil {
+			keys := make([]string, 0, len(obj))
+			for k := range obj {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				dst = appendFlexStrings(dst, obj[k])
+			}
+		}
+	}
+	return dst
+}
+
 // FetchModels 从提供方拉取可用模型清单（GET {baseURL}/models）。
 // DeepSeek 等较新的兼容端会在清单里直接给出 context_window /
-// max_output_tokens / input_modalities / effort.supported_levels——
-// 这些真实字段优先；只返回 id 的老式端点回退到按 ID 猜测。
+// max_output_tokens / input_modalities / reasoning_levels /
+// effort.supported_levels——这些真实字段优先；只返回 id 的老式端点（智谱
+// /models 就是，只有 id/object/created/owned_by）回退到按 ID 猜测。
+// 这些列表字段的 JSON 形态各家不一（数组/对象/缺失都见过），统一走
+// flexStrings 归一：单个模型的写法差异不会让整份清单解析失败。
 func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 	url := strings.TrimRight(p.BaseURL, "/") + "/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -544,16 +605,17 @@ func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 	}
 	var out struct {
 		Data []struct {
-			ID              string   `json:"id"`
-			Name            string   `json:"name"`
-			DisplayName     string   `json:"display_name"` // Anthropic /v1/models 的同义字段
-			ContextWindow   int      `json:"context_window"`
-			ContextLength   int      `json:"context_length"` // 部分端点的同义字段
-			MaxOutputTokens int      `json:"max_output_tokens"`
-			InputModalities []string `json:"input_modalities"`
-			Modalities      []string `json:"modalities"`
+			ID              string      `json:"id"`
+			Name            string      `json:"name"`
+			DisplayName     string      `json:"display_name"` // Anthropic /v1/models 的同义字段
+			ContextWindow   int         `json:"context_window"`
+			ContextLength   int         `json:"context_length"` // 部分端点的同义字段
+			MaxOutputTokens int         `json:"max_output_tokens"`
+			InputModalities flexStrings `json:"input_modalities"`
+			Modalities      flexStrings `json:"modalities"` // 数组，或 {"input":[],"output":[]} 对象
+			ReasoningLevels flexStrings `json:"reasoning_levels"`
 			Effort          struct {
-				SupportedLevels []string `json:"supported_levels"`
+				SupportedLevels flexStrings `json:"supported_levels"`
 			} `json:"effort"`
 		} `json:"data"`
 	}
@@ -589,7 +651,12 @@ func (a *App) FetchModels(p *ProviderCfg) ([]ModelCfg, error) {
 				}
 			}
 		}
-		levels := m.Effort.SupportedLevels
+		// 思考档位：扁平写法 reasoning_levels 优先，其次 effort.supported_levels，
+		// 都没有才按模型 ID 猜（空数组也算没有，回退到猜测）。
+		levels := []string(m.ReasoningLevels)
+		if len(levels) == 0 {
+			levels = []string(m.Effort.SupportedLevels)
+		}
 		if len(levels) == 0 {
 			levels = guessReasoningLevels(p.Protocol, m.ID)
 		}
