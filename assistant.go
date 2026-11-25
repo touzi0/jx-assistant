@@ -1238,7 +1238,9 @@ func resolveChangedFile(a *App, m *SessionMeta, path, op string) changedFile {
 	if ws != "" {
 		if hit := findFileInWorkspace(ws, filepath.Base(path)); hit != "" {
 			cf.Exists, cf.Resolved = true, hit
-			if rel, err := filepath.Rel(ws, hit); err == nil && !strings.HasPrefix(rel, "..") {
+			// findFileInWorkspace 的 hit 来自磁盘列举（macOS 为 NFD 形态），与
+			// 配置工作区（常为 NFC）字面 Rel 会误判工作区外——两侧过 canonicalFor
+			if rel, err := filepath.Rel(canonicalFor(ws), canonicalFor(hit)); err == nil && !strings.HasPrefix(rel, "..") {
 				cf.Display, cf.Rel = filepath.ToSlash(rel), true
 			} else {
 				cf.Display, cf.Rel = hit, false

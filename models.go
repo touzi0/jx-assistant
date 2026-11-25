@@ -369,8 +369,14 @@ func guessReasoningLevels(protocol, id string) []string {
 		// 官方支持 thinking 开关 + reasoning_effort low/high/max（思考默认开、
 		// effort 默认 high；minimal/medium/xhigh/ultra 是这三档的别名映射）
 		return []string{"enabled", "disabled", "low", "high", "max"}
-	case has("glm-5.3"):
-		return []string{"enabled", "low", "high", "max"} // 5.3 起思考常开，用 reasoning_effort 调深浅
+	case has("glm-5.3"), has("glm-5.4"):
+		// 5.3 起思考常开，只用 reasoning_effort 调深浅（low/high/max）。
+		// 实测 5.4（2026-11-25，Coding Plan 端点）：三档都收，且档位间思考量
+		// 差异明显（同一道题 low≈4x tokens、high≈26x、max 更难时到 1499）；
+		// 传 thinking.type=disabled 不报错但也不生效——与不传的分布重叠
+		// （43/45/0 对 44/117/0），说明思考关不掉，所以不列「关」档，
+		// 免得菜单里给一个选了还在思考的假开关。
+		return []string{"enabled", "low", "high", "max"}
 	case has("glm-4.5"), has("glm-4.6"), has("glm-5"):
 		return []string{"enabled", "disabled"}
 	case has("qwen3"), has("kimi"), has("k2"):
@@ -405,7 +411,24 @@ func effectiveReasoningLevels(protocol, modelID string, stored []string) []strin
 	if subset {
 		return guessed
 	}
+	// 反向情形：旧版把这类型号（5.3/5.4 这类思考常开的新版）按 glm-5 通用口径
+	// 写成了「开/关」两档——旧值既不是新结果的子集，也不是端点真报过的档位
+	// （这些型号根本关不掉思考）。这种「纯开关档」一律视为过时的自动推断，
+	// 跟随本版本升级，否则用户永远看不到新增的低/高/最大档。
+	if !containsStr(guessed, "disabled") && onlyOnOffLevels(stored) {
+		return guessed
+	}
 	return stored
+}
+
+// onlyOnOffLevels 判断档位是不是「只有开/关」的旧口径（enabled/disabled 组合）。
+func onlyOnOffLevels(levels []string) bool {
+	for _, lv := range levels {
+		if lv != "enabled" && lv != "disabled" {
+			return false
+		}
+	}
+	return true
 }
 
 func containsStr(list []string, s string) bool {

@@ -91,7 +91,7 @@ func (a *App) closeSessionBrowser(sid string, by browserCloseBy) browserCloseRes
 	_, used := a.browserActive[key] // 注记只投给真正在用浏览器的会话（没开过的对话收到只会一头雾水）
 	a.browserMu.Unlock()
 	// 面板形态可把「谁发起」写进关闭各阶段日志（[browser-panel] 关闭: …）；
-	// 其余形态（有头/无头/Electron 桥）没有关闭阶段日志，按接口 Close 即可。
+	// 其余形态（有头/无头）没有关闭阶段日志，按接口 Close 即可。
 	if rc, ok := target.(interface{ CloseWithReason(string) }); ok {
 		rc.CloseWithReason(by.String() + " 发起")
 	} else {

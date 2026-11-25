@@ -181,9 +181,8 @@ func (a *App) buildContext(sess *SessionMeta, sys string, upTo int64) []Message 
 	for _, s := range summaries {
 		out = append(out, TextMessage("user", s.Text()))
 	}
-	prevEnv := ""     // 上一条可见快照；空 = 下一条整份呈现（首轮，或摘要折叠后的首条）
-	envUpdates := 0   // 自上一条整份/全量快照以来的连续差分数（自愈全量的计数）
-	foldSeen := false // 已见过折叠行：遇到首条未折叠可见行时在交界注入提示标签
+	envRenders := renderEnvRows(raw, boundary) // 每条 env 行发给模型时的消息文本（与前端展示同一次计算）
+	foldSeen := false                          // 已见过折叠行：遇到首条未折叠可见行时在交界注入提示标签
 	for _, m := range raw {
 		if m.Seq <= boundary || m.Kind == "summary" || m.Kind == "prompt" || m.Kind == "inherit" || m.Kind == "request" || m.Kind == "audit" {
 			continue
@@ -201,13 +200,11 @@ func (a *App) buildContext(sess *SessionMeta, sys string, upTo int64) []Message 
 			continue
 		}
 		if m.Kind == "env" {
-			env := m.Text()
-			if s, n := envRowRender(prevEnv, env, envUpdates); s != "" {
-				// 首条整份 / 差分（纯新增或【移除】【新增】变更清单）/ 计数到顶完整重发
-				out = append(out, TextMessage("user", s))
-				envUpdates = n
+			// 首条整份 / 差分（纯新增或【移除】【新增】变更清单）/ 计数到顶完整重发，
+			// 文本由 renderEnvRows 统一算出（见该函数注释）
+			if r, ok := envRenders[m.Seq]; ok {
+				out = append(out, TextMessage("user", r.Text))
 			}
-			prevEnv = env
 			continue
 		}
 		if m.Compact != "" {
@@ -407,6 +404,59 @@ func fullResendEnv(cur string) string {
 		body = cur[i+1:]
 	}
 	return "# 运行环境快照（完整重发，取代更早的快照与更新）\n" + strings.TrimRight(body, "\n")
+}
+
+// envRender 是一条 kind=env 快照行「发给模型时的那条消息」：Text 是模型实际
+// 收到的 user 消息正文，Mode 是形态。随会话详情接口附在行上下发（render 字段）、
+// 随实时 message 事件的 render 字段推送——前端只显示，不再镜像组装层的差分逻辑。
+type envRender struct {
+	Mode string `json:"mode"` // full=整份基线（首轮或摘要折叠后首条） resend=差分满阈值后的完整重发 diff=差分
+	Text string `json:"text"` // 发给模型的 user 消息正文
+}
+
+// renderEnvRows 按组装层口径算出每条 kind=env 行发给模型时的消息文本：输入与
+// buildContext 同一份原始行与摘要覆盖边界，跳过口径也相同（边界内、非对话行、
+// 规则压缩整行省略的行模型看不到，不产出 render）；逐条走 envRowRender 并推进
+// 同一套差分计数。buildContext / ctxStats 发送与统计、接口下发与实时推送都从这
+// 一个函数取值——前端所见即模型所收，不存在第二份差分实现。
+func renderEnvRows(raw []*StoredMessage, boundary int64) map[int64]envRender {
+	out := map[int64]envRender{}
+	prevEnv, updates := "", 0
+	for _, m := range raw {
+		if m.Seq <= boundary || m.Kind == "summary" || m.Kind == "prompt" || m.Kind == inheritKind || m.Kind == "request" || m.Kind == "audit" || m.Compact == compactOmit {
+			continue
+		}
+		if m.Kind != "env" {
+			continue
+		}
+		env := m.Text()
+		if s, n := envRowRender(prevEnv, env, updates); s != "" {
+			mode := "diff"
+			if prevEnv == "" {
+				mode = "full"
+			} else if updates >= envFullResendAfter {
+				mode = "resend"
+			}
+			out[m.Seq] = envRender{Mode: mode, Text: s}
+			updates = n
+		}
+		prevEnv = env
+	}
+	return out
+}
+
+// renderEnvRowAfter 算出刚追加的一条 env 行（last）在当前会话状态下发给模型时的
+// 消息：raw 为追加前的全量原始行，边界按生效摘要取。实时推送用——与随后
+// buildContext 里的 renderEnvRows 同一函数同一输入，前端所见即模型所收。
+func renderEnvRowAfter(raw []*StoredMessage, last *StoredMessage) (envRender, bool) {
+	boundary := int64(0)
+	for _, s := range activeSummaries(raw) {
+		if s.CoversUpTo > boundary {
+			boundary = s.CoversUpTo
+		}
+	}
+	r, ok := renderEnvRows(append(raw, last), boundary)[last.Seq]
+	return r, ok
 }
 
 // envLineKey 取环境快照行的条目键："- key：value" 形式取 key（同条目的新旧
@@ -679,9 +729,8 @@ func (a *App) contextStats(sess *SessionMeta) ctxStats {
 		for _, s := range summaries {
 			add("摘要", TextMessage("user", s.Text()))
 		}
-		prevEnv := ""     // 与 buildContext 同一套环境快照渲染口径（首条整份、后续差分）
-		envUpdates := 0   // 与 buildContext 同一差分计数口径（自愈全量）
-		foldSeen := false // 与 buildContext 同一折叠边界口径：交界处注入提示标签
+		envRenders := renderEnvRows(raw, boundary) // 与 buildContext 同一次计算的环境快照渲染
+		foldSeen := false                          // 与 buildContext 同一折叠边界口径：交界处注入提示标签
 		for _, m := range raw {
 			if m.Seq <= boundary || m.Kind == "summary" || m.Kind == "prompt" || m.Kind == inheritKind || m.Kind == "request" || m.Kind == "audit" {
 				continue
@@ -698,12 +747,9 @@ func (a *App) contextStats(sess *SessionMeta) ctxStats {
 				continue
 			}
 			if m.Kind == "env" {
-				env := m.Text()
-				if s, n := envRowRender(prevEnv, env, envUpdates); s != "" {
-					add("环境快照", TextMessage("user", s))
-					envUpdates = n
+				if r, ok := envRenders[m.Seq]; ok {
+					add("环境快照", TextMessage("user", r.Text))
 				}
-				prevEnv = env
 				continue
 			}
 			if m.Compact != "" {

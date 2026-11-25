@@ -43,6 +43,9 @@ func main() {
 	// 安卓：父进程（应用壳）死亡时内核自动回收引擎，杜绝孤儿占端口
 	// 导致的下一次启动绑定失败死循环（其他平台空操作）。
 	setupParentDeathSignal()
+	// macOS：GUI 形态（访达/Dock 启动）只继承系统最小 PATH，用户 shell 里
+	// 配的开发工具全看不到——补全常规工具目录（其他平台空操作）。
+	fixupDarwinGUIPath()
 
 	// 顶层进程树兜底：自身挂入 kill-on-close Job，正常退出 / 被强杀 /
 	// 崩溃时内核终止它启动过的全部后代（含沙箱外 start 出来的孙进程、
@@ -78,17 +81,15 @@ func main() {
 	webDir := flag.String("webdir", "", "开发模式：前端从该磁盘目录提供（默认用内嵌副本）")
 	desktop := flag.Bool("desktop", false, "桌面模式：用系统 WebView2 开原生窗口（不开浏览器）")
 	browser := flag.Bool("browser", false, "强制浏览器模式（覆盖安装版默认的桌面模式）")
-	electron := flag.Bool("electron", false, "Electron 壳 sidecar 模式：不开窗口不开浏览器，由 Electron 主进程拉起（目录锚定与工作区迁移同桌面模式）")
 	flag.Parse()
 
 	// 安装包构建时注入（-ldflags "-X main.desktopDefault=1"）：发行版
 	// 双击即开桌面窗口；开发版（jx-assistant.exe）不注入，保持浏览器形态。
 	wantDesktop := *desktop || desktopDefault == "1"
 
-	// Electron sidecar 与桌面模式共享环境准备（cwd 锚定 / 默认工作区迁移 /
-	// 禁开浏览器），但绝不启动 WebView2 窗口——窗口由 Electron 主进程持有，
-	// 本进程只当本地 HTTP 服务跑。
-	anchored := (wantDesktop && !*browser) || *electron
+	// 桌面形态与浏览器模式共享环境准备（cwd 锚定 / 默认工作区迁移 /
+	// 禁开浏览器），随后由 runDesktop 开 WebView2 窗口。
+	anchored := wantDesktop && !*browser
 
 	// 桌面/安装版：cwd 由快捷方式「起始位置」决定、不可靠，把工作目录
 	// 锚到 exe 旁，config/data/技能 等相对路径全部随之落位。开发目录
@@ -154,14 +155,6 @@ func main() {
 	app, err := NewApp(cfg, *cfgPath, *webDir)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
-	}
-
-	// Electron 壳 sidecar：发现面板桥（环境变量由 Electron 主进程注入）即挂
-	// 为内嵌浏览器目标——browser_* 工具经桥驱动壳内 <webview> 右栏面板。
-	// 网页/旧桌面壳不带变量，nativePanel 维持 nil，形态不变。
-	if ep := newElectronPanelFromEnv(app); ep != nil {
-		app.nativePanel = ep
-		log.Printf("Electron 面板桥已接入: %s", ep.base)
 	}
 
 	// 默认工作区迁移的收尾：历史会话里显式挂过旧默认目录（安装目录\工作区）
@@ -287,8 +280,18 @@ func main() {
 	if !*noOpen && (dialHost == "127.0.0.1" || dialHost == "localhost") {
 		go func() {
 			time.Sleep(400 * time.Millisecond)
-			openBrowser := exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-			hideConsoleWindow(openBrowser) // 借用系统外壳打开浏览器，别闪控制台窗
+			// 借用系统外壳打开默认浏览器，别闪控制台窗（Windows rundll32 /
+			// macOS open / Linux xdg-open）
+			var openBrowser *exec.Cmd
+			switch {
+			case isWindowsRuntime:
+				openBrowser = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+			case isDarwinRuntime:
+				openBrowser = exec.Command("open", url)
+			default:
+				openBrowser = exec.Command("xdg-open", url)
+			}
+			hideConsoleWindow(openBrowser)
 			_ = openBrowser.Start()
 		}()
 	}

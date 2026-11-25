@@ -20,13 +20,18 @@ import (
 )
 
 // testPython 找一个可用的 Python 解释器：优先共享便携运行时（与生产 {python}
-// 同一份），PATH 里的 python 兜底；都没有就跳过集成测试（纯单元场景不受影响）。
+// 同一份；与产品同源走 runtimePyInside（Windows: python/python.exe，macOS:
+// macos/bin/python3——内置 mac 运行时入库后仓库里两份都在），PATH 兜底
+//（mac 用 python3）；都没有就跳过集成测试（纯单元场景不受影响）。
 func testPython(t *testing.T) string {
 	t.Helper()
-	if p := filepath.Join("技能", "_runtime", "python", "python.exe"); func() bool { _, err := os.Stat(p); return err == nil }() {
+	if p := runtimePyInside(filepath.Join("技能", "_runtime")); func() bool { _, err := os.Stat(p); return err == nil }() {
 		if abs, err := filepath.Abs(p); err == nil {
 			return abs
 		}
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p
 	}
 	if p, err := exec.LookPath("python"); err == nil {
 		return p

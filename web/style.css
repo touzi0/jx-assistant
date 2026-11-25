@@ -1492,6 +1492,9 @@ body.rp-open .w-handle { display: none; }
 .attach-item.error .attach-size { color: var(--danger); }
 /* 图片附件只给一枚缩略图（# 号角标浮在右上角外沿） */
 .attach-item.image { padding: 0; border: none; background: none; box-shadow: none; }
+/* 录制材料卡（停录后挂进附件区的「演示记录 …」卡，kind=record）：图标用录制红，副标是
+   时长/事件/截图数；没有上传态（注记在停录响应里已就位，发送时不走上传） */
+.attach-item.record .attach-icon { color: #d93a3a; }
 .attach-thumb {
   display: block; width: 46px; height: 46px; object-fit: cover;
   border-radius: 10px; border: 1px solid var(--border); background: var(--chip);
@@ -1535,6 +1538,30 @@ body.rp-open .w-handle { display: none; }
 .rec-btn.on { background: #d93a3a; border-color: #d93a3a; color: #fff; }
 .rec-btn.on:hover { background: #c62f2f; border-color: #c62f2f; color: #fff; }
 .rec-btn:disabled { opacity: .45; cursor: not-allowed; }
+/* 操作录制器胶囊（加号菜单「操作录制器」挂出，权限芯片右侧，与「计划」胶囊同族同观感：
+   琥珀底、11px 字、圆角药丸）：里面一枚 ▶/■ 小圆钮起录停录，✕ 收起（录制中收起＝
+   先停录收录）。录制中整颗变红、文案变「录制中」，小圆钮换白底红 ■ 并呼吸提示 */
+.mflag.rec-flag {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px 2px 4px;
+  border-radius: 999px; background: rgba(214, 158, 46, .12); color: var(--amber);
+  border: 1px solid rgba(214, 158, 46, .35); font-size: 11px; user-select: none;
+}
+.mflag.rec-flag.hidden { display: none; } /* 基类 .mflag 默认 display:none，这里要压过它 */
+.mflag.rec-flag .rec-flag-btn {
+  width: 18px; height: 18px; border-radius: 50%; border: none; padding: 0; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--amber); color: #fff; cursor: pointer;
+}
+.mflag.rec-flag .rec-flag-btn svg { width: 10px; height: 10px; }
+.mflag.rec-flag .rec-flag-btn:disabled { opacity: .5; cursor: not-allowed; }
+.mflag.rec-flag .mf-x { color: inherit; padding: 3px 4px; margin: -3px -3px -3px 1px; font-size: 11px; } /* ✕ 命中区放大到约 16×20，别让人点不准 */
+.mflag.rec-flag.on { background: #d93a3a; border-color: #d93a3a; color: #fff; }
+.mflag.rec-flag.on:hover { background: #c62f2f; } /* 压过基类 .mflag.on:hover 的琥珀悬停底 */
+.mflag.rec-flag.on .rec-flag-btn { background: #fff; color: #d93a3a; animation: rec-pulse 1.2s ease-in-out infinite; }
+@keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+/* 加号菜单「操作录制器」录制中：红字红图标，勾位显示「● 录制中」 */
+.pop-item.rec-on, .pop-item.rec-on svg, .pop-item.rec-on .pop-check { color: #d93a3a; }
+.pop-item.rec-on:hover { background: rgba(217, 58, 58, .08); }
 .chip-btn {
   display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2);
   border: 1px solid var(--border); background: var(--bg); border-radius: 999px;
@@ -2011,6 +2038,62 @@ body.rp-open .w-handle { display: none; }
 .confirm-msg { white-space: pre-line; font-size: 13.5px; color: var(--text-2); line-height: 1.7; }
 .modal-actions button.danger { background: #c0392b; border-color: #c0392b; color: #fff; }
 .modal-actions button.danger:hover { background: #a93226; border-color: #a93226; }
+
+/* ---------- 画板（加号菜单「画板」，web/app-whiteboard.js）----------
+   白底画布永远是白的（画给人和 AI 看的示意图，不随暗色主题翻黑），工具条跟主题变量。
+   画布的逻辑尺寸 1000×620（导出 2 倍 2000×1240），显示尺寸由 JS 按卡片可用
+   宽高适配（wbFit），指针坐标按显示比例换算回逻辑坐标——窗口大小只影响显示
+   清晰度，不影响已画内容。 */
+.wb-card { width: 980px; max-width: 94vw; padding: 12px 14px 10px; overflow: hidden; display: flex; flex-direction: column; }
+.wb-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex: none; }
+.wb-title { font-size: 15px; flex: none; }
+.wb-tools { display: flex; align-items: center; gap: 4px; flex: 1; flex-wrap: wrap; min-width: 0; }
+.wb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; flex: none; }
+.wb-tool, .wb-size, .wb-close {
+  height: 30px; border-radius: 8px; border: 1px solid transparent; flex: none;
+  background: none; color: var(--text-2); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.wb-tool { width: 30px; }
+.wb-tool svg { width: 16px; height: 16px; }
+.wb-tool:hover, .wb-size:hover, .wb-close:hover { background: var(--hover); color: var(--text); }
+.wb-tool:disabled { opacity: .4; cursor: default; }
+.wb-tool:disabled:hover { background: none; color: var(--text-2); }
+.wb-tool.active { background: rgba(77, 107, 254, .1); color: var(--accent); border-color: rgba(77, 107, 254, .35); }
+.wb-colors { display: inline-flex; align-items: center; gap: 6px; }
+.wb-color {
+  width: 22px; height: 22px; border-radius: 50%; border: 2px solid transparent; padding: 0; flex: none;
+  background: var(--c); cursor: pointer; position: relative; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, .15);
+}
+.wb-color:hover { transform: scale(1.12); }
+.wb-color.active { border-color: var(--text); box-shadow: inset 0 0 0 2px var(--bg); }
+/* 自选色：中心一颗四色小圆示意「这里能调色」，整颗被透明原生取色器盖住（点哪都弹取色器） */
+.wb-custom { overflow: hidden; }
+.wb-custom::after { content: ''; width: 10px; height: 10px; border-radius: 50%;
+  background: conic-gradient(#d93a3a, #e3a600, #2e9e5b, #2f6fe4, #d93a3a); }
+.wb-custom input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; }
+.wb-size { width: 28px; }
+.wb-size i { display: block; width: var(--s); height: var(--s); border-radius: 50%; background: currentColor; }
+.wb-size.active { background: rgba(77, 107, 254, .1); color: var(--accent); }
+.wb-close { margin-left: auto; font-size: 14px; }
+.wb-stage { position: relative; background: #fff; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; flex: none; }
+#wb-canvas { display: block; touch-action: none; cursor: crosshair; }
+#wb-canvas.tool-text { cursor: text; }
+#wb-canvas.tool-eraser { cursor: cell; }
+/* 文字工具的就地输入框：贴着落笔点、透明底、虚线框；字号/颜色跟当前画笔设置 */
+#wb-text {
+  position: absolute; left: 0; top: 0; min-width: 140px; max-width: 90%; resize: none; overflow: hidden;
+  background: transparent; border: 1px dashed var(--accent); border-radius: 3px; outline: none;
+  padding: 0; margin: 0; line-height: 1.3; font-family: inherit; color: #1f2328;
+}
+.wb-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; flex-wrap: wrap; flex: none; }
+.wb-foot .tip { margin: 0; flex: 1; min-width: 200px; }
+.wb-foot .modal-actions { margin-top: 0; flex: none; }
+@media (max-width: 640px) {
+  .wb-card { padding: 10px 10px 8px; }
+  .wb-foot .tip { display: none; } /* 手机：说明让位给高度，按钮一行靠右 */
+  .wb-foot .modal-actions { width: 100%; justify-content: flex-end; }
+}
 .tip { color: var(--text-3); font-size: 11px; margin-top: 12px; }
 
 .hidden { display: none !important; }
@@ -3458,7 +3541,7 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 #bpw-url:focus { outline: none; border-color: var(--accent); }
 .bpw-stage { position: relative; flex: 1; min-height: 0; background: var(--bg); }
 /* 网页/手机形态的右栏网页区：iframe 铺满舞台（Markdown 渲染页等就地看的页面，
-   见 app-right.js 的 bpwShowFrame）。桌面/Electron 形态由原生控件覆盖舞台，不看它。 */
+   见 app-right.js 的 bpwShowFrame）。桌面形态由原生控件覆盖舞台，不看它。 */
 .bpw-frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
 /* 远程形态的帧镜像：家端浏览器画面的只读直播。默认等比缩放、内容居中、
    装不下的方向留深色边；.raw 切原始像素（1:1），超出舞台用滚动条。
@@ -3481,11 +3564,6 @@ body.bin-mode #wst-view, body.bin-mode #wst-add { display: none; } /* 回收站�
 /* 桌面模式下原生子窗口盖住舞台：提示文字只在网页模式可见（原生控件创建后
    舞台被覆盖；网页模式无控件，提示常驻） */
 html.desktop-shell .bpw-hint { display: none; }
-/* Electron 壳：网页区是页面内 <webview>（默认 display:none，仅此形态显示），
-   提示文字同样隐藏 */
-#bpw-webview { display: none; }
-html.electron-shell #bpw-webview { display: block; }
-html.electron-shell .bpw-hint { display: none; }
 
 /* ---------- Claude 插件兼容层（app-ccplugins.js：统一「插件」页的 Claude 行/安装区/市场面板/命令弹层） ---------- */
 .ccp-install-row { display: flex; gap: 8px; margin: 0 0 8px; }

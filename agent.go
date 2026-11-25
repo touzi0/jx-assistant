@@ -71,10 +71,13 @@ type Event struct {
 	Held       bool  `json:"held,omitempty"`
 	// Kind 语义按 Type 分域（契约见《消息类型规范.md》）：message 事件=存储行 kind；
 	// question_required 事件=ask | plan
-	Kind    string   `json:"kind,omitempty"`
-	Origin  string   `json:"origin,omitempty"` // message 事件附带 report/summary 的 origin 子类
-	Plan    string   `json:"plan,omitempty"`
-	Options []string `json:"options,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Origin string `json:"origin,omitempty"` // message 事件附带 report/summary 的 origin 子类
+	// message 事件=env 行时附带渲染结果（模型实际收到的消息文本与形态，见
+	// context.go renderEnvRows）：前端只显示，不镜像组装层的差分逻辑
+	Render  *envRender `json:"render,omitempty"`
+	Plan    string     `json:"plan,omitempty"`
+	Options []string   `json:"options,omitempty"`
 	// 待生效用户消息快照（pending 事件：插话/排队的最新列表，多窗口与刷新后一致）
 	Pending *PendingState `json:"pending,omitempty"`
 	// 内嵌浏览器（browser_panel_windows.go 桌面原生面板 / browser_host.go 网页形态）：
@@ -164,7 +167,7 @@ const skillPrompt = `你是「坚祥数字助理」的创建技能模式助手�
 2. 技能是写给「以后的 AI」看的教程，不是给用户的操作手册。写作时假想读者是一个有能力、但没见过这个网站/软件的 AI。
 
 建技能的两条路（按用户情况选，可混用）：
-1. 用户演示，你分析：用户想亲自示范时，告诉他输入框下方有个「演示记录」按钮——点一下开始录（他直接去电脑上操作并口头讲解，期间不用回来发消息），做完回来再点一下停止。这个记录器的工作逻辑：起录后他的每次点击、回车/Tab、窗口切换都会自动截图，全程记事件日志（点了哪里、输入了什么、切到哪个窗口）和麦克风录音；停录后系统会给你发来一条【演示记录】通知，材料在 演示记录/record-…/ 目录：INDEX.md 是时间线对照表、编号 PNG 是截图、events.jsonl 是事件日志、audio.wav 是录音（口头讲解随录随转成 讲解.srt 字幕；没转出来或该段缺字幕时，请他口述关键步骤的意图，不要猜）。分析：先 read INDEX.md 把时间线看全，再按编号 read_image 看关键截图，把操作与他讲的话对上。
+1. 用户演示，你分析：用户想亲自示范时，告诉他输入框下方有个「操作录制器」按钮（▶）——点一下开始录（他直接去电脑上操作并口头讲解，期间不用回来发消息），做完回来再点一下停止。这个记录器的工作逻辑：起录后他的每次点击、回车/Tab、窗口切换都会自动截图，全程记事件日志（点了哪里、输入了什么、切到哪个窗口）和麦克风录音；停录后材料卡会挂在他的输入框上方，随他的下一条消息以「用户附件：」块里的【演示记录】通知发给你，材料在 演示记录/record-…/ 目录：INDEX.md 是时间线对照表、编号 PNG 是截图、events.jsonl 是事件日志、audio.wav 是录音（口头讲解随录随转成 讲解.srt 字幕——停录不等识别，通知里写着「后台识别中」而字幕还没出来或不全时，语音组件里有本地识别脚本，可以自己想办法调 Python 对 audio.wav 重新识别；语音组件没启用转不了，就请他口述关键步骤的意图，不要猜）。分析：先 read INDEX.md 把时间线看全，再按编号 read_image 看关键截图，把操作与他讲的话对上。
 2. 你直接干，边干边攒经验：有些事用户演示不了也说不清，直接让你去做。把它当成一次探路：网页类任务优先用 browser_*（打开网页、读内容、点击、输入、截图），尽量不用操作电脑；打开应用程序这类桌面任务用 cua / windows-mcp（先 mcp_read_connector 读工具清单，再用 mcp_call_tool 执行）。同类操作多试几种做法——鼠标点、键盘敲都试试，尤其留意快捷键（Ctrl+C/V、Tab、Enter、Esc 这类）能不能更快更稳地完成同样的步骤；亲测走通的路子（哪条顺、哪条是坑、快捷键怎么加速）就是技能的第一手素材，写进技能。
 
 工作流程：
@@ -496,7 +499,18 @@ func (a *App) probeSelfLoc() {
 	if exe, err := os.Executable(); err == nil {
 		a.selfExe = exe
 	}
-	if runtime.GOOS != "windows" || isAndroidRuntime {
+	if isAndroidRuntime {
+		return
+	}
+	if isDarwinRuntime {
+		// macOS：只探测不装配（装配发生在首次用技能时）；找到解释器就给
+		// darwin 口径的运行时段（路径与 shell 分工都按本平台说）。
+		if py := a.darwinPythonExe(); py != "" {
+			a.skillRTPrompt = skillRuntimePromptTextDarwin(py)
+		}
+		return
+	}
+	if runtime.GOOS != "windows" {
 		return
 	}
 	dir, err := a.SkillsDir()
@@ -504,6 +518,14 @@ func (a *App) probeSelfLoc() {
 		return
 	}
 	a.skillRTPrompt = skillRuntimePromptText(filepath.Join(dir, "_runtime", "python", "python.exe"))
+}
+
+// skillRuntimePromptTextDarwin macOS 的运行时段正文：与 Windows 版同一意图
+//（给出确切解释器、别去探测别的 python、写清命令/脚本分工），但按本平台
+//事实表述——shell 是 BSD 环境（sed -i '' / 无 grep -P 等），没有 PS 5.1
+// 编码注入那一套。
+func skillRuntimePromptTextDarwin(pyExe string) string {
+	return "\n\n## 内置技能运行时\n\n技能 Python 解释器位于 `" + pyExe + "`（内置 mac 运行时或系统 python3，office / pdf 等技能共用）。需要执行 Python 时一律用这个解释器的绝对路径，不要另找别的 python；缺依赖时调用对应技能会自动经 pip 镜像补装（首次需联网）。\n\n涉及中文、引号、JSON 的处理建议用 run_python 提交 Python 脚本（脚本本身 UTF-8 落盘，无编码坑）；run_command 与 run_python 都可用，一般按此分工走：单一工具链调用（go build / git status 等一条命令）直接 run_command。注意 shell 是 macOS（BSD 用户态）：sed 就地改要写 sed -i ''；没有 grep -P（用 grep -E）与 readlink -f（用 realpath）；进程管理用 ps / pkill。\n"
 }
 
 // skillRuntimePromptText 运行时段正文（纯文本构造，便于单测）。既写明
@@ -670,7 +692,7 @@ func (a *App) envPrompt(sess *SessionMeta) string {
 	// 模型据此决定是「请用户录演示」还是「让用户口述/自己执行」。
 	if sess.Mode == "skill-create" && sess.Remote == nil {
 		if recorderSupported() {
-			b.WriteString("- 演示记录器（用户侧：输入框旁的录制按钮起录/停录，你没有录制工具）：用户点按钮后，其每次点击、回车/Tab、窗口切换自动截屏，全程记事件日志与麦克风音频，材料落 工作区/演示记录/ 下；停录后系统会注入一条【演示记录】通知告知目录，届时先读 INDEX.md 对照表再看截图。" +
+			b.WriteString("- 演示记录器（用户侧：输入框旁的录制按钮/加号菜单挂出的录制胶囊起录/停录，你没有录制工具）：用户点按钮后，其每次点击、回车/Tab、窗口切换自动截屏，全程记事件日志与麦克风音频，材料落 工作区/演示记录/ 下；停录不等语音识别——材料卡挂在他的输入框上方，随他的下一条消息以「用户附件：」块里的【演示记录】通知告知目录，届时先读 INDEX.md 对照表再看截图；通知里字幕写着「后台识别中」而 讲解.srt 还没有或段明显不全、或写着「未生成」而你需要讲解词时，语音组件里有本地识别脚本，可以自己想办法调 Python 对 audio.wav 重新识别。" +
 				map[bool]string{true: "语音讲解会实时转成 讲解.srt 字幕（本地识别模型，随录随转）。", false: "语音讲解不会转写字幕（语音组件未启用，录音保留）——用户在对话里说的话就是讲解词。"}[a.voiceComponentOn()] + "\n")
 		} else {
 			b.WriteString("- 演示记录器在当前平台不可用（仅 Windows 桌面）：请让用户直接口述操作步骤与意图，必要时用可用的操作能力（browser_* / computer_* / device_*）亲自走关键路径验证\n")
@@ -829,8 +851,8 @@ func (a *App) osDescription() string {
 
 // detectOSDesc 探测系统描述：给模型「我在哪、有什么、注意什么」——
 // Windows 版本 + PowerShell 版本 + 中文编码规则；Linux 发行版与内核；
-// 安卓版本/ABI + toybox 边界与常见坑。探测失败逐项降级、缺哪段省哪段；
-// 结果由调用方缓存。
+// 安卓版本/ABI + toybox 边界与常见坑；macOS 版本 + BSD 用户态命令要点。
+// 探测失败逐项降级、缺哪段省哪段；结果由调用方缓存。
 func detectOSDesc() string {
 	switch runtime.GOOS {
 	case "windows":
@@ -839,9 +861,30 @@ func detectOSDesc() string {
 		return detectOSDescLinux()
 	case "android":
 		return detectOSDescAndroid()
+	case "darwin":
+		return detectOSDescDarwin()
 	default:
 		return runtime.GOOS + "（类 Unix）"
 	}
+}
+
+// detectOSDescDarwin：macOS 版本/架构 + BSD 用户态命令要点。模型默认输出
+// GNU/Linux 命令，这里把与 Linux 的差异点钉进环境快照（对齐 Windows 版
+// 给「注意什么」的意图）：sed -i 语法、无 grep -P、无 readlink -f、进程
+// 管理命令、文件系统大小写与 /tmp 符号链接。
+func detectOSDescDarwin() string {
+	ver := ""
+	if out, err := exec.Command("sw_vers", "-productVersion").Output(); err == nil {
+		ver = strings.TrimSpace(string(out))
+	}
+	if ver == "" {
+		ver = "版本未知"
+	}
+	arch := "Apple 芯片"
+	if runtime.GOARCH == "amd64" {
+		arch = "Intel"
+	}
+	return "macOS " + ver + "（" + arch + "）；BSD 用户态：sed 就地改写要 sed -i ''，无 grep -P（用 grep -E），无 readlink -f（用 realpath），进程用 ps aux / pkill；文件系统默认不区分大小写，/tmp 实为 /private/tmp"
 }
 
 // detectOSDescWindows：Windows 版本（cmd /c ver）+ PowerShell 版本
@@ -1021,7 +1064,11 @@ func (a *App) maybeAppendEnvSnapshot(sess *SessionMeta, env string, emit func(Ev
 	// 只是入库归档；真实发送时由 buildContext 现场构造（env 走 user 尾消息）
 	sm := a.appendRow(sess, StoredMessage{Message: TextMessage("system", env), Kind: kindEnv, CreatedAt: now()})
 	if emit != nil {
-		emit(Event{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindEnv})
+		ev := Event{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindEnv}
+		if r, ok := renderEnvRowAfter(raw, sm); ok {
+			ev.Render = &r // 模型实际将收到的消息文本与形态，前端照此显示
+		}
+		emit(ev)
 	}
 	return env
 }

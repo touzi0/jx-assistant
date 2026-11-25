@@ -118,10 +118,26 @@ func parseDateVersion(s string) (date, serial int64, ok bool) {
 	return d, n, true
 }
 
+// darwinUpdateChannel macOS 的更新目录与 Windows 桌面主通道分开（对齐手机端
+// jx-link 独立发布的做法）：服务端下发的 /updates/latest 是 Windows 桌面通道
+//（engine/组件分块），darwin 改读同一服务的 /updates/mac/latest——服务端
+// 尚未发布 mac 版时该地址 404，checkUpdateOnce 对 404 按静默「无更新」处理，
+// 先行指向零副作用、发版即生效。自配的第三方发布源（Gitea releases 等）不改写。
+func darwinUpdateChannel(url string) string {
+	if !isDarwinRuntime || url == "" || url == "off" {
+		return url
+	}
+	const desk = "/updates/latest"
+	if strings.HasSuffix(url, desk) {
+		return strings.TrimSuffix(url, desk) + "/updates/mac/latest"
+	}
+	return url
+}
+
 // StartUpdateChecker 启动后台轮询：启动 30s 后首查（不拖慢启动），之后每小时一次
 // （原来是 6h，用户要求「更新提示改每小时检查」：发版当天客户端一小时内就能看到横幅）。
 func StartUpdateChecker(a *App) {
-	url := a.Cfg.UpdateURL
+	url := darwinUpdateChannel(a.Cfg.UpdateURL)
 	if url == "" || url == "off" {
 		return
 	}

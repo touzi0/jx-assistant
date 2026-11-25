@@ -36,7 +36,13 @@ func newMgrNotifyTestApp(t *testing.T) (a *App, mgr, task, solo *SessionMeta) {
 	a.initRuntime()
 	a.sessLocks = map[string]*sync.Mutex{}
 	a.Cfg.Workspace = t.TempDir()
-	a.Cfg.Providers = nil
+	// 种 mock 通道（assistant_ops_test 同款）：resolve 后的自动续跑需要可用通道，
+	// 留空会让续跑失败、通知时机走样——本测试在没本地 config.json 的全新克隆上
+	// 必挂（Windows 开发机有本地配置才碰巧过）。mock 让行为与机器环境无关。
+	a.Cfg.Providers = []ProviderCfg{{
+		ID: "mock", Name: "离线演示", BaseURL: "mock",
+		Models: []ModelCfg{{ID: "mock-1", Name: "演示模型"}},
+	}}
 	mk := func(id, title, mode, dispatchedBy string) *SessionMeta {
 		m := &SessionMeta{ID: id, Title: title, Mode: mode, Workspace: a.Cfg.Workspace,
 			Permission: permWorkspace, DispatchedBy: dispatchedBy, CreatedAt: now(), UpdatedAt: now()}

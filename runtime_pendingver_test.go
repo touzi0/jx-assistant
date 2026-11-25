@@ -5,13 +5,16 @@ package main
 // 在途时排水可能已完成，旧快照晚到把已落库的插话重新画成「插话中」虚线框。
 // 版本号是快照的取值时刻标记：每次队列变更（入队/排水/出队/移动/暂停/清空）
 // 都必须在锁内递增，前端只接受比已应用更新的快照。这里验收：
-//  1. 每个变更点都递增 ver（漏 bump = 旧快照可回放，等于白做）；
+//  1. 每个变更点都前进 ver（漏 bump = 旧快照可回放，等于白做）；
 //  2. ver 与快照内容在锁内原子对应（并发下不会出现「ver 新、内容旧」）；
-//  3. 并发插话+排水：排空后取到的任何快照 ver 都大于排空前取到的快照 ver。
+//  3. 并发插话+排水：排空后取到的任何快照 ver 都大于排空前取到的快照 ver；
+//  4. ver 是毫秒时间戳基底（进程重启不回卷：挂在旧基线上的页面不会被
+//     重启后的新快照永久拦截）。
 
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func newTestAppForVer() *App {
@@ -25,43 +28,52 @@ func newTestAppForVer() *App {
 	return a
 }
 
-// TestPendingVerBumpsOnEveryMutation 每个变更点都递增 ver。
+// TestPendingVerBumpsOnEveryMutation 每个变更点都前进 ver（时间戳基底、严格单调）。
 func TestPendingVerBumpsOnEveryMutation(t *testing.T) {
 	a := newTestAppForVer()
 	const sid = "s1"
-	step := func(want int64, what string) {
+	prev := int64(0)
+	step := func(what string) int64 {
 		t.Helper()
-		if got := a.pendingOf(sid).Ver; got != want {
-			t.Fatalf("%s 后 ver=%d，want %d", what, got, want)
+		got := a.pendingOf(sid).Ver
+		if got <= prev {
+			t.Fatalf("%s 后 ver=%d，未前进（前值 %d）", what, got, prev)
 		}
+		prev = got
+		return got
 	}
-	step(0, "初始")
+	if v := a.pendingOf(sid).Ver; v != 0 {
+		t.Fatalf("初始 ver=%d，want 0", v)
+	}
 	pm := a.pushPending(sid, "steer", "插话", kindChat, "interject")
-	step(1, "插话入队")
+	step("插话入队")
 	a.pushPending(sid, "queue", "排队", kindChat, "")
-	step(2, "排队入队")
+	step("排队入队")
 	got := a.drainSteer(sid)
 	if len(got) != 1 || got[0].ID != pm.ID {
 		t.Fatalf("drainSteer 取走内容不对: %+v", got)
 	}
-	step(3, "插话排水")
+	step("插话排水")
 	if a.popQueue(sid) == nil {
 		t.Fatal("popQueue 应取出排队项")
 	}
-	step(4, "排队出队")
+	step("排队出队")
 	a.pushPending(sid, "queue", "再排一条", kindChat, "")
 	last := a.pushPending(sid, "queue", "又一条", kindChat, "")
-	step(6, "两次入队")
+	step("两次入队")
 	if !a.movePending(sid, last.ID, "") {
 		t.Fatal("movePending 移到队尾应成功")
 	}
-	step(7, "拖拽排序")
+	step("拖拽排序")
 	a.setQueuePaused(sid, true)
-	step(8, "暂停")
+	step("暂停")
+	noBump := a.pendingOf(sid).Ver
 	a.updatePending(sid, "不存在", "remove") // 不在队列：不 bump
-	step(8, "无效操作（不递增）")
+	if v := a.pendingOf(sid).Ver; v != noBump {
+		t.Fatalf("无效操作不应前进 ver: %d -> %d", noBump, v)
+	}
 	a.dropPending(sid)
-	step(9, "清空")
+	step("清空")
 }
 
 // TestPendingVerSnapshotAtomic ver 与内容在锁内原子对应（并发压测不出「ver 新、内容旧」的倒挂）。
@@ -132,5 +144,25 @@ func TestPendingVerDrainAdvances(t *testing.T) {
 	}
 	if after.Ver <= before.Ver {
 		t.Fatalf("排水后 ver=%d 必须大于排水前=%d，否则旧快照回放拦不住", after.Ver, before.Ver)
+	}
+}
+
+// TestPendingVerTimestampBase ver 以毫秒时间戳为基底：重启后（模拟：换一个
+// 全新 App、同一个会话）新 bump 出来的 ver 仍大于旧值——计数器基底会回卷，
+// 挂在旧基线上的前端把重启后的所有快照拦掉，插话/排队状态同会话内失明。
+func TestPendingVerTimestampBase(t *testing.T) {
+	const sid = "s4"
+	old := newTestAppForVer()
+	old.pushPending(sid, "steer", "旧进程里的插话", kindChat, "interject")
+	prev := old.pendingOf(sid).Ver
+	if prev < 1_700_000_000_000 { // 2023-11 之后：时间戳量级，不是小计数
+		t.Fatalf("ver=%d 不是时间戳量级（基底退化了）", prev)
+	}
+	// 模拟进程重启：全新 App（计数器会从 0 开始，时间戳基底则从当前时刻开始）
+	time.Sleep(5 * time.Millisecond) // 真实重启至少隔毫秒级；同毫秒撞值时等于拦一拍，可忽略
+	restarted := newTestAppForVer()
+	restarted.pushPending(sid, "steer", "重启后的插话", kindChat, "interject")
+	if v := restarted.pendingOf(sid).Ver; v <= prev {
+		t.Fatalf("重启后 ver=%d 未超过旧进程的 %d：前端旧基线会永久拦掉新快照", v, prev)
 	}
 }

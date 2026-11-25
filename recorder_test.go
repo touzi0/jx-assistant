@@ -58,6 +58,9 @@ func TestDemoRecordStopNote(t *testing.T) {
 			t.Fatalf("停录通知缺 %q：%s", want, note)
 		}
 	}
+	if strings.Contains(note, "\n") { // 「用户附件：」块按行计：多行会被前端拆成多条灰条
+		t.Fatalf("停录通知必须单行：%q", note)
+	}
 	// 有字幕文件时改报段数（随录随转的实况汇报）
 	if err := os.MkdirAll(stats.Dir, 0755); err != nil {
 		t.Fatal(err)
@@ -68,6 +71,72 @@ func TestDemoRecordStopNote(t *testing.T) {
 	note = demoRecordStopNote(stats)
 	if !strings.Contains(note, "已生成 "+recorderSrtFn+"（1 段，随录随转）") {
 		t.Fatalf("有字幕时通知未报段数：%s", note)
+	}
+	// 停录不等识别：在途段没转完时报「后台识别中」并指明补转工具；没音频时说没音频
+	stats.ASRPending = true
+	note = demoRecordStopNote(stats)
+	if !strings.Contains(note, "字幕：后台识别中") || !strings.Contains(note, "语音组件") {
+		t.Fatalf("后台识别中的通知异常：%s", note)
+	}
+	stats.ASRPending, stats.AudioOK = false, false
+	if note = demoRecordStopNote(stats); !strings.Contains(note, "字幕：无音频可转写") {
+		t.Fatalf("无音频的通知异常：%s", note)
+	}
+	stats.AudioOK = true
+	stats.Dir = filepath.Join(t.TempDir(), "record-x") // 没有字幕文件的另一份
+	if note = demoRecordStopNote(stats); !strings.Contains(note, "字幕：未生成") || !strings.Contains(note, "语音组件") {
+		t.Fatalf("没识别到语音的通知应指明补转工具：%s", note)
+	}
+}
+
+// recVAD（采集循环的停顿分段状态机）：逐帧喂合成 PCM，1s 语音 + 3.5s 静音 +
+// 1.5s 语音——应在 3s 尾静音处定稿第一段，finalize 兜底定稿第二段；cue 终点
+// = 最后语音帧+300ms，起点接上一段结束（与事件/截图同一条时间轴）。纯静音
+// 不出段，待定稿内容只有噪声毛刺时 finalize 返回 dropped 段。
+func TestRecVAD(t *testing.T) {
+	v := newRecVAD()
+	var segs []*recSegment
+	feed := func(ms int, speech bool) {
+		for off := 0; off < ms; off += recFrameMs {
+			frame := make([]byte, recFrameBytes)
+			if speech {
+				for i := range frame {
+					frame[i] = byte(i % 251)
+				}
+			}
+			if seg := v.feed(frame); seg != nil {
+				segs = append(segs, seg)
+			}
+		}
+	}
+	feed(1000, true)
+	feed(3500, false) // 3s 尾静音处第一段定稿，之后 0.5s 静音不触发
+	feed(1500, true)
+	if segs = append(segs, v.finalize()); len(segs) != 2 { // 尾段兜底
+		t.Fatalf("应切出 2 段，got %d", len(segs))
+	}
+	if segs[0].startMs != 0 || segs[0].endMs != 1300 || segs[1].startMs != 1300 || segs[1].endMs != 6300 {
+		t.Fatalf("段时间轴异常: %+v", segs)
+	}
+	// 第一段音频 = 10 语音帧 + 15 帧静音垫（上限 1.5s）；每段是带 44 字节头的 WAV
+	if len(segs[0].wav) != 44+25*recFrameBytes || len(segs[1].wav) != 44+15*recFrameBytes {
+		t.Fatalf("段音频长度异常: %d %d", len(segs[0].wav), len(segs[1].wav))
+	}
+	if segs[0].dropped || segs[1].dropped {
+		t.Fatal("正常段不应标 dropped")
+	}
+	// 纯静音：不出段；最后 finalize 也没有待定稿内容 → dropped
+	v2 := newRecVAD()
+	feed2 := func(ms int) {
+		for off := 0; off < ms; off += recFrameMs {
+			if seg := v2.feed(make([]byte, recFrameBytes)); seg != nil {
+				t.Fatalf("静音不应切段: %+v", seg)
+			}
+		}
+	}
+	feed2(4000)
+	if seg := v2.finalize(); seg == nil || !seg.dropped {
+		t.Fatalf("没有待定稿内容应返回 dropped 段: %+v", seg)
 	}
 }
 

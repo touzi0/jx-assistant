@@ -12,16 +12,16 @@ package main
 //   录音：winmm waveIn 缓冲采集 16kHz 单声道 16bit PCM（一次采集两用：
 //   全量落 audio.wav + 喂 VAD 停顿分段），无 cgo、无第三方库；没有麦克风时
 //   降级为纯键鼠+截图记录。随录随转：VAD 段定稿（3 秒尾静音）经 recorderASR
-//   （voiceasr.go → 语音组件本地模型）识别，逐段落 讲解.srt。
+//   （voiceasr.go → 语音组件本地模型）识别，逐段落 讲解.srt。停录不等识别：
+//   停录只停钩子/采集并写 audio.wav，在途段由识别 worker 后台转完再重建 INDEX.md
+//  （recorderStop 起后台 goroutine 等 asrDone）。
 
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -285,29 +285,14 @@ func recHookLoopInner(ready chan<- uint32, errCh chan<- error) {
 
 // ---------- 录音（waveIn 缓冲采集，16kHz 单声道 16bit） ----------
 //
-// 一次采集两用：PCM 全量累积（停录写 audio.wav）＋ 喂 VAD 停顿分段。VAD 分段
-// 语义与语音组件的听写线（组件/voice/client.js 的 makeLocalRec）逐常量对齐：
-// 350ms 起效 / 3s 尾静音定稿 / 18s 强制切段 / 静音垫 1.5s 上限，能量判据
-// rms > max(0.008, 底噪×3.5)、底噪自适应（0.98/0.02，上限 0.02）。定稿段经
-// recorderASR（voiceasr.go → 语音组件本地模型）识别成文字，逐段落 讲解.srt
-//（时间轴与事件/截图同源：都取 time.Since(r.start)）。
+// 一次采集两用：PCM 全量累积（停录写 audio.wav）＋ 喂 VAD 停顿分段。VAD 状态机
+// 与常量在 recorder.go（recVAD，文件重放补转共用）；这里只管设备缓冲的采集与
+// 识别队列：定稿段经 recorderASR（voiceasr.go → 语音组件本地模型）识别成文字，
+// 逐段落 讲解.srt（时间轴与事件/截图同源：都取 time.Since(r.start)）。
 
 const (
-	recFrameBytes   = 3200            // 100ms @ 16kHz/16bit/单声道 —— VAD 帧长=缓冲长
-	recAudioBuffers = 6               // 在途缓冲数（≈600ms 队列深度）
-	recASRTailWait  = 8 * time.Second // 停录等在途识别的上限（同悬浮窗 TAIL_WAIT_MS）
-	recSpeechMinMs  = 350             // 短于此视为噪声毛刺，丢弃
-	recFinalPauseMs = 3000            // 尾随静音满 3 秒才定稿（真停顿，非说话时长）
-	recSegMaxMs     = 18000           // 连续不停顿超 18 秒强制定稿
-	recPadMaxMs     = 1500            // 段内静音垫上限（间隙+尾部，近似停顿中点切分）
+	recAudioBuffers = 6 // 在途缓冲数（≈600ms 队列深度）
 )
-
-// recASRJob 一段待识别的定稿音频（cue 时间在入队时就定好——识别只回文本）。
-type recASRJob struct {
-	wav     []byte
-	startMs int
-	endMs   int
-}
 
 // recAudioSession 一次录制的音频会话：采集循环、VAD 状态、识别队列与字幕段。
 // 字幕段（cues）由识别 worker 写、停录收尾读，用 cueMu 串行；VAD 状态与 pcm
@@ -318,23 +303,15 @@ type recAudioSession struct {
 	hdrs  []tWAVEHDR
 	bufs  [][]byte
 	pcm   bytes.Buffer // 全量 PCM（audio.wav 本体）
+	vad   *recVAD
 
 	loopDone chan struct{}
 	stopFlag atomic.Bool
-	asrCh    chan recASRJob
+	asrCh    chan recSegment
 	asrDone  chan struct{}
-	pending  atomic.Int32
+	pending  atomic.Int32 // 已入队 + 识别中的段数（SRT 落盘后才减）
 	cueMu    sync.Mutex
 	cues     []srtCue
-
-	// VAD 状态（仅采集循环内访问）
-	noiseFloor     float64
-	sinceFinal     []byte // 定稿段音频（语音帧 + 限量静音垫）
-	sinceFinalMs   int    // 段内语音时长
-	finalSilenceMs int    // 尾随静音计时
-	padMs          int    // 段内已收录的静音垫
-	lastSpeech     time.Time
-	prevEndMs      int // 上一段 cue 结束（下一段的起点）
 }
 
 // recAudioStart 开麦采集：设备打不开（无麦克风/驱动拒绝）返回 false——录音
@@ -342,9 +319,9 @@ type recAudioSession struct {
 // CALLBACK_NULL 轮询取缓冲（低频 15ms，省一层事件句柄）。
 func recAudioStart(r *demoRec) bool {
 	s := &recAudioSession{
-		r: r, noiseFloor: 0.004,
+		r: r, vad: newRecVAD(),
 		loopDone: make(chan struct{}),
-		asrCh:    make(chan recASRJob, 16),
+		asrCh:    make(chan recSegment, 16),
 		asrDone:  make(chan struct{}),
 	}
 	fmtEx := tWAVEFORMATEX{FormatTag: 1, Channels: 1, SamplesPerSec: 16000,
@@ -419,7 +396,7 @@ func (s *recAudioSession) loop() {
 			if s.hdrs[i].Flags&whdrDone == 0 {
 				continue
 			}
-			s.handleFrame(s.bufs[i][:s.hdrs[i].BytesRecorded], time.Now())
+			s.handleFrame(s.bufs[i][:s.hdrs[i].BytesRecorded])
 			// 回收只清 DONE 状态、必须保留 WHDR_PREPARED：全清会把 PREPARED
 			// 一并抹掉，waveInAddBuffer 立刻拒绝回队列（WAVERR_UNPREPARED=34）
 			// ——第一轮在途缓冲（6×100ms=600ms）录完后音频从此静默中断，
@@ -444,83 +421,66 @@ func (s *recAudioSession) loop() {
 	}
 }
 
-// handleFrame 一个 100ms 缓冲：落全量 PCM + 喂 VAD（语义见节首注释）。
-func (s *recAudioSession) handleFrame(data []byte, now time.Time) {
+// handleFrame 一个 100ms 缓冲：落全量 PCM + 喂 VAD；定稿的段交识别队列。
+func (s *recAudioSession) handleFrame(data []byte) {
 	s.pcm.Write(data)
-	rms := recRMS(data)
-	const frameMs = 100
-	isSpeech := rms > math.Max(0.008, s.noiseFloor*3.5)
-	if !isSpeech {
-		s.noiseFloor = math.Min(0.02, s.noiseFloor*0.98+rms*0.02)
-	}
-	if isSpeech {
-		s.sinceFinal = append(s.sinceFinal, data...)
-		s.sinceFinalMs += frameMs
-		s.finalSilenceMs = 0
-		s.lastSpeech = now
-	} else if s.sinceFinalMs > 0 {
-		s.finalSilenceMs += frameMs
-		if s.padMs < recPadMaxMs { // 间隙/尾部静音限量入段
-			s.sinceFinal = append(s.sinceFinal, data...)
-			s.padMs += frameMs
-		}
-	}
-	if s.sinceFinalMs >= recSegMaxMs || (s.sinceFinalMs >= recSpeechMinMs && s.finalSilenceMs >= recFinalPauseMs) {
-		s.finalize()
+	if seg := s.vad.feed(data); seg != nil {
+		s.enqueue(seg)
 	}
 }
 
-// finalize 定稿一段：打包 WAV 交识别队列。cue 终点取本段最后一帧语音+300ms
-//（尾静音不计入），起点接上一段结束——与 events/截图同一条时间轴。
-func (s *recAudioSession) finalize() {
-	frames, spoken := s.sinceFinal, s.sinceFinalMs
-	endMs := 300
-	if !s.lastSpeech.IsZero() {
-		endMs = int(s.lastSpeech.Sub(s.r.start).Milliseconds()) + 300
-	}
-	startMs := s.prevEndMs
-	s.sinceFinal, s.sinceFinalMs, s.finalSilenceMs, s.padMs = nil, 0, 0, 0
-	s.prevEndMs = endMs
-	if spoken < recSpeechMinMs || len(frames) < recFrameBytes { // 噪声毛刺/音频不足 100ms：丢弃
-		return
-	}
-	if recorderASR == nil {
+// enqueue 把 VAD 定稿的一段交识别队列（噪声毛刺/无识别线的不交）。pending 在
+// 这里加、worker 把该段字幕落盘后减：pending>0 ⇔ 还有段没写进 讲解.srt——
+// 停录不等问题就靠它判定。队列满（识别严重滞后）丢段保录制。
+func (s *recAudioSession) enqueue(seg *recSegment) {
+	if seg.dropped || recorderASR == nil {
 		return
 	}
 	s.pending.Add(1)
 	select {
-	case s.asrCh <- recASRJob{wav: recPcmToWav(frames), startMs: startMs, endMs: endMs}:
+	case s.asrCh <- *seg:
 	default:
-		s.pending.Add(-1) // 队列满（识别严重滞后）：丢段保录制
+		s.pending.Add(-1)
 	}
 }
 
 // asrWorker 串行消费识别队列（worker 进程本身也是串行的）：文本到手即追加
-// 字幕段并整文件重写 讲解.srt。识别失败/空文本只丢该段，不影响录制。
+// 字幕段并整文件重写 讲解.srt，然后才把 pending 减回去。识别失败/空文本只丢
+// 该段，不影响录制。停录后继续跑：把停录时在途的段转完才退出（关 asrCh 即
+// 收尾信号），退出后 asrDone 关闭——recorderStop 的后台收尾靠它衔接。
 func (s *recAudioSession) asrWorker() {
 	defer close(s.asrDone)
-	for job := range s.asrCh {
-		text, err := recorderASR(job.wav)
-		s.pending.Add(-1)
+	for seg := range s.asrCh {
+		text, err := recorderASR(seg.wav)
 		if err != nil {
-			log.Printf("演示记录语音识别失败（%d-%dms 段丢弃）：%v", job.startMs, job.endMs, err)
+			log.Printf("演示记录语音识别失败（%d-%dms 段丢弃）：%v", seg.startMs, seg.endMs, err)
+			s.pending.Add(-1)
 			continue
 		}
-		if strings.TrimSpace(text) == "" {
-			continue
+		if strings.TrimSpace(text) != "" {
+			s.cueMu.Lock()
+			s.cues = append(s.cues, srtCue{StartMs: seg.startMs, EndMs: seg.endMs, Text: strings.TrimSpace(text)})
+			cues := append([]srtCue(nil), s.cues...)
+			s.cueMu.Unlock()
+			if err := writeSRTFile(filepath.Join(s.r.dir, recorderSrtFn), cues); err != nil {
+				log.Printf("演示记录字幕落盘失败：%v", err)
+			}
 		}
-		s.cueMu.Lock()
-		s.cues = append(s.cues, srtCue{StartMs: job.startMs, EndMs: job.endMs, Text: strings.TrimSpace(text)})
-		cues := append([]srtCue(nil), s.cues...)
-		s.cueMu.Unlock()
-		if err := writeSRTFile(filepath.Join(s.r.dir, recorderSrtFn), cues); err != nil {
-			log.Printf("演示记录字幕落盘失败：%v", err)
-		}
+		s.pending.Add(-1)
 	}
 }
 
-// recAudioFinish 停录收尾：停采集 → VAD 尾段定稿（不足 3s 静音的余段照转）
-// → 等在途识别（≤8s，卡死不拖死停录）→ 写 audio.wav。返回音频是否落盘。
+// cueCount 已写出的字幕段数。
+func (s *recAudioSession) cueCount() int {
+	s.cueMu.Lock()
+	defer s.cueMu.Unlock()
+	return len(s.cues)
+}
+
+// recAudioFinish 停录收尾（**不等语音识别**）：停采集 → 关设备 → VAD 尾段定稿
+//（不足 3s 静音的余段照转）→ 关识别队列（worker 把在途段转完自行退出）→ 立刻
+// 写 audio.wav。返回音频是否落盘。识别 worker 可能在停录后还要跑几十秒（首次
+// 用语音时本地模型要加载），由 recorderStop 起后台 goroutine 等 asrDone 收尾。
 func recAudioFinish(r *demoRec) bool {
 	s := r.audio
 	if s == nil {
@@ -538,30 +498,12 @@ func recAudioFinish(r *demoRec) bool {
 	}
 	procWaveInClose.Call(s.hWave)
 	s.hWave = 0
-	s.finalize() // 尾段兜底：余下语音没有 3s 静音也照转
+	s.enqueue(s.vad.finalize()) // 尾段兜底：余下语音没有 3s 静音也照转
 	close(s.asrCh)
-	select {
-	case <-s.asrDone:
-	case <-time.After(recASRTailWait):
-	}
 	if s.pcm.Len() == 0 {
 		return false
 	}
 	return os.WriteFile(filepath.Join(r.dir, recorderAudioFn), recPcmToWav(s.pcm.Bytes()), 0644) == nil
-}
-
-// recRMS 归一化均方根（int16 LE → [0,1)），VAD 能量判据的输入。
-func recRMS(b []byte) float64 {
-	n := len(b) / 2
-	if n == 0 {
-		return 0
-	}
-	var sum float64
-	for i := 0; i+1 < len(b); i += 2 {
-		v := float64(int16(binary.LittleEndian.Uint16(b[i:])))
-		sum += v * v
-	}
-	return math.Sqrt(sum/float64(n)) / 32768
 }
 
 // ---------- 启停 ----------
@@ -643,17 +585,43 @@ func recorderStop() (*recorderStats, error) {
 	}
 	audioOK := false
 	if r.audio != nil {
-		audioOK = recAudioFinish(r) // 停采→尾段定稿→等在途识别→写 audio.wav
+		audioOK = recAudioFinish(r) // 停采→尾段定稿→写 audio.wav（不等识别）
 	}
 	close(r.evCh)
 	select {
 	case <-r.doneCh:
 	case <-time.After(5 * time.Second):
 	}
-	return &recorderStats{
+	stats := &recorderStats{
 		Dir: r.dir, MS: int(r.lastMS.Load()), Events: int(r.evCount.Load()),
 		Shots: int(r.shots.Load()), AudioOK: audioOK,
-	}, nil
+	}
+	if s := r.audio; s != nil {
+		recorderCollectASR(stats, s)
+	}
+	return stats, nil
+}
+
+// recorderCollectASR 记下停录那一刻的识别进度（Cues / ASRPending / asrDone）；
+// 还有段没转完就起后台 goroutine 等 worker 退出后收尾：经 recorderASRDone 重建
+// INDEX.md 并广播（字幕段并进对照表），没有钩子就只重建 INDEX。停录不等它。
+func recorderCollectASR(stats *recorderStats, s *recAudioSession) {
+	stats.Cues = s.cueCount()
+	stats.asrDone = s.asrDone
+	stats.ASRPending = s.pending.Load() > 0
+	if !stats.ASRPending {
+		return
+	}
+	go func() {
+		<-s.asrDone
+		// stats 此刻可能还被停录端点读着（生成响应），不改它：把最终段数交给
+		// 钩子，由钩子按「已出 n 段」重建 INDEX.md 并通知前端
+		if recorderASRDone != nil {
+			recorderASRDone(stats, s.cueCount())
+			return
+		}
+		_ = buildRecorderIndex(stats)
+	}()
 }
 
 func recorderStatusText() string {

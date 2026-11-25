@@ -224,13 +224,8 @@ func (st *timelineState) render(b *strings.Builder, m *StoredMessage) {
 	}
 }
 
-// promptRec 是 kind=prompt 行正文的解析形态（上下文引擎每轮开轮时落库，见 OpenRound）。
-type promptRec struct {
-	Sys   string    `json:"sys"`
-	Env   string    `json:"env"`
-	Tools []ToolDef `json:"tools"`
-}
-
+// renderPrompt 画一轮开轮快照：变化与否优先读引擎随行记录的 chg（promptChange，
+// 比对只在引擎做一次）；老行（chg 字段出现前落的）回退到导出侧与上一条逐字比较。
 func (st *timelineState) renderPrompt(b *strings.Builder, m *StoredMessage) {
 	var p promptRec
 	if err := json.Unmarshal([]byte(m.Text()), &p); err != nil {
@@ -244,6 +239,19 @@ func (st *timelineState) renderPrompt(b *strings.Builder, m *StoredMessage) {
 	}
 	head := fmt.Sprintf("上下文组装（第 %d 轮）：系统提示词 %d 字 · 环境快照 %d 字 · 工具 %d 个",
 		st.roundNo, len([]rune(p.Sys)), len([]rune(p.Env)), len(p.Tools))
+	sysChanged, toolsChanged := false, false
+	var plus, minus []string
+	prevSys := st.lastSys
+	if p.Chg != nil {
+		sysChanged, toolsChanged = p.Chg.Sys, len(p.Chg.ToolsAdd)+len(p.Chg.ToolsDel) > 0
+		plus, minus = p.Chg.ToolsAdd, p.Chg.ToolsDel
+		if p.Chg.PrevSys != "" {
+			prevSys = p.Chg.PrevSys
+		}
+	} else {
+		sysChanged, toolsChanged = p.Sys != st.lastSys, !sameStrings(names, st.lastTools)
+		plus, minus = diffStrings(st.lastTools, names)
+	}
 	if !st.sawPrompt {
 		tlLine(b, m.CreatedAt, head)
 		tlFold(b, "系统提示词全文（请求里的第一条 system 消息）", p.Sys)
@@ -251,18 +259,17 @@ func (st *timelineState) renderPrompt(b *strings.Builder, m *StoredMessage) {
 		tlFold(b, "工具定义完整 JSON（请求体里与消息平级的 tools 数组）", prettyJSON(p.Tools))
 	} else {
 		changed := false
-		if p.Sys != st.lastSys {
+		if sysChanged {
 			changed = true
 			tlLine(b, m.CreatedAt, head)
 			b.WriteString("  系统提示词发生变化（前缀改变——此前已缓存的前缀将失效）\n")
-			writeDiff(b, st.lastSys, p.Sys)
+			writeDiff(b, prevSys, p.Sys)
 		}
-		if !sameStrings(names, st.lastTools) {
+		if toolsChanged {
 			changed = true
 			if !changed {
 				tlLine(b, m.CreatedAt, head)
 			}
-			plus, minus := diffStrings(st.lastTools, names)
 			b.WriteString("  工具定义变化：")
 			if len(minus) > 0 {
 				b.WriteString("移除 " + strings.Join(minus, ",") + " ")

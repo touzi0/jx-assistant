@@ -93,6 +93,13 @@ jx.db-wal
 打包/linux/stage-linux/
 打包/linux/jx-assistant-linux-amd64
 
+# 出包脚本的中间目录、下载缓存与日志（mac/win）：不入库
+打包/stage-mac/
+打包/cache/
+打包/*.log
+# 自带浏览器内核的解压体（根目录 browser/，如存在）：运行期产物，不入库
+browser/
+
 # 语音输入法联动文件（运行期状态：热键/主题色，由主程序按当前设置生成）
 voicetype.json
 
@@ -114,3 +121,7 @@ voicetype.json
 # .onnx.partN 分片入库（asr_worker.py 首次加载时拼回整体文件）；拼回生成的
 # 整体文件不入库（本机运行期产物，别误提交）。
 组件/voice/models/xasr/encoder-epoch-99-avg-1.int8.onnx
+# Chrome 内核（browser_bundle.go 自动装配的 Chrome for Testing 解压体，约
+# 350MB）：本机运行期产物，不入库（缺失会自动下载装配）。当前落在 组件/browser，
+# 位置正在按「基础设施不放组件区」的原则调整——搬家后这条同步改路径。
+组件/browser/

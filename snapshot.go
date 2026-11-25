@@ -60,11 +60,13 @@ func (t *toolContext) displayPath(abs string) string {
 		}
 		return filepath.ToSlash(abs)
 	}
-	// 配置里的工作区可能是相对路径（基于进程 CWD），先转绝对再求相对
+	// 配置里的工作区可能是相对路径（基于进程 CWD），先转绝对再求相对；
+	// 两侧都过 canonicalFor——符号链接（/tmp→/private/tmp）与 macOS 的
+	// NFD/NFC 文件名形态漂移会让字面 Rel 误判成工作区外（见 canonicalFor 注）
 	if wabs, err := filepath.Abs(ws); err == nil {
 		ws = wabs
 	}
-	rel, err := filepath.Rel(ws, abs)
+	rel, err := filepath.Rel(canonicalFor(ws), canonicalFor(abs))
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(abs)
 	}

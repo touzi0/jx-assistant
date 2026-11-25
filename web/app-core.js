@@ -41,14 +41,6 @@ if (new URLSearchParams(location.search).get('shell') === 'desktop') {
   document.documentElement.classList.add('desktop-shell');
 }
 
-/* Electron 壳标记（Electron 主进程加载本页时追加 &electron=1）：右栏浏览器
- * 面板改用页面内 <webview> 元素（DOM 布局，无矩形上报）；语音听写按钮保持
- * 隐藏——Web Speech API 在 Electron 没有免费识别通道，等本地 ASR 落地。 */
-if (new URLSearchParams(location.search).get('electron') === '1') {
-  document.documentElement.classList.add('electron-shell');
-  window.JX_ELECTRON = true;
-}
-
 /* ---------- JX：插件接口（插件兼容层注入的浏览器半边经此接入原生界面） ---------- */
 const JX = {
   _bus: {},

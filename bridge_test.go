@@ -69,7 +69,7 @@ func TestBridgeTokenAndWhitelist(t *testing.T) {
 	}
 
 	// 伪造 token → 403
-	if code, _ := bridgePost(t, srv, "forged-token", "read", map[string]any{"path": ws + "\\hello.txt"}); code != http.StatusForbidden {
+	if code, _ := bridgePost(t, srv, "forged-token", "read", map[string]any{"path": filepath.Join(ws, "hello.txt")}); code != http.StatusForbidden {
 		t.Fatalf("伪造 token 应 403，得到 %d", code)
 	}
 
@@ -96,7 +96,7 @@ func TestBridgeTokenAndWhitelist(t *testing.T) {
 	}
 
 	// 白名单内：read 成功读到文件
-	_, out = bridgePost(t, srv, token, "read", map[string]any{"path": ws + "\\hello.txt"})
+	_, out = bridgePost(t, srv, token, "read", map[string]any{"path": filepath.Join(ws, "hello.txt")})
 	if ok, _ := out["ok"].(bool); !ok {
 		t.Fatalf("read 应成功：%v", out)
 	}
@@ -106,7 +106,7 @@ func TestBridgeTokenAndWhitelist(t *testing.T) {
 
 	// release 后再调 → 403
 	cleanup()
-	if code, _ := bridgePost(t, srv, token, "read", map[string]any{"path": ws + "\\hello.txt"}); code != http.StatusForbidden {
+	if code, _ := bridgePost(t, srv, token, "read", map[string]any{"path": filepath.Join(ws, "hello.txt")}); code != http.StatusForbidden {
 		t.Fatalf("release 后 token 应失效（403），得到 %d", code)
 	}
 	// 幂等：再 release 不炸

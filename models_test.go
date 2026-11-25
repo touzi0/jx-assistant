@@ -6,7 +6,7 @@ import (
 )
 
 // 思考档位推断的协议维度：同一模型 ID 在三种渠道协议下档位不同
-//（Anthropic 预算档 / Responses effort 档 / 兼容端点既有口径）。
+// （Anthropic 预算档 / Responses effort 档 / 兼容端点既有口径）。
 func TestGuessReasoningLevelsByProtocol(t *testing.T) {
 	cases := []struct {
 		name, proto, id string
@@ -53,6 +53,12 @@ func TestGuessReasoningLevelsByProtocol(t *testing.T) {
 			name: "兼容渠道 deepseek 照旧", proto: "", id: "deepseek-flash",
 			want: []string{"enabled", "disabled", "low", "high", "max"},
 		},
+		{
+			// glm-5.4 与 5.3 同口径：思考常开，只有 low/high/max 三档深浅
+			//（实测 thinking.type=disabled 不报错也不生效，故不列「关」档）
+			name: "兼容渠道 glm-5.4 与 5.3 同口径", proto: "", id: "glm-5.4",
+			want: []string{"enabled", "low", "high", "max"},
+		},
 	}
 	for _, c := range cases {
 		got := guessReasoningLevels(c.proto, c.id)
@@ -75,6 +81,13 @@ func TestEffectiveReasoningLevels(t *testing.T) {
 			name: "deepseek 旧推断自动升级", proto: "", id: "deepseek-flash",
 			stored: []string{"enabled", "disabled"},
 			want:   []string{"enabled", "disabled", "low", "high", "max"},
+		},
+		{
+			// 存量 glm-5.4 配置：旧版按 glm-5 通用口径写死的开/关两档不是新结果的
+			// 子集，但也不是端点真报过的档位（这类型号关不掉思考），要能跟着升级
+			name: "glm-5.4 存量开关档升级", proto: "", id: "glm-5.4",
+			stored: []string{"enabled", "disabled"},
+			want:   []string{"enabled", "low", "high", "max"},
 		},
 		{
 			// 存量 Anthropic 渠道：旧版写死的五档（无 max），本版本补 max
@@ -164,7 +177,7 @@ func TestAnthropicPresetHasAllLevels(t *testing.T) {
 }
 
 // 预置 Responses 模板：协议 responses、模型档位 disabled/low/medium/high
-//（Responses 无 max 档；effort 值在 responsesEffort 里都有映射）。
+// （Responses 无 max 档；effort 值在 responsesEffort 里都有映射）。
 func TestResponsesPresetLevels(t *testing.T) {
 	preset, ok := PresetByID("openai-responses")
 	if !ok {

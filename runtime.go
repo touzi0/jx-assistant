@@ -735,15 +735,23 @@ func (a *App) landUserSide(m *SessionMeta, content, kind, origin string, emit fu
 	return sm
 }
 
-// bumpPendingLocked 递增会话的待生效队列版本号（必须在 pendMu 持有下调用）。
+// bumpPendingLocked 前进会话的待生效队列版本号（必须在 pendMu 持有下调用）。
 // 版本号随快照下发，是「快照取值时刻」的标记：插话排水极快（打断→注入可在
 // 响应写回前完成），interject 响应/pending 广播在途时队列可能已排空，旧快照
 // 晚到若被前端照画就是无人再摘的幽灵虚线框——前端按 ver 只接受更新的快照。
+// 用「毫秒时间戳与历史最大值取大」而不是纯计数：进程重启后计数清零会回卷，
+// 挂着的页面（手机端/多窗口）基线还在旧值，之后所有快照都被版本门拦掉，
+// 同会话内插话/排队状态失明到切走重进；时间戳基底重启后继续增长，永不回卷
+// （同毫秒连续变更用 +1 前进，保持严格单调）。
 func (a *App) bumpPendingLocked(sessionID string) {
 	if a.pendVer == nil { // 惰性建表：测试/非常规构造路径没走 initRuntime 也不炸
 		a.pendVer = map[string]int64{}
 	}
-	a.pendVer[sessionID]++
+	v := time.Now().UnixMilli()
+	if v <= a.pendVer[sessionID] {
+		v = a.pendVer[sessionID] + 1
+	}
+	a.pendVer[sessionID] = v
 }
 
 // drainSteer 取走并清空会话的插话队列（agent 循环步间排水）。

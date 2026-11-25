@@ -35,7 +35,7 @@ package main
 // 同签名堆栈且栈顶在 enumWndCb，再为工具执行路径加同款护栏。
 //
 // 删除条件：Go 官方修复上述回调栈拷贝缺陷（跟进 golang/go issue），或桌面
-// 壳迁往 Electron（仓库 browser_panel_electron.go 路线）后本护栏无回调可保。
+// 壳换掉 WebView2 之后本护栏无回调可保。
 
 import "log"
 

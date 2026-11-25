@@ -86,15 +86,27 @@ func newBrowserHost(app *App, headless bool, profile string) *BrowserHost {
 
 // findBrowserExe 优先找系统自带的 Edge（Win10/11 必装，符合自包含
 // 原则——不依赖用户另装浏览器）；Edge 异常缺失时兜底找 Chrome；
-// 都找不到交给 chromedp 自行探测。
+// macOS 没有必装的可 CDP 浏览器（Safari 不支持 CDP），按常见安装位置找
+// Chrome/Edge/Chromium；都找不到交给 chromedp 自行探测。
 func findBrowserExe() string {
-	candidates := []string{
-		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
-		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("LOCALAPPDATA") + `\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("LOCALAPPDATA") + `\Google\Chrome\Application\chrome.exe`,
-		`C:\Program Files\Google\Chrome\Application\chrome.exe`,
-		`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+	var candidates []string
+	if isDarwinRuntime {
+		home, _ := os.UserHomeDir()
+		candidates = []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			filepath.Join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+		}
+	} else {
+		candidates = []string{
+			`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+			`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+			os.Getenv("LOCALAPPDATA") + `\Microsoft\Edge\Application\msedge.exe`,
+			os.Getenv("LOCALAPPDATA") + `\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		}
 	}
 	for _, p := range candidates {
 		if p == "" {
@@ -108,7 +120,7 @@ func findBrowserExe() string {
 }
 
 // Browser 返回（惰性创建）该会话的无头宿主：网页形态的内嵌目标（桌面原生
-// 壳的会话面板见 panelFor；Electron 壳见 nativePanel）。每会话一个实例、
+// 壳的会话面板见 panelFor）。每会话一个实例、
 // 独立 profile（data/browser-profiles/<会话>/）——A 会话 AI 开的页面不会被
 // B 会话的导航顶掉，登录态互不串台；无会话上下文（空键）退回共享目录
 // browser-profile（旧行为）。
@@ -173,13 +185,10 @@ func (a *App) headedBrowser(sid string) *BrowserHost {
 	return h
 }
 
-// embeddedTarget 内嵌形态目标：Electron 壳=右栏 <webview> 单例面板；原生
-// 桌面壳=该会话的右栏 WebView2 面板（panelFor）；网页形态=该会话的无头
-// chromedp 实例。sid 为会话 id（空=无会话上下文的共享实例）。
+// embeddedTarget 内嵌形态目标：原生桌面壳=该会话的右栏 WebView2 面板
+// （panelFor）；网页形态=该会话的无头 chromedp 实例。sid 为会话 id（空=无
+// 会话上下文的共享实例）。
 func (a *App) embeddedTarget(sid string) browserTarget {
-	if a.nativePanel != nil {
-		return a.nativePanel
-	}
 	a.panelMu.Lock()
 	dispatch := a.panelDispatch
 	a.panelMu.Unlock()
@@ -1255,8 +1264,7 @@ func (a *App) handleBrowserFrame(w http.ResponseWriter, r *http.Request) {
 
 // browserFrameCaptor 内嵌形态的可选帧截取（WebP q60，远程镜像专用——比
 // Screenshot 的 PNG 小一个量级，是 2fps 轮询下的带宽主力）。原生桌面面板
-// 与无头 chromedp 宿主实现；Electron 面板桥只出 PNG，暂不参与（无实现即
-// 由 handler 报「不支持」）。
+// 与无头 chromedp 宿主实现（没有实现的形态由 handler 报「不支持」）。
 type browserFrameCaptor interface {
 	CaptureFrame() ([]byte, error)
 }
@@ -1312,7 +1320,7 @@ func (a *App) handleBrowserPanelRect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	// 原生桌面壳未就位（网页形态/Electron 壳/启动间隙）：没有原生面板可动
+	// 原生桌面壳未就位（网页形态/启动间隙）：没有原生面板可动
 	a.panelMu.Lock()
 	dispatch := a.panelDispatch
 	a.panelMu.Unlock()
@@ -1366,9 +1374,8 @@ func (a *App) handleBrowserPanelRect(w http.ResponseWriter, r *http.Request) {
 // 浏览器面板之上，设置等全屏 .modal 打开时前端（app-right.js 的 MutationObserver）
 // 上报 on=true，宿主把面板压到主 WebView2 之下（YieldTop）；全部 modal 关闭后
 // on=false 恢复提顶。写者纪律同 handleBrowserPanelRect：仅浏览器 UA + desktop
-// 标记（网页/远程形态的页面发不来，Electron 壳的 webview 是 DOM 元素天然让位、
-// 也不该发）。标记记在 App 级（panelOverlayYield），惰性创建的面板首次落位
-// 同样生效。
+// 标记（网页/远程形态的页面发不来、也不该发）。标记记在 App 级
+// （panelOverlayYield），惰性创建的面板首次落位同样生效。
 func (a *App) handleBrowserPanelOverlay(w http.ResponseWriter, r *http.Request) {
 	var p struct {
 		On      bool `json:"on"`

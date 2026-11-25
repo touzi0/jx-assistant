@@ -112,8 +112,10 @@ func TestWinEncodingNotes(t *testing.T) {
 }
 
 func TestSkillRuntimePromptText(t *testing.T) {
-	s := skillRuntimePromptText(`C:\Apps\坚祥数字助理GO\技能\_runtime\python\python.exe`)
-	wantAll(t, s, "运行时段", "C:/Apps/坚祥数字助理GO/技能/_runtime/python/python.exe",
+	p := `C:\Apps\坚祥数字助理GO\技能\_runtime\python\python.exe`
+	s := skillRuntimePromptText(p)
+	// 期望值同源走 ToSlash（Windows 上转成正斜杠、其他平台原样），测试不随平台漂移
+	wantAll(t, s, "运行时段", filepath.ToSlash(p),
 		"无需用户安装环境", "python/py", "office_skill", "自动联网装配",
 		"涉及中文、引号、JSON 的处理建议用 run_python 提交 Python 脚本",
 		"run_command 与 run_python 都可用",
@@ -126,7 +128,12 @@ func TestSystemPromptSelfLoc(t *testing.T) {
 	ws, _ := filepath.Abs(roTestWS(t))
 
 	sp := a.systemPrompt(&SessionMeta{ID: "s1", Mode: "task", Workspace: ws})
-	wantAll(t, sp, "task 系统提示词", "本助手引擎程序：", "## 内置技能运行时", "_runtime/python/python.exe")
+	if isDarwinRuntime {
+		// macOS：运行时段是 darwin 口径（内置 mac 运行时或系统 python3 的路径）
+		wantAll(t, sp, "task 系统提示词", "本助手引擎程序：", "## 内置技能运行时", "python3")
+	} else {
+		wantAll(t, sp, "task 系统提示词", "本助手引擎程序：", "## 内置技能运行时", "_runtime/python/python.exe")
+	}
 
 	// assistant 模式：定位句在场（全模式），运行时段不在（没有技能工具）
 	asst := a.systemPrompt(&SessionMeta{ID: "s2", Mode: "assistant", Workspace: ws})

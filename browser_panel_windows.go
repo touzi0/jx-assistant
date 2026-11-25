@@ -1208,7 +1208,7 @@ func (p *browserPanel) Close() { p.closePanel("未标注发起方") }
 
 // CloseWithReason 同 Close，额外把发起方写进各阶段日志（右栏 ✕ 与 AI 的
 // browser_close 走同一个收口，差别只在日志与收口方的标记）。其余形态
-// （有头/无头/Electron 桥）没有关闭阶段日志，收口按 browserTarget.Close 调。
+// （有头/无头）没有关闭阶段日志，收口按 browserTarget.Close 调。
 func (p *browserPanel) CloseWithReason(reason string) { p.closePanel(reason) }
 
 // closePanel 发起关闭，返回「浏览器进程已退出且宿主子窗口已拆」的完成信号。

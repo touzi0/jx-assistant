@@ -310,20 +310,6 @@ function buildSeqIndex(view) {
   (st.msgs || []).forEach((m, i) => { if (m.seq != null) st._seqIdx.set(m.seq, i); });
 }
 
-// older（服务端 {count,sys,tools,envBoundary}）→ groupTurns 的分组基线（与
-// 子对话继承段同一接力机制）：批次头部的 prompt 变更行据此显示「变更行」而
-// 非「首见完整交代」。envBoundary 不在这里带：摘要行会混入分组输入，覆盖
-// 边界由 sumAt 扫描自动推进到位
-function olderBaseOf(o) {
-  if (!o || (!o.sys && !o.tools)) return null;
-  return {
-    sawPrompt: true,
-    lastSys: o.sys || '',
-    lastToolsJson: o.tools ? JSON.stringify(o.tools) : '',
-    lastTools: o.tools || null,
-  };
-}
-
 // 顶条（#load-older）：剩余提示 / 加载中转圈 / 到底隐藏。点击立即取上一批
 // （onclick 挂在 setupScrollTuck，条本身常驻 DOM、只换内容）
 function renderLoadOlderBar(view) {
@@ -363,7 +349,7 @@ async function loadOlder(view) {
     if (!st.cur || st.cur.id !== sid || !st.msgs.length || st.msgs[0].seq !== firstSeq) return false;
     const batch = d.messages || [];
     if (!batch.length) { st.older = { ...st.older, count: 0 }; return false; }
-    const older = d.older ? { ...d.older, count: d.older.count || 0 } : { count: 0 };
+    const older = d.older ? { count: d.older.count || 0 } : { count: 0 };
     if (batch[0].kind === 'inherit') {
       st.msgs = batch.concat(st.msgs);
       st.older = older;
@@ -374,13 +360,13 @@ async function loadOlder(view) {
     }
     // 普通批次：分组输入 = 新批 + 已加载的摘要/压缩账本行（这两类 builder 不产
     // 条目、只按 coversUpTo/覆盖区间归位——卡片与账本挂到新批内的真实发生位置，
-    // 落库在末尾的行不会丢归位）。基线取当前 older.base（该批之前的状态）
+    // 落库在末尾的行不会丢归位）。快照行形态由服务端按 chg 决定，无需接力基线
     const relisted = st.msgs.filter((m) => displayKindOf(m) === 'summary' || isCompactNoteRow(m));
     const input = batch.concat(relisted);
     const resultOf = {};
     for (const m of input) { if (m.role === 'tool' && m.tool_call_id) resultOf[m.tool_call_id] = m; }
     reportedSubs = scanReported(batch.concat(st.msgs)); // 子任务卡完成态按全量已加载口径
-    const turns = groupTurns(input, resultOf, olderBaseOf(st.older));
+    const turns = groupTurns(input, resultOf);
     const frag = document.createDocumentFragment();
     turns.forEach((turn, ti) => {
       appendTurn(frag, turn, sid + ':' + (turn.userMsg ? turn.userMsg.seq : 'head' + ti), view, false);
@@ -487,8 +473,8 @@ function releaseOlder(view) {
   st.msgs = st.msgs.slice(msgCount);
   st._pfxLen = Math.max(0, st._pfxLen - msgCount);
   st._pfxNodes = Math.max(0, st._pfxNodes - nodeCount);
-  // 未加载条数加回释放的批次；基线恢复为基础窗的（这些消息下次上翻重新加载）
-  st.older = { count: ((st.older && st.older.count) || 0) + msgCount, ...(st._baseWinBase || {}) };
+  // 未加载条数加回释放的批次（这些消息下次上翻重新加载）
+  st.older = { count: ((st.older && st.older.count) || 0) + msgCount };
   buildSeqIndex(view);
   renderLoadOlderBar(view);
 }
@@ -527,17 +513,12 @@ async function loadSessionInto(id, tok, opts) {
   }
   state.cur = data.meta;
   state.msgs = data.messages || [];
-  // 分批记账：本窗之上的未加载条数与基线（释放批次时恢复到它）、批栈清零
-  state.older = data.older ? { ...data.older, count: data.older.count || 0 } : undefined;
+  // 分批记账：本窗之上的未加载条数、批栈清零
+  state.older = data.older ? { count: data.older.count || 0 } : undefined;
   if (!stay || !state._batches || !state._batches.length) {
-    // 全新加载/没有已加载批：基础窗跟新（释放批次时恢复到它的基线）
-    state._baseWinBase = data.older ? { sys: data.older.sys, tools: data.older.tools } : undefined;
     state._batches = stay ? (state._batches || []) : [];
   }
-  state.pendingSteer = (data.pending && data.pending.steer) || [];
-  state.pendingQueue = (data.pending && data.pending.queue) || [];
-  state.pendingVer = (data.pending && data.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
-  state.queuePaused = !!(data.pending && data.pending.paused);
+  landPendingSnapshot(state, data.pending, mainView);
   // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
   state.queueHeld = state.pendingQueue.length > 0 && !state.queuePaused &&
     !(data.running || (state.cur && state.cur.status === 'running'));
@@ -721,25 +702,18 @@ function toolsRow(tools, seq) {
   return row;
 }
 
-// 首轮拼装的尾部材料：只有「运行环境」——它是请求**消息序列里**的一条 user 快照
-// （追加式：首条整份、其后按行差分；有变化才追加，且追加在当轮用户消息之后，
-// 所以首轮它就是那次请求的最后一条消息），故展示在用户消息下方。
-function promptTailRows(env, seq) {
-  return procTextRow('运行环境', fmtCount(String(env ?? '').length) + ' 字 · 追加式环境快照（作为 user 消息进消息序列，有变化才追加新的）', env ?? '', seq);
-}
-
-// 系统提示词变更行：diff + 新全文；前缀改变意味着此前缓存的前缀将失效
+// 系统提示词变更行：diff + 新全文；前缀改变意味着此前缓存的前缀将失效。prev 是
+// 引擎随快照行记录的变化前全文（chg.prevSys）
 function sysChangeRow(prev, sys, seq) {
   return procTextRow('系统提示词变更', '前缀改变 · 此前缓存的前缀将失效 · 现 ' + fmtCount(String(sys).length) + ' 字', diffBody(prev, sys), seq);
 }
 
-// 工具定义变更行：标题列出新增/移除的工具名，正文是新 tools JSON
-function toolsChangeRow(prevTools, tools, seq) {
-  const names = (arr) => (Array.isArray(arr) ? arr.map((t) => t && t.function && t.function.name).filter(Boolean) : []);
-  const { removed, added } = lineDiffOf(names(prevTools).join('\n'), names(tools).join('\n'));
+// 工具定义变更行：标题列出新增/移除的工具名（引擎随快照行记录的 chg.toolsAdd /
+// toolsDel），正文是新 tools JSON
+function toolsChangeRow(tools, add, del, seq) {
   const parts = [];
-  if (removed.length) parts.push('移除 ' + removed.join('、'));
-  if (added.length) parts.push('新增 ' + added.join('、'));
+  if (del && del.length) parts.push('移除 ' + del.join('、'));
+  if (add && add.length) parts.push('新增 ' + add.join('、'));
   const sub = parts.length ? parts.join(' · ') : '共 ' + (Array.isArray(tools) ? tools.length : 0) + ' 个';
   const row = document.createElement('div');
   row.className = 'proc-row';
@@ -753,59 +727,15 @@ function toolsChangeRow(prevTools, tools, seq) {
   return row;
 }
 
-// 运行环境更新行：展示这条快照在下次请求里实际发给模型的消息——正文即发送
-// 原文、字数即发送量（差分时是几十~几百字，整份/完整重发时才是全文 5k 级）。
-// 形态由 groupTurns 的 env 构造器按组装层口径复刻判定，见 ENV_FULL_RESEND_AFTER。
-const ENV_FULL_RESEND_AFTER = 5; // 与后端 context.go envFullResendAfter 同值：连续差分到顶后完整重发一次校准
-
-// envUpdateMessageJS / fullResendEnvJS：组装层 context.go envUpdateMessage /
-// fullResendEnv 的前端镜像（行多重集差 + 中文标签清单，逐字节同输出）。
-// envnote 展示的正是模型将收到的消息——改任一侧必须同步另一侧。
-function envUpdateMessageJS(prev, cur) {
-  prev = String(prev); cur = String(cur);
-  const prevLines = prev.split('\n'), curLines = cur.split('\n');
-  const prevCount = new Map(), curCount = new Map();
-  prevLines.forEach((l) => prevCount.set(l, (prevCount.get(l) || 0) + 1));
-  curLines.forEach((l) => curCount.set(l, (curCount.get(l) || 0) + 1));
-  const added = []; // 新快照里有、旧快照里没有的行（含换值后的新值行）
-  for (const l of curLines) {
-    const c = prevCount.get(l) || 0;
-    if (c > 0) { prevCount.set(l, c - 1); continue; }
-    added.push(l);
-  }
-  const removed = []; // 旧快照里有、新快照里没了的 "- " 条目行（注记行等静默消失）
-  for (const l of prevLines) {
-    const c = curCount.get(l) || 0;
-    if (c > 0) { curCount.set(l, c - 1); continue; }
-    if (l.trimStart().startsWith('- ')) removed.push(l);
-  }
-  let b = '';
-  if (removed.length) {
-    b = '# 环境更新（条目有增删/变更：移除行 = 早前快照中该条目整行作废，新增行 = 最新状态，均给整行原文；连续差分积累多了系统会自动完整重发一次校准）\n';
-    removed.forEach((l) => { b += '【移除】' + l + '\n'; });
-    added.forEach((l) => { b += '【新增】' + l + '\n'; });
-    return b.replace(/\n+$/, '');
-  }
-  if (!added.length) return '';
-  added.sort(); // 与后端 sort.Strings 同为确定性排序（快照行为 BMP 字符，序一致）
-  b = '# 环境更新（新增条目，叠加在更早的快照与更新之上；条目减少或变更时改发增删变更清单）\n';
-  added.forEach((l) => { b += l + '\n'; });
-  return b.replace(/\n+$/, '');
-}
-
-// 完整重发形态：正文用新快照原文，首行标题换成「完整重发」声明（镜像 fullResendEnv）
-function fullResendEnvJS(cur) {
-  let body = String(cur);
-  const i = body.indexOf('\n');
-  if (i >= 0 && body.startsWith('# ')) body = body.slice(i + 1);
-  return '# 运行环境快照（完整重发，取代更早的快照与更新）\n' + body.replace(/\n+$/, '');
-}
-
+// 运行环境行：展示这条快照发给模型时的那条消息——正文即发送原文、字数即发送量
+// （差分时是几十~几百字，整份/完整重发时才是全文 5k 级）。文本与形态都由上下文
+// 引擎算好随行下发（render = {mode, text}，与组装层同一次计算），前端只显示。
 function envNoteRow(it) {
-  const kindLabel = it.mode === 'full' ? '整份' : it.mode === 'resend' ? '完整重发（差分校准）' : '差分';
-  return procTextRow('运行环境更新',
-    '随下次请求尾部发送 · ' + fmtCount(String(it.text).length) + ' 字 · ' + kindLabel,
-    String(it.text), it.seq);
+  const isFull = it.mode === 'full';
+  const sub = isFull
+    ? '随下次请求尾部发送 · ' + fmtCount(String(it.text).length) + ' 字 · 整份快照（作为 user 消息进消息序列，有变化才追加新的）'
+    : '随下次请求尾部发送 · ' + fmtCount(String(it.text).length) + ' 字 · ' + (it.mode === 'resend' ? '完整重发（差分校准）' : '差分');
+  return procTextRow(isFull ? '运行环境' : '运行环境更新', sub, String(it.text), it.seq);
 }
 
 // 时间提示词行：与「运行环境」同款折叠行——模型收到的每条时间消息都在这里
@@ -947,11 +877,11 @@ function toolRow(tc, result, opts = {}) {
 
 /* ---------- 折叠段：折叠条 + 隐藏容器 ---------- */
 
-  // 上下文材料条目：时间提示、首轮尾部材料、运行环境更新、系统提示词/工具定义变更。
+  // 上下文材料条目：时间提示、运行环境（更新）、系统提示词/工具定义变更。
   // 它们与思考/工具过程一起折叠（想核对「模型看到了什么」时再展开），
   // 渲染的两个路径（完成态/流式）都按此归类。
 function isMatItem(it) {
-  return it.k === 'time' || it.k === 'prompttail' || it.k === 'envnote' || it.k === 'syschange' || it.k === 'toolschange';
+  return it.k === 'time' || it.k === 'envnote' || it.k === 'syschange' || it.k === 'toolschange';
 }
 // 注意：fold（已折叠标注行）刻意不归入材料折叠——它是用户要看的状态标注，
 // 与压缩摘要行同样常显，藏进材料分组就失去「这里压缩过」的提示意义
@@ -1099,8 +1029,8 @@ async function loadInheritOlder(sid, sec) {
    2026-11-16 起派生只承接「摘要 + 摘要边界之后的原文」：更早的父会话历史按需经
    GET /api/sessions/{id}/inherit 懒加载（锚点里的 from/total 是游标），点一次取一批，
    取到的行存在本页内存（inheritOlderCache），不写库、不改会话消息。
-   turns 由 renderMessages 分组后传入（分组状态上的基线随 turns.base 带出，
-   供正文段接着比——子对话首条 prompt 快照与父相同时不再重复显示）。 */
+   turns 由 renderMessages 分组后传入（子对话自己的首条 prompt 快照与父对话相同时
+   引擎已判为无变化、服务端掏成空壳，正文段不会重复显示）。 */
 function inheritBlock(turns, items, sid, mark) {
   const key = sid + ':inherit';
   const sec = document.createElement('div');
@@ -1265,58 +1195,40 @@ const ROW_ITEM_BUILDERS = {
   // 压缩摘要：不按落库位置产条目——卡片由 groupTurns 的 sumAt 归位到覆盖
   // 边界（最后一条被压缩的消息之后）就地插入，位置才是压缩真实发生的地方
   summary() {},
-  // 运行环境快照：按组装层（context.go envRowRender）同一口径复刻「模型实际
-  // 收到什么」——首条（或摘要折叠后首条）整份、其后差分（envUpdateMessageJS
-  // 行多重集差）、连续差分满 ENV_FULL_RESEND_AFTER 后完整重发校准、同文不发；
-  // 已被摘要覆盖（seq≤envBoundary）或规则压缩整行省略（omit）的快照模型已
-  // 看不到，不再显示。envnote 的正文与字数因此与下次请求的发送内容一致
-  // （所见即所发：差分时几十~几百字，整份/完整重发才显示全文字数）。
+  // 运行环境快照：只显示引擎随行下发的 render（{mode, text} = 这条快照发给模型时
+  // 的那条消息与形态，与组装层同一次计算，见 context.go renderEnvRows）——所见即
+  // 所发：差分时几十~几百字，整份/完整重发才显示全文字数。没有 render 的行模型
+  // 看不到（摘要已覆盖 / 规则压缩整行省略），同样不显示
   env(m, st) {
-    if (m.seq <= st.envBoundary) return;   // 摘要已覆盖：模型看不到这条快照
-    if (m.compact === 'omit') return;      // 规则压缩整行省略：同上
-    const txt = String(m.content ?? '');
-    let mode = null, body = '';
-    if (st.lastEnv == null) {
-      mode = 'full'; body = txt; st.envUpdates = 0;
-    } else if (st.envUpdates >= ENV_FULL_RESEND_AFTER) {
-      mode = 'resend'; body = fullResendEnvJS(txt); st.envUpdates = 0;
-    } else {
-      body = envUpdateMessageJS(st.lastEnv, txt);
-      if (body) { mode = 'diff'; st.envUpdates++; }
-    }
-    st.lastEnv = txt; // 基线无条件推进（同文/注记过期静默消失也不回退，与后端一致）
-    if (!mode) return;
+    if (!m.render || !m.render.text) return;
     st.ensure();
-    st.cur.items.push({ k: 'envnote', seq: m.seq, text: body, mode });
+    st.cur.items.push({ k: 'envnote', seq: m.seq, text: String(m.render.text), mode: m.render.mode });
   },
-  // 提示词拼装快照：变化驱动展示（规范 §4）——首轮完整交代拼装结构
-  // （工具定义 + 系统提示词在用户消息上方、运行环境在请求末尾，即请求真实排布），
-  // 此后仅在系统提示词/工具定义变更时出折叠行；环境变化由 env 行负责
+  // 提示词拼装快照：形态由服务端按引擎记录的 chg 决定（ContextEngine 契约 6）——
+  // 空壳 {} = 本轮材料无变化，不显示；全文行按 chg 分两种：first 或无变化（窗口
+  // 内首条）→ 首见形态，完整交代拼装结构（工具定义 + 系统提示词在用户消息上方，
+  // 运行环境在请求末尾，即请求真实排布）；有变化 → 折叠的变更行（规范 §4「只讲
+  // 变化」：系统提示词给变化前全文做 diff，工具定义给新增/移除名单 + 新全文）
   prompt(m, st) {
-    let sys = '', env = '', tools = null;
+    let sys = '', tools = null, chg = null;
     try {
       const j = JSON.parse(String(m.content ?? '{}'));
-      sys = j.sys || ''; env = j.env || '';
+      sys = j.sys || '';
       if (Array.isArray(j.tools)) tools = j.tools;
-    } catch (e) { /* 忽略坏行 */ }
+      chg = j.chg || null;
+    } catch (e) { return; /* 忽略坏行 */ }
+    if (!sys && tools == null && !chg) return; // 空壳：无变化
     st.ensure();
-    const toolsJson = tools == null ? '' : JSON.stringify(tools);
-    if (!st.sawPrompt) {
-      // 首轮：lastEnv 同步为本轮环境，随后的同文快照行会被去重
+    const toolsChanged = !!(chg && ((chg.toolsAdd && chg.toolsAdd.length) || (chg.toolsDel && chg.toolsDel.length)));
+    const sysChanged = !!(chg && chg.sys);
+    if (!chg || chg.first || (!sysChanged && !toolsChanged)) {
+      // 工具定义跟着提示词走（都在消息序列之前展示），运行环境由 env 行自己交代
       st.cur.sysHead = sys; st.cur.sysHeadSeq = m.seq;
-      // 工具定义跟着提示词走（都在消息序列之前展示），运行环境留在尾部材料里
       st.cur.headTools = tools; st.cur.headToolsSeq = m.seq;
-      st.cur.items.push({ k: 'prompttail', seq: m.seq, env });
-      st.lastEnv = env;
-    } else {
-      // 空壳行（服务端把与上一条逐字节相同的快照瘦成 {} 后）不产生任何变更展示：
-      // 有值才比较、才推进基线——sys/tools 真实“变空”不可能发生，空值只来自瘦身
-      if (sys && sys !== st.lastSys) st.cur.items.push({ k: 'syschange', seq: m.seq, sys, prev: st.lastSys });
-      if (toolsJson && toolsJson !== st.lastToolsJson) st.cur.items.push({ k: 'toolschange', seq: m.seq, tools, prevTools: st.lastTools });
+      return;
     }
-    st.sawPrompt = true;
-    if (sys) st.lastSys = sys;
-    if (toolsJson) { st.lastToolsJson = toolsJson; st.lastTools = tools; }
+    if (sysChanged) st.cur.items.push({ k: 'syschange', seq: m.seq, sys, prev: chg.prevSys || '' });
+    if (toolsChanged) st.cur.items.push({ k: 'toolschange', seq: m.seq, tools, add: chg.toolsAdd || [], del: chg.toolsDel || [] });
   },
   // 继承标记行由 inheritBlock 分段处理（这里不产条目）
   inherit() {},
@@ -1327,20 +1239,11 @@ const ROW_ITEM_BUILDERS = {
 // 按真实用户发言切回合；系统通知（回报/中断/上传）归入当前回合且常显；
 // assistant 消息按序拆成思考/正文/工具条目，tool 消息经 resultOf 配对进条目。
 // 每次请求都会完整重发系统提示词（协议如此）——「不变」= 逐字节相同，
-// 前缀缓存据此命中，所以上下文材料只在变化时展示。
-// base（可空）：分组状态的初始基线——子对话的正文段从这里接过继承段分组后的
-// 基线，自己首条 prompt 快照与父对话逐字节相同时就不再显示「工具定义/系统
-// 提示词」折叠行（它们已折在「来自主对话」段里；真换了模式/工具集才显示变更行）。
-function groupTurns(msgs, resultOf, base) {
-  const st = {
-    turns: [], cur: null, resultOf,
-    sawPrompt: false, lastSys: '', lastToolsJson: '', lastTools: null, lastEnv: null,
-    ...(base || {}),
-  };
-  // 环境快照的组装口径状态（镜像 context.go buildContext）：envUpdates 差分
-  // 计数（继承段接力），envBoundary 摘要覆盖边界（边界内的快照模型已看不到）
-  st.envUpdates = st.envUpdates || 0;
-  st.envBoundary = 0;
+// 前缀缓存据此命中，所以上下文材料只在变化时展示；变没变、变了什么由上下文
+// 引擎比对并随行下发（prompt 行的 chg、env 行的 render），这里只按结果产条目，
+// 分组不保留任何比对状态。
+function groupTurns(msgs, resultOf) {
+  const st = { turns: [], cur: null, resultOf };
   st.ensure = () => {
     if (!st.cur) { st.cur = { userMsg: null, items: [] }; st.turns.push(st.cur); }
   };
@@ -1371,7 +1274,6 @@ function groupTurns(msgs, resultOf, base) {
   for (const m of msgs) {
     if (displayKindOf(m) !== 'summary' || !m.coversUpTo) continue;
     sumAt.set(m.coversUpTo, m);
-    if (m.coversUpTo > st.envBoundary) st.envBoundary = m.coversUpTo; // 组装层 boundary 同口径：取摘要覆盖边界最大值
   }
   // 规则压缩账本行按覆盖区间归到折叠段：账本正文写明「覆盖 seq X–Y」，
   // Y 落在哪个段的边界之内就归哪段（段边界是段内最后一条可见行，Y 有可能
@@ -1399,8 +1301,6 @@ function groupTurns(msgs, resultOf, base) {
       st.cur.items.push({ k: 'summary', seq: s.seq, text: String(s.content ?? ''), origin: s.origin, covers: s.coversUpTo });
     }
   }
-  st.base = { sawPrompt: st.sawPrompt, lastSys: st.lastSys, lastToolsJson: st.lastToolsJson, lastTools: st.lastTools, lastEnv: st.lastEnv, envUpdates: st.envUpdates };
-  st.turns.base = st.base; // 挂在返回的 turns 上：renderMessages 接力给正文段的分组
   return st.turns;
 }
 
@@ -1576,11 +1476,10 @@ async function forkFromAnswer(m, btn) {
 }
 
 function renderRowItem(it, opts) {
-  if (it.k === 'prompttail') return promptTailRows(it.env, it.seq);
   if (it.k === 'envnote') return envNoteRow(it);
   if (it.k === 'time') return timeNoteRow(it.text, it.seq);
   if (it.k === 'syschange') return sysChangeRow(it.prev, it.sys, it.seq);
-  if (it.k === 'toolschange') return toolsChangeRow(it.prevTools, it.tools, it.seq);
+  if (it.k === 'toolschange') return toolsChangeRow(it.tools, it.add, it.del, it.seq);
   if (it.k === 'summary') return summaryRow(it.text, it.origin, it.covers, it.seq);
   if (it.k === 'fold') return foldRow(it.rounds, it.seq, it.notes);
   if (it.k === 'think') return thinkRow(it.text, it.seq);
@@ -2703,13 +2602,13 @@ function mdPanelURL(sid, path) {
 }
 
 /* Markdown 在右栏渲染打开——只给**显式**的右栏入口（「右侧查看」/右键「预览
-   （右栏）」）用，默认「打开」不经这里。桌面/Electron 走原生面板（与 html
+   （右栏）」）用，默认「打开」不经这里。桌面走原生面板（与 html
    预览同一条 navigate 通道，面板里跑的就是那张渲染页）；手机与网页形态走右栏
    iframe（bpwShowFrame，见 app-right.js）——抽屉里铺满可用宽，窄屏单列可读。 */
 function openMDInPanel(sid, path) {
   const url = mdPanelURL(sid, path);
   rpOpen('browser'); // 面板未开自动开；已开只是切页签
-  if (bpwDesktop() || bpwElectron()) { bpwNav({ url: location.origin + url }); return; }
+  if (bpwDesktop()) { bpwNav({ url: location.origin + url }); return; }
   bpwShowFrame(url, String(path).replace(/\\/g, '/').split('/').pop());
 }
 
@@ -2722,14 +2621,14 @@ function deliveryOpenFile(view, sid, d) {
 
 // 远程访问环境（发起访问的设备不是跑助手的那台电脑）：交付卡的「打开」换成
 // 「下载」——文件只在本机上，「打开」调起的是本机的系统程序，访问端什么都
-// 看不见。判据按访问位置、不看设备形态：桌面壳/Electron 的页面就跑在本机程序
+// 看不见。判据按访问位置、不看设备形态：桌面壳的页面就跑在本机程序
 // 里（bindHost 配成局域网 IP 时壳里也不是 loopback，所以先判壳）；远程接入
 // （JX_REMOTE）必是别的设备；浏览器只认 loopback 地址为本机——手机壳、手机
 // 浏览器、局域网里别的电脑加载的都是电脑 IP。取舍：本机浏览器手动敲自己的
 // 局域网 IP 也会被当远程（下载到本机下载目录，文件仍在这台机器上，误伤很小；
 // 反过来远程点「打开」把本机程序调起来才是真问题）。
 function isRemoteClientEnv() {
-  if (bpwDesktop() || bpwElectron()) return false;
+  if (bpwDesktop()) return false;
   if (window.JX_REMOTE) return true;
   const h = (location.hostname || '').toLowerCase();
   return h !== 'localhost' && h !== '127.0.0.1' && h !== '::1' && h !== '[::1]';
@@ -3251,9 +3150,8 @@ function renderMessages(msgs, view, opts) {
   }
   anchorSave(view); // 任何重建（前缀全量重建/尾部重建）之前锚定视口（仅钉住阅读时生效）
   // 子对话开头的继承段（后端克隆父对话时写入的标记行 + N 条历史）：
-  // 折叠成一条「来自主对话」折叠条，其余消息照常渲染。继承段先分组，
-  // 正文段从它分组后的基线接着比——子对话自己的 prompt 快照与父对话相同
-  // 时不再重复显示「工具定义/系统提示词」（真变了才出变更行）。
+  // 折叠成一条「来自主对话」折叠条，其余消息照常渲染。子对话自己的 prompt
+  // 快照与父对话相同时引擎已判为无变化（服务端掏成空壳），正文段不会重复显示。
   let inherited = null, rest = msgs, off = 0, inhTurns = null, inhMark = null;
   if (msgs[0].kind === 'inherit') {
     let mark = {};
@@ -3272,7 +3170,7 @@ function renderMessages(msgs, view, opts) {
   }
   const kRel = lastTurnStart(rest);
   const k = kRel < 0 ? off : off + kRel; // 前缀长度：无真实用户消息时继承段之后全算尾部
-  const turns = groupTurns(rest, resultOf, inhTurns && inhTurns.base);
+  const turns = groupTurns(rest, resultOf);
   // 前缀可复用：同会话、分界没动、分界前最后一条 seq 未变、前缀 DOM 还在
   const reusable = st._pfxSid === sid && st._pfxLen === k && k > 0
     && msgs[k - 1] && msgs[k - 1].seq === st._pfxSeq
@@ -3726,6 +3624,14 @@ function handleGlobalEvent(ev) {
       // 后台落库的用户消息（todo.go 广播）与环境快照行（权限等 PATCH 后立即
       // 落库的 env 行，role=system）：正看着这个会话就整体翻新（节流合并）
       if (viewing && !state.streaming && ev.message && (ev.message.role === 'user' || ev.kind === 'env')) refreshCurrentSoon();
+      // 插话注入落库（user 正文）：对账摘掉已送达的插话虚线框。本地流 handler
+      // 是第一道（同款对账），但流通道丢帧时这条总线是兜底——流与总线收的是
+      // 同一事件；执行中（streaming）上面整包翻新被挡，没有这步就只能等摘框
+      // 广播，广播再丢帧就成了无人再摘的幽灵框。
+      if (ev.message && ev.message.role === 'user' && typeof ev.message.content === 'string') {
+        if (viewing && pruneLandedSteer(mainView, ev.message.content)) renderMessages(state.msgs, mainView);
+        if (subViewing && pruneLandedSteer(subView, ev.message.content)) renderMessages(subState.msgs, subView);
+      }
       // env 行是「环境条目刚变过」的信号（权限/能力/计划目标/工作目录；人工改权限
       // 走 PATCH，不发 session_updated）：顺手把权限胶囊跟上——同一个会话的另一处
       // 视图（右栏子对话）、别的窗口、手机端都靠这里，不必等下一次切会话
@@ -3915,16 +3821,22 @@ function handleGlobalEvent(ev) {
     }
     case 'demo_record_started':
     case 'demo_record_stopped':
-      // 演示记录器归用户直控（按钮）：任何窗口起录/停录，所有录制按钮同步收敛
+      // 操作录制器归用户直控（专用按钮 / 录制胶囊）：任何窗口起录/停录，
+      // 所有录制按钮与录制胶囊同步收敛
       demoRec.active = ev.type === 'demo_record_started';
       demoRec.dir = ev.output || demoRec.dir;
-      document.querySelectorAll('.rec-btn').forEach(demoRecSyncBtn);
-      // 停录：【演示记录】通知落进该会话，正看着就翻新让它落屏
-      if (ev.type === 'demo_record_stopped' && ev.sessionId) {
-        if (state.cur && state.cur.id === ev.sessionId && !state.streaming) refreshCurrent();
-        if (subState.cur && subState.cur.id === ev.sessionId && !subState.streaming) refreshCurrentSub();
-      }
+      demoRecSyncAll();
+      syncPlusChecks(popView); // 加号菜单正开着时「录制中」态即时跟上（菜单单例，只刷它的归属视图）
+      // 材料不落会话注记行：停录的窗口把【演示记录】卡挂进自己的输入框附件区（demoRecToggle），
+      // 这里不需要翻新
       break;
+    case 'demo_record_transcribed': {
+      // 停录不等的语音识别在后台转完了（ev.output=材料目录）：还挂在输入框上方的
+      // 那份材料卡把「语音转写中…」换成字幕段数、注记换成最终实况；已发出去的不动
+      const n = updateRecordCards(ev.output, ev.data && ev.data.cues, ev.data && ev.data.note);
+      if (n) toast('演示记录的语音已转写完成（' + (+((ev.data && ev.data.cues) || 0)) + ' 段字幕），材料卡已更新，可以发送了');
+      break;
+    }
     case 'components_updated':
       // 组件已静默热更：前端半边对账增删（不刷新页面），轻提示不打扰
       if (window.CX && CX.refresh) {
@@ -3939,7 +3851,7 @@ function handleGlobalEvent(ev) {
     // 重报矩形：面板曾因矩形上报失联被留在隐藏态（地址已填、舞台空白），
     // 每次导航到达都补一次上报，让面板自愈显示。带 sessionId 的事件只作用于
     // 本会话的面板——别的会话（含后台子对话的 AI）在导航，不刷本会话工具栏、
-    // 不动本会话布局；不带 sessionId 的（Electron 壳/共享面板）维持全局口径。
+    // 不动本会话布局；不带 sessionId 的（会话记录之外的共享面板）维持全局口径。
     case 'browser_nav':
       if (ev.sessionId && (!state.cur || ev.sessionId !== state.cur.id)) break;
       bpwOnNav(ev);
@@ -5805,6 +5717,7 @@ function handleEvent(ev, view) {
       if (ev.seq) ev.message.seq = ev.seq;
       if (ev.kind) ev.message.kind = ev.kind; // 行类型：与存储 kind 一致（契约见《消息类型规范.md》）
       if (ev.origin) ev.message.origin = ev.origin;
+      if (ev.render) ev.message.render = ev.render; // env 行：引擎算好的「模型实际收到的消息」（见 envNoteRow）
       // 新回合开始（用户消息回显）：关注点回到尾部，顺手放掉上方已加载批次
       // （贴底跟随态才生效，钉住阅读不动）。赶在下一条 push 触发前缀判定之前：
       // 释放后索引同步平移，渲染仍走尾部重建快路径，批记账不会作废
@@ -6406,15 +6319,37 @@ async function editPendingMsg(view, pm) {
 function applyPending(view, pending, sessionId) {
   if (!pending) return;
   if (sessionId && (!view.state.cur || view.state.cur.id !== sessionId)) return;
-  const ver = pending.ver | 0;
+  const ver = +pending.ver || 0; // 安全整数（毫秒时间戳），勿用 |0：32 位截断会在 2^31 边界回卷
   if (ver > 0 && (view.state.pendingVer || 0) >= ver) return; // 旧快照回放：不落地
   if (ver > 0) view.state.pendingVer = ver;
   view.state.pendingSteer = pending.steer || [];
   view.state.pendingQueue = pending.queue || [];
   view.state.queuePaused = !!pending.paused;
   if (!view.state.pendingQueue.length) view.state.queueHeld = false; // 队列清空：保留横幅不再有意义
+  // 落地即对账：快照的取值可能早于插话落库（摘框广播丢帧、慢网在途响应），此时
+  // 本地版本基线还没前进、同 ver 的旧快照能过版本门——消息历史（seq 单调不可
+  // 回退）是最终裁决：画上的同时剪掉正文已落库的项，回放画出的框当帧即摘。
+  if (view.state.pendingSteer.length) pruneLandedSteer(view);
   renderQueueDock(view);
   if (view.state.cur) renderMessages(view.state.msgs, view);
+}
+
+// landPendingSnapshot 整包加载点（会话详情 loadSessionInto / reloadMessages /
+// 子会话打开）落地 pending 快照：与广播/响应的 applyPending 同一套版本纪律。
+// 整包响应在途期间可能又发生队列变更（插话广播已把新状态画上）——旧快照的
+// pending 部分不落地（消息部分由调用方各自的 seq 对账把关），否则插话刚画上
+// 的排队坞/插话框会被迟到的响应抹掉，直到下一次整包刷新才回来（用户看到的
+// 「插话后排队坞不出现、切走再回来才出现」）。ver 缺失（老后端）照常落地。
+// view 可选：传入则落地即对账（同 applyPending——同 ver 旧快照不被版本门拦，
+// 已落库的插话项按消息历史当帧剪掉，不留无人再摘的幽灵框）。
+function landPendingSnapshot(st, pending, view) {
+  const pv = +(pending && pending.ver) || 0; // 安全整数（毫秒时间戳），勿用 |0：32 位截断会在 2^31 边界回卷
+  if (pv > 0 && pv < (st.pendingVer || 0)) return; // 迟到的旧快照：pending 部分不覆盖
+  st.pendingSteer = (pending && pending.steer) || [];
+  st.pendingQueue = (pending && pending.queue) || [];
+  st.pendingVer = pv;
+  st.queuePaused = !!(pending && pending.paused);
+  if (view && st.pendingSteer.length) pruneLandedSteer(view);
 }
 
 // pruneLandedSteer 摘掉「正文已作为用户消息落库」的插话虚线框，返回是否有摘除。
@@ -6980,18 +6915,14 @@ async function reloadMessages(view, opts) {
       const head = incoming.length ? view.state.msgs.filter((m) => m.seq < incoming[0].seq) : [];
       if (head.length) {
         d.messages = head.concat(incoming);
-        if (d.older) d.older = { ...d.older, count: Math.max(0, (d.older.count || 0) - head.length) };
-      } else if (d.older) {
-        view.state._baseWinBase = { sys: d.older.sys, tools: d.older.tools }; // 基础窗边界前移（无上翻历史）：释放基线跟到最新
+        if (d.older) d.older = { count: Math.max(0, (d.older.count || 0) - head.length) };
       }
-      view.state.older = d.older ? { ...d.older, count: d.older.count || 0 } : undefined;
+      view.state.older = d.older ? { count: d.older.count || 0 } : undefined;
       renderLoadOlderBar(view);
       view.state.msgs = d.messages || [];
     }
     view.state.cur = d.meta;
-    view.state.pendingSteer = (d.pending && d.pending.steer) || [];
-    view.state.pendingQueue = (d.pending && d.pending.queue) || [];
-    view.state.pendingVer = (d.pending && d.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
+    landPendingSnapshot(view.state, d.pending, view); // 在途旧快照不抹掉已画上的排队坞/插话框
     view.state.checkpoints = d.checkpoints || [];
     view.state.deliveries = d.deliveries || [];
     // 上一轮失败过就继续显示报错条（刷新/切换回来都还在，方便接着重试）
@@ -7506,8 +7437,11 @@ function appendQuotedBody(b, raw, mdBody) {
   qm.attNotes.forEach((n) => {
     const line = document.createElement('span');
     line.className = 'msg-quote';
-    line.textContent = n;
-    line.title = n;
+    // 【演示记录】注记一段录制一行、几百字：与引用行同款折叠——只露前 10 字，全文放
+    // title（按句切行，系统提示浮窗才不会拉成一条长线）。文件注记仍整行靠 CSS 截断
+    const isRecord = n.startsWith('【演示记录】');
+    line.textContent = isRecord ? quoteClip(n) : n;
+    line.title = isRecord ? n.replace(/([；。])/g, '$1\n') : n;
     b.appendChild(line);
   });
   qm.quotes.forEach((q, i) => {
@@ -8228,22 +8162,87 @@ const codingModeUI = {
   },
 };
 
-/* ---------- 演示记录器（创建技能模式）：录制按钮，归用户直控 ----------
-   模型不持有录制工具；按钮 POST /api/demo-record/* 起录/停录，材料以【演示记录】
-   系统通知进对话（同文件上传机制）。状态唯一权威在后端单例，按钮只是视图：
-   SSE demo_record_started/stopped 与 status 接口把所有窗口/视图收敛一致。 */
-const demoRec = { supported: true, active: false, dir: '', loaded: false, busy: false };
+/* ---------- 操作录制器（原「演示记录」）：录制胶囊 / 加号菜单项，归用户直控 ----------
+   模型不持有录制工具；界面 POST /api/demo-record/* 起录/停录。停录端点把【演示记录】
+   通知正文随响应返回，界面把材料作为一张卡挂进停录输入区上方的附件区（stageRecord），
+   随用户下一条消息的「用户附件：」块到达模型——与文件附件同一条通路，首页没开会话
+   时录的也跟着第一条消息走。状态唯一权威在后端单例，界面只是视图：SSE
+   demo_record_started/stopped 与 status 接口把所有窗口/视图收敛一致。
+   入口两处：创建技能模式的专用录制按钮（权限芯片右侧，skillCreateModeUI，常驻）；
+   其余模式从加号菜单「操作录制器」挂出一枚**录制胶囊**（权限芯片右侧，与「计划」
+   胶囊同族）：▶/■ 在胶囊里起录停录，✕ 收起（录制中收起＝先停录收录）。胶囊由用户
+   挂出（pinned，按输入区各记一份）；录制中所有输入区都显示胶囊——停录按钮必须
+   够得着，不管是从哪个输入区起的录。创建技能模式下胶囊不显示（专用按钮在场）。 */
+const demoRec = { supported: true, active: false, dir: '', loaded: false, busy: false,
+  pinned: { main: false, sub: false } }; // pinned[key]：该输入区是否挂出了录制胶囊
+const _recFlag = new WeakMap(); // view → 录制胶囊根元素（首挂常驻，之后只切显隐）
 
 function demoRecSyncBtn(btn) {
   if (!btn) return;
   btn.disabled = demoRec.loaded && !demoRec.supported;
   btn.classList.toggle('on', demoRec.active);
   btn.title = demoRec.active ? '停止录制并收录材料'
-    : (demoRec.supported ? '演示记录：开始录制（操作时自动截图＋记事件＋录音）' : '演示记录（仅 Windows 桌面可用）');
+    : (demoRec.supported ? '操作录制器：开始录制（操作时自动截图＋记事件＋录音）' : '操作录制器（仅 Windows 桌面可用）');
   const play = btn.querySelector('.ico-play');
   const stop = btn.querySelector('.ico-stop');
   if (play) play.classList.toggle('hidden', demoRec.active);
   if (stop) stop.classList.toggle('hidden', !demoRec.active);
+}
+
+// 录制胶囊：▶/■ 起录停录，✕ 收起。权限芯片右侧、与「计划」胶囊同款位置与观感
+function demoRecFlagEl(view) {
+  let el = _recFlag.get(view);
+  if (el) return el;
+  el = document.createElement('span');
+  el.className = 'mflag rec-flag hidden';
+  el.innerHTML =
+    '<button type="button" class="rec-flag-btn">' +
+      '<svg class="ico-play" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>' +
+      '<svg class="ico-stop hidden" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="1.5"/></svg>' +
+    '</button><span class="rec-flag-text">操作录制器</span>' +
+    '<b class="mf-x" title="收起（录制中则先停止并收录）">✕</b>';
+  // 整颗胶囊都是起录/停录键（大命中区），只有 ✕ 是收起
+  el.addEventListener('click', (e) => {
+    if (e.target.closest('.mf-x')) { demoRecDismiss(view); return; }
+    if (demoRec.loaded && !demoRec.supported) return;
+    demoRecToggle(view);
+  });
+  viewEl(view, 'perm-chip').after(el);
+  _recFlag.set(view, el);
+  return el;
+}
+
+// 收起胶囊：录制中先停录收录（停录失败就留着胶囊，别把停录入口收没了）
+async function demoRecDismiss(view) {
+  if (demoRec.active) {
+    await demoRecToggle(view);
+    if (demoRec.active) return;
+  }
+  demoRec.pinned[view.key] = false;
+  demoRecSyncAll();
+  syncPlusChecks(view);
+}
+
+// 录制态收敛到全部视图：专用按钮按各自状态刷；胶囊在「录制中 或 本输入区挂出过」且
+// 非创建技能模式时显示（专用按钮在场不重复）
+function demoRecSyncAll() {
+  document.querySelectorAll('.rec-btn').forEach(demoRecSyncBtn);
+  for (const v of [mainView, subView]) {
+    const show = (demoRec.active || demoRec.pinned[v.key]) && viewChatMode(v) !== 'skill-create';
+    const mounted = _recFlag.get(v);
+    if (!show) { if (mounted) mounted.classList.add('hidden'); continue; }
+    const el = demoRecFlagEl(v);
+    el.classList.remove('hidden');
+    el.classList.toggle('on', demoRec.active);
+    el.title = demoRec.active ? '录制中：点胶囊上的 ■ 停止并收录材料'
+      : (demoRec.supported ? '操作录制器：点 ▶ 开始录制（操作时自动截图＋记事件＋录音）' : '操作录制器（仅 Windows 桌面可用）');
+    el.querySelector('.rec-flag-text').textContent = demoRec.active ? '录制中' : '操作录制器';
+    const btn = el.querySelector('.rec-flag-btn');
+    btn.disabled = demoRec.loaded && !demoRec.supported;
+    btn.title = el.title;
+    el.querySelector('.ico-play').classList.toggle('hidden', demoRec.active);
+    el.querySelector('.ico-stop').classList.toggle('hidden', !demoRec.active);
+  }
 }
 
 function demoRecLoadOnce() {
@@ -8253,13 +8252,13 @@ function demoRecLoadOnce() {
     demoRec.supported = !!st.supported;
     demoRec.active = !!st.active;
     demoRec.dir = st.dir || '';
-    document.querySelectorAll('.rec-btn').forEach(demoRecSyncBtn);
+    demoRecSyncAll();
   }).catch(() => { demoRec.loaded = false; }); // 失败可重试：下次挂载再拉
 }
 
 async function demoRecToggle(view) {
   if (demoRec.busy) return;
-  const sess = (view.state && view.state.cur) || null; // 会话内停录：【演示记录】通知落进该会话；首页（未开会话）也能录
+  const sess = (view.state && view.state.cur) || null; // 会话内停录：材料落进该会话的工作区（首页未开会话也能录，落默认工作区）
   const body = sess ? { session: sess.id } : {};
   demoRec.busy = true;
   try {
@@ -8267,22 +8266,30 @@ async function demoRecToggle(view) {
       const r = await api('/api/demo-record/stop', { method: 'POST', body: JSON.stringify(body) });
       demoRec.active = false;
       demoRec.dir = r.dir || demoRec.dir;
-      toast(sess ? '演示已收录，回到对话让 AI 分析即可' : '已收录到 ' + (r.dir || '') + '，开个对话即可让 AI 分析');
+      // 材料作为一张卡挂进这个输入区上方的附件区，随下一条消息带给 AI（首页没开会话
+      // 也走得通：附件区跨对话通用，懒创建的会话照样带）。停录不等语音识别：
+      // 后台还在转时卡上标「语音转写中…」，不用等——通知里会告诉 AI 字幕在后台转
+      const card = stageRecord(view, r);
+      toast(card ? ('录制已收录：材料卡在输入框上方' + (r.asrPending ? '（语音在后台转写，不用等），写一句要 AI 做什么就能发送' : '，写一句要 AI 做什么再发送'))
+        : '已收录到 ' + demoRec.dir + '，但附件区已满没能加入输入框', 6000);
     } else {
       const r = await api('/api/demo-record/start', { method: 'POST', body: JSON.stringify(body) });
       demoRec.active = true;
       demoRec.dir = r.dir || '';
-      toast('开始录制：去电脑上正常操作并口头讲解，做完回来点停止');
+      // 停录入口在哪取决于当前模式：创建技能有专用按钮，其余在录制胶囊上
+      const stopWhere = viewChatMode(view) === 'skill-create' ? '输入框的红色按钮' : '输入框下方的「录制中」胶囊';
+      toast('开始录制：去电脑上正常操作并口头讲解，做完回来点' + stopWhere + '停止', 6000);
     }
   } catch (e) {
     toast((demoRec.active ? '停止' : '开始') + '录制失败：' + e.message);
   }
   demoRec.busy = false;
-  document.querySelectorAll('.rec-btn').forEach(demoRecSyncBtn);
+  demoRecSyncAll();
 }
 
 // 创建技能模式定制：输入框工具条上一枚录制按钮（▶ 起录 / ■ 红底停止），
-// 与「计划」开关同一插槽（权限芯片右侧）。首页与子对话视图都生效。
+// 与「计划」开关同一插槽（权限芯片右侧）。首页与子对话视图都生效。其余模式
+// 没有这枚按钮，从加号菜单挂出录制胶囊（demoRecFlagEl；同一份 demoRec 状态与 demoRecToggle）。
 const skillCreateModeUI = {
   mount(view) {
     const btn = document.createElement('button');
@@ -8543,6 +8550,7 @@ function syncComposer(view) {
   viewEl(view, 'flag-goal').title = s.goalMode ? ('目标模式：' + (s.goalText || '（未填写目标）')) : '目标模式';
   viewEl(view, 'mode-flags').classList.toggle('hidden', !s.planMode && !s.goalMode);
   applyModeUI(view); // 模式前端定制：在基础刷新之后跑、可覆盖上面的设置（两个视图都跑）
+  demoRecSyncAll(); // 加号按钮的录制红点按模式走（创建技能有专用按钮时不标）：切模式后重算
   if (vcur) viewEl(view, 'input').placeholder = sendKeyHint(); // 占位跟随发送快捷键设置
   refreshCtxChip(view);
   renderAttachments(view); // 附件区跟随视图/会话（换会话时放掉上一轮的附件）
@@ -8605,6 +8613,19 @@ function syncPlusChecks(view) {
     cxItem.classList.toggle('hidden', !hasSession);
     $('pm-cxsession-check').textContent =
       hasSession && window.CX && CX.sessionCustom ? '✓' : '';
+  }
+  // 「操作录制器」：点一下在输入框下方挂出录制胶囊（▶ 开始 / ■ 停止 / ✕ 收起），起录
+  // 停录都在胶囊上；本输入区挂出了打 ✓，录制中红字「● 录制中」。创建技能模式有专用
+  // 录制按钮（权限芯片右侧），菜单项让位。status 还没拉到前先按可用渲染，不支持的平台
+  // 拉到后禁用灰显
+  const recItem = $('pm-rec');
+  if (recItem) {
+    recItem.classList.toggle('hidden', viewChatMode(view) === 'skill-create');
+    recItem.classList.toggle('rec-on', demoRec.active);
+    recItem.disabled = demoRec.loaded && !demoRec.supported;
+    recItem.title = demoRec.supported ? '在输入框下方挂出录制胶囊（▶ 开始 / ■ 停止，✕ 收起）：录下你在电脑上的操作（自动截图＋记事件＋录音），材料进当前对话供 AI 分析'
+      : '操作录制器（仅 Windows 桌面可用）';
+    $('pm-rec-check').textContent = demoRec.active ? '● 录制中' : (demoRec.pinned[view.key] ? '✓' : '');
   }
 }
 
@@ -8817,6 +8838,67 @@ function stageFiles(files, view) {
   return added;
 }
 
+// 停录后把【演示记录】材料作为一张卡挂进输入框上方的附件区（与文件附件同一排、
+// 同一枚 ✕）：发送时注记进「用户附件：」块随消息到达（flushAttachments 对这类不
+// 上传、直接取 a.note）。首页（没开会话）录的也能跟着第一条消息走——旧版往会话里
+// 落一行注记，折叠成一行没人看见，首页更是无处可落。返回入列的附件（满了返回 null）
+function stageRecord(view, r) {
+  view = view || popView || mainView;
+  const list = attachmentsOf(view);
+  if (list.length >= ATTACH_MAX_COUNT) {
+    attachHint(view, '附件区已满（一条消息最多 ' + ATTACH_MAX_COUNT + ' 个附件），录制材料没有加入；移掉一个再录', 8000);
+    return null;
+  }
+  const dir = String((r && r.dir) || '');
+  const a = {
+    id: 'a' + (++attachSeq), kind: 'record',
+    name: '演示记录 ' + (dir.split(/[\\/]/).pop() || ''),
+    size: null, mime: '', file: null, path: dir, previewUrl: '', status: 'staged',
+    ms: +((r && r.ms) || 0), events: +((r && r.events) || 0), shots: +((r && r.shots) || 0),
+    // 停录不等语音识别：asrPending=true 时后台还在转，SSE demo_record_transcribed 到了
+    // 再把副标/注记换成最终实况（updateRecordCards）
+    asrPending: !!(r && r.asrPending), cues: +((r && r.cues) || 0),
+    note: String((r && r.note) || ''),
+  };
+  a.sub = recordSub(a); // 卡片副标
+  list.push(a);
+  renderAttachments(view);
+  syncComposerPad(view);
+  return a;
+}
+
+// 录制材料卡的副标：时长 · 事件 · 截图 ·（语音转写中… | 字幕 n 段）
+function recordSub(a) {
+  const ms = +a.ms || 0;
+  const dur = ms >= 60000 ? Math.floor(ms / 60000) + '分' + Math.round((ms % 60000) / 1000) + '秒' : Math.max(1, Math.round(ms / 1000)) + '秒';
+  let s = dur + ' · ' + (+a.events || 0) + ' 事件 · ' + (+a.shots || 0) + ' 张截图';
+  if (a.asrPending) s += ' · 语音转写中…';
+  else if (+a.cues > 0) s += ' · 字幕 ' + a.cues + ' 段';
+  return s;
+}
+
+// 后台识别完成（SSE demo_record_transcribed）：两个输入区里还挂着（没发出去）的
+// 同一份材料卡，副标与注记换成最终实况；已发出去的不动（模型那边按通知里的
+// 提示自己处理：稍后读字幕，或用语音组件的识别脚本补转）。返回更新了几张卡
+function updateRecordCards(dir, cues, note) {
+  let n = 0;
+  for (const v of [mainView, subView]) {
+    const list = attachmentsOf(v);
+    let changed = false;
+    for (const a of list) {
+      if (a.kind !== 'record' || a.path !== dir) continue;
+      a.asrPending = false;
+      a.cues = +cues || 0;
+      if (note) a.note = note;
+      a.sub = recordSub(a);
+      changed = true;
+      n++;
+    }
+    if (changed) renderAttachments(v);
+  }
+  return n;
+}
+
 /* ---------- 拖拽原件路径桥（仅桌面壳 WebView2） ----------
    WebView2 不给页面文件绝对路径（File.path 不存在、text/uri-list / text/plain
    皆空、webkitGetAsEntry().fullPath 只有文件名——实测见 AGENT.md 界面节），所以
@@ -8904,17 +8986,17 @@ function clearAttachments(view) {
   syncComposerPad(view);
 }
 
-// 单张附件卡：图片给缩略图，其余给文件卡（图标 + 文件名 + 大小 + ✕）
+// 单张附件卡：图片给缩略图，录制材料给红点卡（图标 + 「演示记录 <目录名>」+ 时长/事件/截图），其余给文件卡（图标 + 文件名 + 大小 + ✕）
 function attachCard(view, a) {
   const card = document.createElement('div');
-  card.className = 'attach-item' + (a.kind === 'image' ? ' image' : '') +
+  card.className = 'attach-item' + (a.kind === 'image' ? ' image' : '') + (a.kind === 'record' ? ' record' : '') +
     (a.status === 'error' ? ' error' : (a.status === 'uploading' ? ' uploading' : ''));
-  card.title = (a.path || a.name) + (a.size != null ? '（' + fmtBytes(a.size) + '）' : '') +
-    (a.status === 'error' ? '\n上传失败：' + (a.error || '') : '');
+  card.title = a.kind === 'record' ? String(a.note || a.path).replace(/([；。])/g, '$1\n') : ((a.path || a.name) + (a.size != null ? '（' + fmtBytes(a.size) + '）' : '') +
+    (a.status === 'error' ? '\n上传失败：' + (a.error || '') : '')); // 录制注记按句切行：提示浮窗可读
   const rm = document.createElement('button');
   rm.type = 'button';
   rm.className = 'attach-x';
-  rm.title = '移除（这条消息不会带上它）';
+  rm.title = a.kind === 'record' ? '移除（这条消息不会带上这段录制材料）' : '移除（这条消息不会带上它）';
   rm.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>';
   rm.onclick = (e) => { e.stopPropagation(); removeAttachment(view, a.id); };
   if (a.kind === 'image' && a.previewUrl) {
@@ -8928,13 +9010,15 @@ function attachCard(view, a) {
   }
   const icon = document.createElement('span');
   icon.className = 'attach-icon';
-  icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+  icon.innerHTML = a.kind === 'record'
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
   const name = document.createElement('b');
   name.className = 'attach-name';
   name.textContent = a.name;
   const size = document.createElement('span');
   size.className = 'attach-size';
-  size.textContent = a.status === 'uploading' ? '上传中…' : (a.status === 'error' ? '未上传' : (a.size != null ? fmtBytes(a.size) : ''));
+  size.textContent = a.kind === 'record' ? (a.sub || '') : (a.status === 'uploading' ? '上传中…' : (a.status === 'error' ? '未上传' : (a.size != null ? fmtBytes(a.size) : '')));
   card.appendChild(icon);
   card.appendChild(name);
   card.appendChild(size);
@@ -8977,7 +9061,9 @@ function renderAttachments(view) {
   const box = viewEl(view, 'attachments');
   if (!box) return;
   const list = attachmentsOf(view);
-  const sig = list.map((a) => [a.id, a.name, a.size, a.status].join(':')).join('|');
+  // 签名含 sub/note：录制材料卡后台转写完成后只改这两个字段（updateRecordCards），
+  // id/name/size/status 都没动——不带上它们就不会重画
+  const sig = list.map((a) => [a.id, a.name, a.size, a.status, a.sub, a.note].join(':')).join('|');
   if (box._sig === sig) return;
   box._sig = sig;
   box.innerHTML = '';
@@ -9094,6 +9180,10 @@ async function flushAttachments(view) {
   try {
     for (const a of queue) {
       if (!list.includes(a)) continue; // 已被 ✕ 删掉：不再上传
+      if (a.kind === 'record') { // 录制材料：注记在停录响应里已就位，没有文件要上传
+        if (a.note) notes.push(a.note);
+        continue;
+      }
       a.status = 'uploading';
       a._abort = new AbortController(); // 删除附件时按它中止挂起中的上传
       renderAttachments(view);
@@ -9490,6 +9580,20 @@ $('ws-search-clear').onclick = () => {
 };
 $('pm-upload').onclick = () => doUpload();
 $('pm-plan').onclick = () => toggleModeFlag('planMode');
+// 加号菜单「操作录制器」：挂出录制胶囊（作用于发起它的输入区），起录/停录在胶囊上
+// （▶/■），✕ 收起。status 在此拉一次：胶囊按钮的可用态从此有据可依，之后靠 SSE 广播维持
+$('pm-rec').onclick = () => {
+  const v = popView;
+  closePopovers();
+  const fresh = !demoRec.pinned[v.key];
+  demoRec.pinned[v.key] = true;
+  demoRecSyncAll();
+  syncPlusChecks(v);
+  if (fresh) toast('录制胶囊已挂到输入框下方：▶ 开始录制，■ 停止收录，✕ 收起', 4500);
+};
+demoRecLoadOnce();
+// 加号菜单「画板」（app-whiteboard.js）：作用于发起它的输入区，插入的图片进那个输入框的附件区
+$('pm-board').onclick = () => { const v = popView; closePopovers(); openWhiteboard(v); };
 jxDiag('init:绑定C 菜单项 完成');
 // 目标模式开启时要求填写目标文本；关闭时清状态（goalText 保留备查）
 async function toggleGoalFlag() {

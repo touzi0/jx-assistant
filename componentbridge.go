@@ -166,7 +166,7 @@ func (m *bridgeManager) sharedPythonPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	py := filepath.Join(dir, "_runtime", "python", "python.exe")
+	py := runtimePyInside(filepath.Join(dir, "_runtime"))
 	if _, err := os.Stat(py); err != nil {
 		return py, err
 	}

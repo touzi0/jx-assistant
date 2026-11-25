@@ -40,7 +40,7 @@ func (f *fakeFrameTarget) CaptureFrame() ([]byte, error) {
 	return b, nil
 }
 
-// noFrameTarget 运行中但没有 CaptureFrame 实现（Electron 面板桥一类的形态）。
+// noFrameTarget 运行中但没有 CaptureFrame 实现（无镜像能力的面板形态）。
 type noFrameTarget struct{ fakeBrowserTarget }
 
 func (f *noFrameTarget) State() BrowserState { return BrowserState{Running: true} }

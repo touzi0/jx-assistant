@@ -381,18 +381,12 @@
           <div class="bpw-hint" id="bpw-hint">浏览器面板仅在桌面版可用</div>
           <!-- 网页/手机形态的右栏网页区（那两种形态没有原生控件）：Markdown
                渲染页这类必须就地看的页面铺在这里（app-right.js 的 bpwShowFrame）。
-               桌面/Electron 形态由原生控件覆盖舞台，本元素保持隐藏。 -->
+               桌面形态由原生控件覆盖舞台，本元素保持隐藏。 -->
           <iframe id="bpw-frame" class="bpw-frame hidden" title="右栏预览"></iframe>
           <!-- 远程形态（手机/外网电脑接入）的右栏浏览器：家端面板画面的只读
                镜像（WebP 帧流，app-right.js 的 bpwMirror*）。默认等比缩放居中，
                .raw 为原始像素 1:1+滚动条。桌面/本机网页形态不显示。 -->
           <div class="bpw-mirror hidden" id="bpw-mirror"><img id="bpw-mirror-img" alt="远程浏览器画面"></div>
-          <!-- Electron 桌面壳：右栏网页区是真正的 DOM 内嵌浏览器（独立持久
-               partition，登录态与主界面隔离）。地址栏/工具栏逻辑不变——仍经
-               Go 的 /api/browser/* 走，Go 再经壳的 panel-bridge 驱动本元素，
-               AI 工具与用户操作同一控件。旧 WebView2 壳不用它：默认
-               display:none（style.css），仅 .electron-shell 下显示。 -->
-          <webview id="bpw-webview" src="about:blank" partition="persist:webview-browser" style="width:100%;height:100%;border:0"></webview>
         </div>
         <div class="bpw-status"><span id="bpw-title" class="bpw-pagetitle">未打开页面</span><span id="bpw-vp"></span></div>
       </div>
@@ -1026,11 +1020,78 @@
   </div>
 </div>
 
+<!-- 画板：加号菜单进入。白底画布 + 画笔/文字/橡皮 + 几种常用色与自选色，「插入到输入框」
+     把画布导成 PNG 进附件区（与粘贴图片同一条通路，发送时随消息带给 AI）。
+     逻辑见 web/app-whiteboard.js -->
+<div id="whiteboard" class="modal hidden">
+  <div class="modal-card wb-card">
+    <div class="wb-head">
+      <b class="wb-title">画板</b>
+      <div class="wb-tools">
+        <button type="button" class="wb-tool active" data-tool="pen" title="画笔">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        </button>
+        <button type="button" class="wb-tool" data-tool="text" title="文字：在画布上点一下，打字后按 Enter 落笔（Shift+Enter 换行）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V5h16v2M12 5v14M9 19h6"/></svg>
+        </button>
+        <button type="button" class="wb-tool" data-tool="eraser" title="橡皮">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20H8.5l-4.2-4.2a2 2 0 0 1 0-2.8l8.6-8.6a2 2 0 0 1 2.8 0l5.5 5.5a2 2 0 0 1 0 2.8L14 19.9"/><path d="M8.5 8.5l7 7"/></svg>
+        </button>
+        <span class="wb-sep"></span>
+        <span class="wb-colors" id="wb-colors">
+          <button type="button" class="wb-color active" data-color="#1f2328" style="--c:#1f2328" title="黑"></button>
+          <button type="button" class="wb-color" data-color="#d93a3a" style="--c:#d93a3a" title="红"></button>
+          <button type="button" class="wb-color" data-color="#2f6fe4" style="--c:#2f6fe4" title="蓝"></button>
+          <button type="button" class="wb-color" data-color="#2e9e5b" style="--c:#2e9e5b" title="绿"></button>
+          <button type="button" class="wb-color" data-color="#e3a600" style="--c:#e3a600" title="黄"></button>
+          <span class="wb-color wb-custom" title="自选颜色" style="--c:#7c4dcc">
+            <input type="color" id="wb-custom" value="#7c4dcc">
+          </span>
+        </span>
+        <span class="wb-sep"></span>
+        <button type="button" class="wb-size" data-size="3" title="细线"><i style="--s:3px"></i></button>
+        <button type="button" class="wb-size active" data-size="6" title="中线"><i style="--s:6px"></i></button>
+        <button type="button" class="wb-size" data-size="12" title="粗线"><i style="--s:12px"></i></button>
+        <span class="wb-sep"></span>
+        <button type="button" class="wb-tool" id="wb-undo" title="撤销上一步（Ctrl+Z）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg>
+        </button>
+        <button type="button" class="wb-tool" id="wb-clear" title="清空画布">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>
+        </button>
+      </div>
+      <button type="button" class="wb-close" id="wb-close" title="关闭（画的内容会保留，下次打开还在）">✕</button>
+    </div>
+    <div class="wb-stage" id="wb-stage">
+      <canvas id="wb-canvas" width="2000" height="1240"></canvas>
+      <textarea id="wb-text" class="hidden" rows="1" spellcheck="false" placeholder="输入文字，Enter 落笔"></textarea>
+    </div>
+    <div class="wb-foot">
+      <span class="tip">画完点「插入到输入框」，图片作为附件随下一条消息发给 AI；关闭后再打开，画的内容还在</span>
+      <div class="modal-actions">
+        <button id="wb-cancel">关 闭</button>
+        <button id="wb-insert" class="accent">插入到输入框</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- 加号弹出菜单 -->
 <div id="plus-menu" class="popover hidden">
   <button class="pop-item" id="pm-upload">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/></svg>
     文件上传
+  </button>
+  <!-- 画板：白底画布随手画个示意图，插入输入框成 PNG 附件随消息发给 AI（web/app-whiteboard.js） -->
+  <button class="pop-item" id="pm-board" title="随手画个示意图：画完插入输入框，作为图片随消息发给 AI">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+    画板
+  </button>
+  <!-- 操作录制器（原「演示记录」）：点一下在输入框下方挂出录制胶囊（▶ 开始 / ■ 停止 / ✕ 收起），
+       与「计划」胶囊同族；创建技能模式的专用录制按钮仍在权限芯片右侧，该模式下本项隐藏 -->
+  <button class="pop-item" id="pm-rec" title="在输入框下方挂出录制胶囊（▶ 开始 / ■ 停止，✕ 收起）：录下你在电脑上的操作，材料进当前对话供 AI 分析">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/></svg>
+    操作录制器<span class="pop-check" id="pm-rec-check"></span>
   </button>
   <button class="pop-item" id="pm-plan">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
@@ -1267,6 +1328,7 @@
 <script src="/app-mcp.js"></script>
 <script src="/app-settings.js"></script>
 <script src="/app-cxsession.js"></script>
+<script src="/app-whiteboard.js"></script>
 <script src="/app-wizard.js"></script>
 <script src="/app.js"></script>
 <script src="/cx.js"></script>

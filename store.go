@@ -37,6 +37,9 @@ type StoredMessage struct {
 	Superseded bool   `json:"superseded,omitempty"`
 	CreatedAt  string `json:"createdAt,omitempty"`
 	Thinking   string `json:"thinking,omitempty"` // assistant 该步的思考过程原文
+	// env 行下发/推送时附带的「模型实际收到的消息」（renderEnvRows 算出，见
+	// context.go）：不落库，只随会话详情接口与实时 message 事件带给前端显示
+	Render *envRender `json:"render,omitempty"`
 }
 
 // 消息搜索命中：会话 + 片段。
@@ -53,6 +56,7 @@ type Store struct {
 	db   *sql.DB
 	path string
 	mu   sync.Mutex // 串行化写；配合单连接与 WAL，个人负载下无争用问题
+	ro   *sql.DB    // 只读连接池，长读专用（见 reader）
 }
 
 // dataPath 返回库文件路径（界面「数据位置」展示用）。
@@ -69,7 +73,10 @@ func NewStore(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 单连接：SQLite 是单写者模型，全部语句走一个连接最稳，也彻底避开 BUSY
+	// 主连接单条：SQLite 是单写者模型，写与短读走一个连接最稳，彻底避开 BUSY。
+	// 但秒级长读（全文搜索）不能也走它——库到 2 GB 后一次扫描 1.7 s，期间上下文
+	// 拼装、消息写入全在排队（「消息发出去过了一会儿才到模型」的一个来源）。
+	// WAL 本就支持多读并行、读写互不阻塞，长读单独走只读池（见 reader）。
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, path: dbPath}
 	if err := s.createSchema(); err != nil {
@@ -80,7 +87,33 @@ func NewStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	s.openReader(dbPath)
 	return s, nil
+}
+
+// openReader 打开只读连接池（同一库文件，mode=ro）：只读连接在 WAL 下不与写者
+// 抢锁，不引入新的 BUSY 路径；三条给两路侧栏搜索与模型工具 search_sessions 各一。
+// 打开不致命——失败则 reader() 退回主连接，只是长读又会堵住主连接。
+func (s *Store) openReader(dbPath string) {
+	ro, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return
+	}
+	ro.SetMaxOpenConns(3)
+	if err := ro.Ping(); err != nil { // sql.Open 不真正连接，Ping 一次才算数
+		ro.Close()
+		return
+	}
+	s.ro = ro
+}
+
+// reader 返回长读（秒级扫描类查询）应使用的只读池；只读池不可用时退回主连接。
+// 新增的长读一律走它，别再占主连接。
+func (s *Store) reader() *sql.DB {
+	if s.ro != nil {
+		return s.ro
+	}
+	return s.db
 }
 
 // migration 是一条数据库结构迁移。sql 按序执行；tolerant 用于
@@ -2051,6 +2084,7 @@ func (s *Store) DeletePendingJobsForSession(sessionID string) error {
 }
 
 // SearchMessages 跨会话全文搜索（当前 LIKE 实现；个人规模数据足够，量大后可升 FTS）。
+// 秒级全表扫描，走只读池（reader）——不堵主连接上的上下文拼装与消息写入。
 // 搜索范围覆盖三列：消息正文（含工具结果行）、工具调用参数（tool_calls JSON）、
 // 思考过程（thinking）。ctxRadius 是命中片段的半径（<=0 时取默认短片段 90 字）。
 // 命中代表行的取舍（2026-11-19 修）：**会话内取最早命中**（原始记录），会话间
@@ -2070,7 +2104,7 @@ func (s *Store) SearchMessages(query string, limit, ctxRadius int) ([]SearchHit,
 	}
 	like := "%" + query + "%"
 	// 第一步：每个命中会话的最早命中行 id，会话按更新时间倒序取 limit 个
-	idRows, err := s.db.Query(`
+	idRows, err := s.reader().Query(`
 		SELECT h.first_id FROM (
 			SELECT m.session_id AS session_id, MIN(m.id) AS first_id
 			FROM messages m
@@ -2100,7 +2134,7 @@ func (s *Store) SearchMessages(query string, limit, ctxRadius int) ([]SearchHit,
 		ph[i] = "?"
 		argsQ[i] = id
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.reader().Query(`
 		SELECT m.id, m.session_id, s.title, s.mode, m.seq, m.role, m.content, m.tool_calls, m.thinking
 		FROM messages m JOIN sessions s ON s.id = m.session_id
 		WHERE m.id IN (`+strings.Join(ph, ",")+`)`, argsQ...)
@@ -2177,4 +2211,9 @@ func snippetAround(s, query string, radius int) string {
 	return out
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.ro != nil {
+		s.ro.Close()
+	}
+	return s.db.Close()
+}

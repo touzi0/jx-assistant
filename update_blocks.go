@@ -400,7 +400,7 @@ func (a *App) FinalizeEngineSwap() {
 			// exe，pending 却还在，横幅永远提示重启到新版本、点了也只会拉起旧
 			// 版）。清掉悬空 pending 并立即重新检查更新，让静默更新重新换一次。
 			log.Printf("[更新] 检测到待生效版本 %s 的交换已被覆盖（当前正位程序为 %s），清除悬空状态并重新检查更新", st.EnginePending, appVersion)
-			if url := a.Cfg.UpdateURL; url != "" && url != "off" {
+			if url := darwinUpdateChannel(a.Cfg.UpdateURL); url != "" && url != "off" {
 				go a.checkUpdateOnce(url)
 			}
 		}
@@ -842,7 +842,7 @@ func clearReadonlyTree(dir string) {
 // 轮询）。检查在后台跑（含大块下载），响应只是「已开始」；结果经事件流与
 // /api/status 到达。
 func (a *App) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
-	url := strings.TrimSpace(a.Cfg.UpdateURL)
+	url := darwinUpdateChannel(strings.TrimSpace(a.Cfg.UpdateURL))
 	if url == "" || url == "off" {
 		writeErr(w, http.StatusBadRequest, "更新检查已关闭（更新检查源为 off）")
 		return

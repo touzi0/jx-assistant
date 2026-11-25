@@ -61,11 +61,12 @@ func (a *App) applyBuiltinBlock(b *updateBlock, rel releaseInfo, sourceURL strin
 		return
 	}
 
-	// 结构校验：包里必须能找到 cua-driver.exe。发布端可以把目录再套一层，
-	// 所以用 findRootWith 找根而不是假定 zip 根就是目录根。
-	root, err := findRootWith(tmp, filepath.Join("cua-driver", "cua-driver.exe"))
+	// 结构校验：包里必须能找到 cua-driver（Windows 是 cua-driver.exe，mac 是
+	// cua-driver）。发布端可以把目录再套一层，所以用 findRootWith 找根而不是
+	// 假定 zip 根就是目录根。
+	root, err := findRootWith(tmp, filepath.Join("cua-driver", cuaDriverBinName()))
 	if err != nil {
-		log.Printf("[更新] 内置组件包结构不对（需含 cua-driver\\cua-driver.exe），已拒绝: %v", err)
+		log.Printf("[更新] 内置组件包结构不对（需含 cua-driver\\%s），已拒绝: %v", cuaDriverBinName(), err)
 		setUpdateError("内置组件包结构不对: " + err.Error())
 		return
 	}

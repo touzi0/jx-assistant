@@ -150,9 +150,9 @@ func (a *App) applyRuntimeBlock(b *updateBlock, rel releaseInfo, sourceURL strin
 		setUpdateError("运行时包解压失败: " + err.Error())
 		return
 	}
-	root, err := findRootWith(tmp, filepath.Join("python", "python.exe"))
+	root, err := findRootWith(tmp, runtimePyInside(""))
 	if err != nil {
-		log.Printf("[更新] 运行时包结构不对（需含 python\\python.exe）: %v", err)
+		log.Printf("[更新] 运行时包结构不对（需含 %s）: %v", runtimePyInside(""), err)
 		setUpdateError("运行时包结构不对: " + err.Error())
 		return
 	}
@@ -215,9 +215,9 @@ func localTagOrUnknown(rt string) string {
 
 // smokeTestRuntime 新运行时能不能跑起来（起一次 python，超时/非零都算失败）。
 func smokeTestRuntime(rt string) error {
-	py := filepath.Join(rt, "python", "python.exe")
+	py := runtimePyInside(rt)
 	if _, err := os.Stat(py); err != nil {
-		return fmt.Errorf("新运行时里没有 python.exe: %w", err)
+		return fmt.Errorf("新运行时里没有解释器（%s）: %w", py, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

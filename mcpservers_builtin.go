@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -99,10 +100,15 @@ func resolveCuaDriver(a *App) (string, []string, map[string]string, bool) {
 	if dir == "" {
 		return "", nil, nil, false
 	}
-	exe := filepath.Join(dir, "cua-driver", "cua-driver.exe")
+	// 可执行文件名按平台取：Windows 是 cua-driver.exe，macOS/Linux 是 cua-driver
+	// （同一份 Rust 工程的多平台构建，见 crates/platform-macos；mac 包由
+	// 打包/打包Mac版.py 从上游 release 取 darwin-universal 二进制放进来）。
+	exe := filepath.Join(dir, "cua-driver", cuaDriverBinName())
 	if !fileExists(exe) {
 		return "", nil, nil, false
 	}
+	// macOS 要「辅助功能 + 屏幕录制」两项系统授权（首次点击/截屏时由系统弹窗
+	// 申请，用户拒绝则驱动只能读到窗口列表、动不了）。这里不代劳，交给系统弹窗。
 	return exe, []string{"mcp"}, nil, true
 }
 
@@ -186,4 +192,12 @@ func (a *App) materializeBuiltinMCP() error {
 func fileExists(p string) bool {
 	st, err := os.Stat(p)
 	return err == nil && !st.IsDir()
+}
+
+// cuaDriverBinName Cua 驱动可执行文件名：Windows 带 .exe，macOS/Linux 不带。
+func cuaDriverBinName() string {
+	if runtime.GOOS == "windows" {
+		return "cua-driver.exe"
+	}
+	return "cua-driver"
 }

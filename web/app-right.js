@@ -467,9 +467,8 @@ async function openSubSession(id) {
     flushSubDraft();
     subState.cur = data.meta;
     subState.msgs = data.messages || [];
-    // 分批记账：本窗之上的未加载条数与基础窗基线、批栈清零（主对话同款）
-    subState.older = data.older ? { count: data.older.count || 0, base: data.older.base } : undefined;
-    subState._baseWinBase = data.older && data.older.base;
+    // 分批记账：本窗之上的未加载条数、批栈清零（主对话同款）
+    subState.older = data.older ? { count: data.older.count || 0 } : undefined;
     subState._batches = [];
     // 打开即视为已读（与主对话 openSession 同款）：清红点与完成绿点，下拉清单数据同步
     delete dotDone[id];
@@ -479,10 +478,7 @@ async function openSubSession(id) {
       if (kid) kid.unread = false;
       api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
     }
-    subState.pendingSteer = (data.pending && data.pending.steer) || [];
-    subState.pendingQueue = (data.pending && data.pending.queue) || [];
-    subState.pendingVer = (data.pending && data.pending.ver) || 0; // 整包真值对齐：版本基线随之重置
-    subState.queuePaused = !!(data.pending && data.pending.paused);
+    landPendingSnapshot(subState, data.pending, subView); // 在途旧快照不抹掉已画上的排队坞/插话框
     // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
     subState.queueHeld = subState.pendingQueue.length > 0 && !subState.queuePaused &&
       !(data.running || (subState.cur && subState.cur.status === 'running'));
@@ -603,16 +599,14 @@ rpRegister('subs', { // 右侧边栏：注册首个视图
   },
 });
 
-/* ---------- 浏览器视图（桌面=原生 WebView2 面板 / Electron=<webview> / 网页=占位提示） ---------- */
+/* ---------- 浏览器视图（桌面=原生 WebView2 面板 / 网页=占位提示） ---------- */
 /* 工具栏与状态条由本界面渲染；旧桌面壳的网页区域是 #bpw-stage 占位 div，原生
  * WebView2 控件精确覆盖该矩形（宿主 browser_panel_windows.go），网页本身不进
  * HTML。矩形以 CSS px 原值上报 /api/browser/panel-rect（宿主进程的子窗口坐标
  * 与 CSS px 同尺度，乘 devicePixelRatio 会把面板推出窗口——显示缩放 ≠100% 的
  * 机器上就是「永远白屏」的根源，见 handleBrowserPanelRect），窗口缩放/拖分
- * 割条/侧栏开合都触发重算。Electron 壳（electron-shell 类）网页区是页面内
- * <webview> 元素：参与 CSS 布局与 z-order，整套矩形上报在这里整体短路。 */
+ * 割条/侧栏开合都触发重算。 */
 function bpwDesktop() { return document.documentElement.classList.contains('desktop-shell'); }
-function bpwElectron() { return document.documentElement.classList.contains('electron-shell'); }
 
 // 原生控件左缘让位：舞台矩形上报时左边内缩 6px，把 .rp-resize（跨右栏左缘
 // -5~+5px 的拖拽把手）完整留给 HTML——否则把手右半与悬停竖线被原生子窗口盖住，
@@ -625,7 +619,7 @@ const BPW_EDGE = 6;
 let bpwDragHide = false;
 function bpwDragPause(on) {
   if (on) {
-    if (bpwElectron() || !bpwDesktop() || !bpwActive() || bpwDragHide) return;
+    if (!bpwDesktop() || !bpwActive() || bpwDragHide) return;
     bpwDragHide = true;
     api('/api/browser/panel-rect', { method: 'POST', body: JSON.stringify({ visible: false, desktop: true, session: bpwSession() }) }).catch(() => {});
   } else {
@@ -645,10 +639,9 @@ function bpwActive() {
  * .modal 的显隐（hidden class），任一打开即上报宿主把面板 Z 序压到主
  * WebView2 之下（POST /api/browser/panel-overlay，browser_host.go 落到面板的
  * YieldTop——主 WebView2 铺满客户区且不透明，压底即被盖住，浮层完整显示）；
- * 全部关闭后上报恢复提顶。Electron 壳的 webview 是 DOM 元素天然参与 z-index，
- * 网页形态没有原生面板，都无需上报。观察整个 DOM 树的 class 变化：聊天渲染
- * 高频改 class，回调里只做几个 modal 的 className 检查且状态不变即返回，
- * 开销可忽略。 */
+ * 全部关闭后上报恢复提顶。网页形态没有原生面板，无需上报。观察整个 DOM 树的
+ * class 变化：聊天渲染高频改 class，回调里只做几个 modal 的 className 检查且
+ * 状态不变即返回，开销可忽略。 */
 let bpwOverlayOn = false;
 function bpwOverlayReport() {
   if (!bpwDesktop()) return;
@@ -674,7 +667,6 @@ let bpwRectTimer = null, bpwLastKey = '';
 // 可见」信号——后端面板可能被另一页面实例或异常时序藏在暗处，矩形没变也
 // 必须重发一次让它显示（自愈路径不吃去重）。
 function bpwReport(immediate, force) {
-  if (bpwElectron()) return; // Electron 壳：webview 是 DOM 元素，无矩形同步
   if (!bpwDesktop()) return; // 网页形态没有原生面板，一个字节都不发：
   // 手机/浏览器里开的同一 UI 曾用一次隐藏上报把桌面端的面板顶掉
   // （多写者之祸，后端 handleBrowserPanelRect 现只认 desktop 标记）
@@ -718,7 +710,7 @@ function bpwReport(immediate, force) {
    （changed=false 只回版本号）；收起右栏/切走视图即停轮询，零流量零开销。
    仅同步、不操控：后退/前进/地址输入都是动家端浏览器，一律收起。 */
 function bpwMirrorEnv() {
-  if (bpwDesktop() || bpwElectron()) return false;
+  if (bpwDesktop()) return false;
   if (window.JX_REMOTE) return true;
   const h = (location.hostname || '').toLowerCase();
   return h !== 'localhost' && h !== '127.0.0.1' && h !== '::1' && h !== '[::1]';
@@ -797,7 +789,7 @@ function bpwNav(body) {
   body.session = bpwSession();
   // 网页/手机形态的右栏在看 iframe 页：后退/前进/刷新直接驱动 iframe 自己的历史，
   // 别去戳后端（那形态没有原生面板，问了也是空跑）
-  if (body.action && bpwFrameActive() && !bpwDesktop() && !bpwElectron()) { bpwFrameAction(body.action); return; }
+  if (body.action && bpwFrameActive() && !bpwDesktop()) { bpwFrameAction(body.action); return; }
   api('/api/browser/navigate', { method: 'POST', body: JSON.stringify(body) })
     .then((st) => { bpwOnNav(st); })
     .catch((e) => { $('bpw-title').textContent = '导航失败：' + e.message; });
@@ -841,8 +833,8 @@ function bpwReveal() {
     .catch((e) => alert('定位失败：' + e.message));
 }
 // ── 网页/手机形态的右栏网页区：同源 iframe ──────────────────────────────────
-/* 桌面与 Electron 形态的网页区是原生控件（WebView2 子窗口 / <webview>），网页
-   本身不进 HTML；网页与手机形态没有原生控件，右栏「浏览器」平时只是提示文字。
+/* 桌面形态的网页区是原生控件（WebView2 子窗口），网页本身不进 HTML；网页与
+   手机形态没有原生控件，右栏「浏览器」平时只是提示文字。
    Markdown 渲染页必须就地看（手机上没有 MD 查看器），所以给它铺一张同源 iframe：
    抽屉里满宽显示，窄屏按单列读（模板自带 500px 断点）。
    远程（手机外壳 JX_REMOTE）形态的顶层文档不在家端 origin 上，iframe.src 直连

@@ -39,6 +39,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -891,18 +893,22 @@ func containsPathLexical(root, p string) bool {
 // EvalSymlinks 不解析 junction；对齐 DSH fs-sandbox 的 realpath 规范化）；
 // 其余平台用 EvalSymlinks。末段不存在（新建文件）时归一化父目录再拼回。
 // 失败时回退 Clean（词法判断兜底）。
+// 结果统一 NFC：macOS 文件系统对文件名返回 NFD（分解式）而网络/JSON/输入
+// 常是 NFC——同名不同字节，按字节做 Rel/map 键会错乱（APFS 查找对形态
+// 不敏感，两种写法都能解析；归一在解析后做，形态不影响查找）。对原本就是
+// NFC 的路径是幂等空操作，Windows/Linux 无副作用。
 func canonicalFor(p string) string {
 	if c, ok := canonicalNative(p); ok {
-		return c
+		return norm.NFC.String(c)
 	}
 	if rp, err := filepath.EvalSymlinks(p); err == nil {
-		return rp
+		return norm.NFC.String(rp)
 	}
 	dir := filepath.Dir(p)
 	if rp, err := filepath.EvalSymlinks(dir); err == nil {
-		return filepath.Join(rp, filepath.Base(p))
+		return norm.NFC.String(filepath.Join(rp, filepath.Base(p)))
 	}
-	return filepath.Clean(p)
+	return norm.NFC.String(filepath.Clean(p))
 }
 
 // sameFileUnder 身份比对回退：词法不匹配时逐级向上找与 root 同一文件

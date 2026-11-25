@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,7 @@ import (
 // （内部用户技能，含密钥）一起嵌进 exe，随静默更新/裸 exe 分发泄漏
 // （2026-10-30 事故排查：旧引擎 exe 内嵌了 11 个内部技能，jx-assistant.exe.old
 // 二进制里仍有它们的名字）。user 永不入包、永不入 exe。
+//
 //go:embed 技能/pdf 技能/ocr 技能/office 技能/downloader 技能/apkinfo 技能/web-search-local
 var skillsFS embed.FS
 
@@ -255,11 +257,24 @@ func skillRuntimeNotice(msg string) {
 	log.Printf("[技能运行时] %s", msg)
 }
 
+// runtimePyInside 共享便携运行时（技能/_runtime）里的解释器路径：
+// Windows 布局 _runtime/python/python.exe；macOS 布局 _runtime/macos/bin/python3。
+// 组件桥（componentbridge）与运行时热更新（update_runtime）也走它——
+// 运行时共享原则：组件与技能永远用同一份。
+func runtimePyInside(rtDir string) string {
+	if isDarwinRuntime {
+		return filepath.Join(rtDir, "macos", "bin", "python3")
+	}
+	return filepath.Join(rtDir, "python", "python.exe")
+}
+
 // ensureSkillRuntime 保证「技能的 Python 运行时 + 全部依赖模块」可用：
-// 桌面用随包分发的 技能/_runtime/python（自包含原则，不碰系统 Python），
-// 已装配直接复用；缺失时联网装配（结果进程级缓存）。
+// 桌面 Windows 用随包分发的 技能/_runtime/python（自包含原则，不碰系统
+// Python），已装配直接复用；缺失时联网装配（结果进程级缓存）。
 // 安卓用内置 Linux 运行时（Termux 快照）的 python3——缺依赖经 pip 现场补装，
 // 每次调用都核对本次技能的依赖（探测结果有缓存，常态零开销）。
+// macOS 优先内置 mac 运行时（技能/_runtime/macos），缺失退系统 python3、
+// 缺依赖 pip 镜像补装（skills_darwin.go）。
 func (a *App) ensureSkillRuntime(modules, wheels []string) (*pythonRuntime, error) {
 	provisionMu.Lock()
 	defer provisionMu.Unlock()
@@ -269,6 +284,14 @@ func (a *App) ensureSkillRuntime(modules, wheels []string) (*pythonRuntime, erro
 	emit := skillRuntimeNotice
 	if isAndroidRuntime {
 		py, err := ensureTermuxSkillRuntime(modules, wheels, emit)
+		if err != nil {
+			return nil, err
+		}
+		provisionedPy = py
+		return py, nil
+	}
+	if isDarwinRuntime {
+		py, err := a.ensureDarwinSkillRuntime(modules, wheels, emit)
 		if err != nil {
 			return nil, err
 		}
@@ -531,11 +554,44 @@ func unzip(zipPath, dest string) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 			return fmt.Errorf("创建上级目录失败（条目 %q）: %w", f.Name, err)
 		}
+		// 符号链接条目（mac/linux 打包的 Chromium .app 里到处都是：framework 的
+		// Versions/Current、Resources、二进制别名…）：内容就是链接目标。写成普通
+		// 文件会让 .app 结构失效（mac 上 Chrome 直接起不来）。Windows 无权限建
+		// 符号链接，退回写普通文件（开发机只是看一眼内容，不影响功能）。
+		if f.Mode()&os.ModeSymlink != 0 {
+			src, err := f.Open()
+			if err != nil {
+				return err
+			}
+			data, err := io.ReadAll(src)
+			src.Close()
+			if err != nil {
+				return fmt.Errorf("读取符号链接条目失败（%q）: %w", f.Name, err)
+			}
+			linkTarget := filepath.FromSlash(string(data))
+			_ = os.RemoveAll(target)
+			if runtime.GOOS != "windows" {
+				if err := os.Symlink(linkTarget, target); err != nil {
+					return fmt.Errorf("创建符号链接失败（条目 %q）: %w", f.Name, err)
+				}
+				continue
+			}
+			if err := os.WriteFile(target, data, 0644); err != nil {
+				return err
+			}
+			continue
+		}
 		src, err := f.Open()
 		if err != nil {
 			return err
 		}
-		dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		// 保留 zip 里记录的可执行位（mac/linux 包靠它：Chromium 的 crashpad
+		// handler、dylib 旁边的辅助程序，全变 0644 就打不开了）。Windows 忽略权限位。
+		perm := f.Mode().Perm()
+		if perm == 0 {
+			perm = 0o644
+		}
+		dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 		if err != nil {
 			src.Close()
 			return err

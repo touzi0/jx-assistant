@@ -130,7 +130,7 @@ func (a *App) loadMigrationRecs() map[string]time.Time {
 // runMigrations 启动入口（NewApp 调用）：跑正式清单。
 // JX_SKIP_MIGRATIONS 兜底闸（2026-11-14 止血）：环境变量非空即整体跳过迁移，
 // 不读不写任何账本、不碰技能目录。开发启动脚本（开发桌面版-并行 / 录屏演示 /
-// rebuild-engine / Electron sidecar）默认注入 =1——开发/隔离实例由此获得
+// rebuild-engine）默认注入 =1——开发/隔离实例由此获得
 // 「永不改技能目录」的硬保证；正式版不设此变量，行为分毫不差。背景：
 // 账本同域修复（2026-11-09 事故）之后，2026-11-12 又实证一次——旧逻辑二进制
 // 被配临时 dataDir 拉起，三条迁移在技能目录全部重跑。开关是修复之外的第二道闸。

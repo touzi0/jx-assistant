@@ -17,7 +17,7 @@ func TestMigrateLegacyPlainURL(t *testing.T) {
 	}{
 		{"http://192.168.0.210:2227/announce", "https://jxaizz.com:2227/announce", true},
 		{"http://jxaizz.com:2227/market/manifest.json", "https://jxaizz.com:2227/market/manifest.json", true},
-		{"http://jxaizz.cn:2227", "https://jxaizz.com:2227", true},
+		// jxaizz.cn 已弃用下线、移出迁移清单（见 legacyPlainHosts 注释），不再列用例
 		{"http://jxkj.mycloudnas.com:2227", "https://jxaizz.com:2227", true},
 		{"http://192.168.0.210:3000/v1", "https://jxaizz.com:2227/v1", true}, // new-api 明文直连的历史下发
 		// 不动：https（Gitea 默认源）、非自家地址（用户的 Ollama/第三方明文）、空、非 URL

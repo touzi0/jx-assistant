@@ -39,6 +39,14 @@ import (
 //     （本文件后段的 Journal/RecordCall/RecordRequest），发给模型的请求
 //     环形缓存最近 keepRequests 轮；前端两类下载（运行日志 / 原始数据）
 //     统一经 ExportTimeline / ExportRawRequests 向引擎申请。
+//  6. 「每轮发出去的材料（系统提示词 / 环境快照 / 工具定义）相对上一轮变了
+//     什么、模型实际收到的文本是什么」只由引擎比对一次并随行记录：开轮快照行
+//     带 chg（promptChange），env 行带 render（envRender，与组装同一次计算）。
+//     接口下发与实时推送只按记录结果决定形态——没变化的轮次只给空壳 {}，系统
+//     提示词与工具定义显示时永远给全文 + 变化摘要，环境快照给模型实际收到的
+//     那条消息文本与形态；前端只接收与显示，不自己比对。两侧各比一次曾让分批
+//     加载的会话在新一轮开头假报「系统提示词变更」（HTTP 下发瘦身、实时推送
+//     不瘦身、前端接力基线丢失，三处口径不一）。
 type ContextEngine struct{ app *App }
 
 // ctxEngine 取上下文引擎：NewApp 已装配；测试等直接构造 App 的路径惰性
@@ -90,59 +98,130 @@ func toolDefsOf(tools []Tool) []ToolDef {
 	return defs
 }
 
-// OpenRound 开轮留痕：组装本轮初始材料并落 kind=prompt 展示快照行（正文
-// {sys, env, tools}），主循环每轮开始调用一次，自己不再拼这条行。env 为
-// 原始快照（不含技能变更补丁行）；环境快照的落库 diff 仍由首步 Assemble
-// 负责。工具目录相对上一轮有增删时，先落一条 kind=report（origin=tools）
-// 的变更公告——追加式上下文里目录真变化本就断前缀，公告让模型明确知道
-// 增删了什么（能力开关不改编目，走环境快照公告，见 suspendedInPlan）。
+// promptRec 是 kind=prompt 行正文的解析形态（OpenRound 落库）：sys/env/tools 是
+// 本轮开轮时的材料原文，chg 是引擎比对好的「相对上一轮变了什么」。env 为原始
+// 快照（不含技能变更补丁行），供导出运行日志交代拼装结构；前端的环境展示走
+// env 行的 render。
+type promptRec struct {
+	Sys   string        `json:"sys"`
+	Env   string        `json:"env"`
+	Tools []ToolDef     `json:"tools"`
+	Chg   *promptChange `json:"chg,omitempty"` // 老行（本字段出现前落的）为空，下发层按旧口径补判
+}
+
+// promptChange 是本轮材料相对上一条快照的变化摘要——引擎开轮时比对一次、随行
+// 落库，下发与实时推送按它决定形态（无变化只给空壳 {}），前端据此画首见/变更
+// 行。系统提示词与工具定义显示时永远给全文，这里只记摘要：变了没有、变化前
+// 的系统提示词全文、新增/移除的工具名。
+type promptChange struct {
+	First    bool     `json:"first,omitempty"`    // 没有可比的上一条（本会话首条且父会话也没有）：前端按「首见」交代
+	Sys      bool     `json:"sys,omitempty"`      // 系统提示词相对上一条有变化
+	PrevSys  string   `json:"prevSys,omitempty"`  // sys 变化时的上一条全文（前端画变更 diff 用）
+	ToolsAdd []string `json:"toolsAdd,omitempty"` // 本轮新增的工具名（已排序）
+	ToolsDel []string `json:"toolsDel,omitempty"` // 本轮移除的工具名（已排序）
+}
+
+// changed 报告 sys/tools 任一有变化（false = 无变化，下发空壳）。
+func (c promptChange) changed() bool {
+	return c.First || c.Sys || len(c.ToolsAdd) > 0 || len(c.ToolsDel) > 0
+}
+
+// OpenRound 开轮留痕：组装本轮初始材料、与上一条快照比对出变化摘要，落
+// kind=prompt 展示快照行（正文 {sys, env, tools, chg}），主循环每轮开始调用一次，
+// 自己不再拼这条行。环境快照的落库 diff 仍由首步 Assemble 负责。工具目录相对
+// 本会话上一轮有增删时，先落一条 kind=report（origin=tools）的变更公告——追加式
+// 上下文里目录真变化本就断前缀，公告让模型明确知道增删了什么（能力开关不改编
+// 目，走环境快照公告，见 suspendedInPlan）。实时推送与会话详情接口同一瘦身口径：
+// 无变化只推空壳 {}。
 func (e *ContextEngine) OpenRound(sess *SessionMeta, emit func(Event)) {
 	sys, env, tools := e.materials(sess)
 	defs := toolDefsOf(tools)
-	if note := e.toolChangeNote(sess, defs); note != "" {
-		sm := e.app.appendRow(sess, StoredMessage{Message: TextMessage("user", note), Kind: kindReport, Origin: "tools", CreatedAt: now()})
-		if emit != nil {
-			emit(Event{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindReport, Origin: "tools"})
+	chg, ownPrev := e.promptChangeOf(sess, sys, defs)
+	// 模型侧的目录变更公告只认本会话的上一轮：子对话首轮的模型没见过父对话的
+	// 工具目录（承接段不复制 prompt 行，见 prepareInheritedRows），没有「变更」可言
+	if ownPrev {
+		if note := toolsChangeNoteText(chg.ToolsAdd, chg.ToolsDel); note != "" {
+			sm := e.app.appendRow(sess, StoredMessage{Message: TextMessage("user", note), Kind: kindReport, Origin: "tools", CreatedAt: now()})
+			if emit != nil {
+				emit(Event{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindReport, Origin: "tools"})
+			}
 		}
 	}
-	if pj, err := json.Marshal(map[string]any{"sys": sys, "env": env, "tools": defs}); err == nil {
-		sm := e.app.appendRow(sess, StoredMessage{Message: TextMessage("system", string(pj)), Kind: kindPrompt, CreatedAt: now()})
-		if emit != nil {
-			emit(Event{Type: "message", Message: &sm.Message, Seq: sm.Seq, Kind: kindPrompt})
+	pj, err := json.Marshal(promptRec{Sys: sys, Env: env, Tools: defs, Chg: &chg})
+	if err != nil {
+		return
+	}
+	sm := e.app.appendRow(sess, StoredMessage{Message: TextMessage("system", string(pj)), Kind: kindPrompt, CreatedAt: now()})
+	if emit != nil {
+		ev := sm.Message
+		if !chg.changed() {
+			ev.Content = "{}"
 		}
+		emit(Event{Type: "message", Message: &ev, Seq: sm.Seq, Kind: kindPrompt})
 	}
 }
 
-// toolChangeNote 对比本轮与上一轮（最近一条 kind=prompt 行）的工具目录，
-// 产出「停用某某工具、新增某某工具」式的变更公告；首轮或未变化返回空串。
-func (e *ContextEngine) toolChangeNote(sess *SessionMeta, defs []ToolDef) string {
-	raw, err := e.app.Store.RawMessagesAll(sess.ID)
-	if err != nil {
-		return ""
+// promptChangeOf 比对本轮 sys/tools 与可比的上一条快照，产出变化摘要。返回值
+// 第二项报告上一条是否来自本会话（false = 取自父会话：子对话首轮的展示基线，
+// 其模型侧没有上一轮）。首轮或无变化时各字段为零值；first 只在两边都没有可比
+// 的上一条时置位。
+func (e *ContextEngine) promptChangeOf(sess *SessionMeta, sys string, defs []ToolDef) (promptChange, bool) {
+	prev, ok, own := e.prevPromptRow(sess)
+	if !ok {
+		return promptChange{First: true}, false
 	}
-	var prev promptRec
-	found := false
+	chg := promptChange{}
+	if prev.Sys != sys {
+		chg.Sys, chg.PrevSys = true, prev.Sys
+	}
+	chg.ToolsAdd, chg.ToolsDel = toolNameDiff(prev.Tools, defs)
+	return chg, own
+}
+
+// prevPromptRow 取可比的上一条 prompt 快照行：本会话最近一条；本会话还没有
+// （子对话首轮）则取父会话最近一条——子对话的 sys/tools 按自己的 mode 重建，
+// 与父对话逐字节相同即视为无变化（父对话已交代过的不再重复显示）。
+func (e *ContextEngine) prevPromptRow(sess *SessionMeta) (promptRec, bool, bool) {
+	if raw, err := e.app.Store.RawMessagesAll(sess.ID); err == nil {
+		if p, ok := lastPromptOf(raw); ok {
+			return p, true, true
+		}
+	}
+	if sess.ParentID != "" {
+		if raw, err := e.app.Store.RawMessagesAll(sess.ParentID); err == nil {
+			if p, ok := lastPromptOf(raw); ok {
+				return p, true, false
+			}
+		}
+	}
+	return promptRec{}, false, false
+}
+
+// lastPromptOf 从后往前找最近一条可解析的 prompt 快照行。
+func lastPromptOf(raw []*StoredMessage) (promptRec, bool) {
 	for i := len(raw) - 1; i >= 0; i-- {
 		if raw[i].Kind != kindPrompt {
 			continue
 		}
-		if err := json.Unmarshal([]byte(raw[i].Text()), &prev); err == nil {
-			found = true
+		var p promptRec
+		if err := json.Unmarshal([]byte(raw[i].Text()), &p); err != nil {
+			return promptRec{}, false
 		}
-		break
+		return p, true
 	}
-	if !found {
-		return ""
-	}
+	return promptRec{}, false
+}
+
+// toolNameDiff 按工具名算目录增删（排序保证确定性）。
+func toolNameDiff(prevTools, curTools []ToolDef) (added, removed []string) {
 	oldNames := map[string]bool{}
-	for _, t := range prev.Tools {
+	for _, t := range prevTools {
 		oldNames[t.Function.Name] = true
 	}
 	newNames := map[string]bool{}
-	for _, d := range defs {
+	for _, d := range curTools {
 		newNames[d.Function.Name] = true
 	}
-	var added, removed []string
 	for n := range newNames {
 		if !oldNames[n] {
 			added = append(added, n)
@@ -153,11 +232,16 @@ func (e *ContextEngine) toolChangeNote(sess *SessionMeta, defs []ToolDef) string
 			removed = append(removed, n)
 		}
 	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	return added, removed
+}
+
+// toolsChangeNoteText 把目录增删渲染成给模型的「工具目录变更」公告；无增删返回空串。
+func toolsChangeNoteText(added, removed []string) string {
 	if len(added) == 0 && len(removed) == 0 {
 		return ""
 	}
-	sort.Strings(added)
-	sort.Strings(removed)
 	var b strings.Builder
 	b.WriteString("【工具目录变更】")
 	if len(added) > 0 {

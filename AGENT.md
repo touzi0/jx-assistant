@@ -19,18 +19,12 @@ go test -run TestXxx .             # 单测（只跑自己改动相关的，别�
 
 首次使用：**出厂不预置任何模型通道**（2026-11-13 用户口径：新装打开就该是彻底的
 空的，通道只来自公司接入或用户自己添加）——要么走「公司接入向导」（服务端
-`/provision` 下发通道），要么在 左下角「设置 · 模型」里添加提供方，填 API 地址 +
-Key；`baseURL` 兼容 OpenAI chat-completions 接口（渠道协议可选 Anthropic 原生 /
-OpenAI Responses，见「渠道协议」节）。地址填 `mock` 可进入**离线演示模式**，
-无需 Key 即可体验完整链路。旧版出厂会把 DeepSeek 官方地址 + `deepseek-chat`
-折成一个空 Key 通道挂在菜单里，`config.go` 的 `dropDefaultPlaceholderProvider`
-在加载时把这种出厂占位删掉（用户配过 Key / 改过地址 / 自己加过模型的通道不动）。
+`/provision` 下发通道），要么在 左下角「设置 · 模型」里添加提供方
 
 ## 开发规矩（AI 开发前必读）
 
 > 本项目主要由 AI 开发，节奏快，且经常有多个 AI 在同一台电脑上并行开发。
-> 动手前先读完本节；功能与架构细节看下文各节与「存储与模块结构」。
-> （本节由原《开发规范.md》并入——两文档曾长期重复，已合并至此。）
+> 功能与架构细节看下文各节与「存储与模块结构」。
 
 ### 核心工作原理（最高优先级，先读这里）
 
@@ -38,24 +32,16 @@ OpenAI Responses，见「渠道协议」节）。地址填 `mock` 可进入**离
 
 **写代码前的 7 个问题（中英对照，问完再动手）：**
 
-1. Does this need to exist? → no: skip it (YAGNI)
-   这功能需要存在吗？→ 不需要就不做
-2. Already in this codebase? → reuse it, don't rewrite
-   代码库里已经有了吗？→ 有就复用，不要重写
-3. Stdlib does it? → use it
-   标准库能做吗？→ 能就用标准库
-4. Native platform feature? → use it
-   平台原生能力有吗？→ 有就用
-5. Installed dependency? → use it
-   已装的依赖能做吗？→ 能就用
-6. One line? → one line
-   一行能写完吗？→ 一行就是一行
-7. Only then: the minimum that works
-   都不是，才动手：写能用的最小实现
+1. 代码库里已经有了吗？→ 有就复用，不要重写
+2. 标准库能做吗？→ 能就用标准库
+3. 平台原生能力有吗？→ 有就用
+4.已装的依赖能做吗？→ 能就用
+5. 一行能写完吗？→ 一行就是一行
+6. 不要补丁套补丁，不要留下死代码，要重新思考这种功能安排在哪里更合理
+7. 都不是，才动手：写能用的最小实现
 
-英文原版与「放到本项目语境里」的解读见下一节。
 
-**一、验证以编译与实际效果为准，自动化测试放松。** 每完成一步就 `go build`，
+**一、验证以编译与实际效果为准，自动化测试放松。** 每完成一段就 `go build`，
 保证代码没有基础错误；最终修改要实际验证（跑起来看效果、做针对性验证）。
 自动化测试不是主要验证手段：一般只跑自己写的、与自己改动相关的测试
 （`go test -run TestXxx .`）；**只有确定近期没有其他 AI 在修改本项目时，
@@ -72,12 +58,12 @@ OpenAI Responses，见「渠道协议」节）。地址填 `mock` 可进入**离
 
 **四、验证通过就立即提交。** 代码写得可以了（编译通过、预期效果达到）就
 赶紧 commit，不攒改动——尽量减少与其他会话的改动混在一起。这里的「验证」
-指编译 + 实际效果，不要求自动化测试全过；只提交自己本次的文件，一次提交
-对应一件事。
+指编译 + 实际效果，不要求自动化测试全过；如果改动量较大，且暂时不方便验证则直接提交，以后会有别人验证；
+只提交自己本次的文件，一次提交对应一件事。
 
 ### 写代码前的 7 个问题（在项目里的落法）
 
-7 个问题的中英对照见上文「核心工作原理」，此处不重复——直接落到本项目：
+7 个问题对照见上文「核心工作原理」，此处不重复——直接落到本项目：
 
 - 动手新写之前，先搜一遍代码库：工具实现看 `tools.go` / `historytools.go`，
   上下文处理看 `context.go` / `contextengine.go`，扩展机制看 `components.go` /
@@ -86,9 +72,9 @@ OpenAI Responses，见「渠道协议」节）。地址填 `mock` 可进入**离
   `app-ctxmenu.js`、共享地基 `app-core.js`）——大概率已经有了，复用而不是重写。
 - 优先用 Go 标准库。本项目直接依赖只有 3 个（`modernc.org/sqlite`、
   `golang.org/x/crypto`、`pkg/sftp`），全部是不可替代项；想引入新依赖，
-  先自问前 3 条问不问得过去。
-- 前端是原生 JS、无框架、无构建链，这是有意的架构决策（软著全自主实现 +
-  单文件交付）。"引入框架/打包器让代码好写一点"在本项目里默认是错误答案。
+  先自问前 4 条问不问得过去。
+- 前端是原生 JS、无框架、无构建链，这是有意的架构决策（全自主实现 +
+  单文件交付）。
 
 ### 运行时与依赖归属
 
@@ -98,13 +84,20 @@ Python 依赖按「谁用谁带走」归位，禁止混装：
    随仓库分发）：pdf / ocr / office / com / 微信 / 语音组件等内置能力的依赖
    （pdfplumber、rapidocr 全家、docx/pptx/openpyxl、pywin32/comtypes、
    sherpa-onnx 等）。要加包走技能管理器（技能 manifest 声明）。
-2. **任务域专用依赖 → 该域自己的工具目录**：视频语音域在
-   `D:\智能体工作区\工作目录\video_tools\`（视频语音任务域专用工具目录，
-   ffmpeg / 模型 / venv311 自包含，faster-whisper、ctranslate2 与 GPU 的
-   CUDA 库全在此）。
-3. **用户技能依赖 → 跟技能自身走**（技能私有 deps），删技能连依赖一起删。
-4. **禁止直接往共享运行时 pip 装东西**——它服务全部内置技能，装错难回退；
+2. **用户技能依赖 → 跟技能自身走**（技能私有 deps），删技能连依赖一起删。
+3. **禁止直接往共享运行时 pip 装东西**——它服务全部内置技能，装错难回退；
    任务域需求建独立工具目录 / venv。
+
+### 平台隔离（打包口径）
+
+- **跟目标平台无关的运行时/二进制一律不进包**：`技能/_runtime` 按平台名分目录
+  （`python`=Windows、`macos`、`linux`、`android*`），打包只留目标平台的——
+  `打包/打包安装包.ps1` 暂存技能后删掉 `_runtime` 下非 `python` 的目录。
+- 平台专属可执行文件靠**文件名**区分（`cua-driver.exe` vs `cua-driver`），代码按
+  `runtime.GOOS` 取名（`cuaDriverBinName()`；`resolveCuaDriver` 与
+  `update_builtin.go` 的内置组件包结构校验同一口径）。
+- `unzip()` 保留 zip 里记录的可执行位、识别符号链接条目（mac/linux 包靠它：
+  二进制全变 0644 就打不开）；Windows 忽略权限位，无权限建链接时退化为写普通文件。
 
 ### 开发流程：调研规划 → 执行 → 验证 → 提交
 
@@ -116,7 +109,7 @@ Python 依赖按「谁用谁带走」归位，禁止混装：
    `web/app-chat.js`）。不明白的地方先弄明白，禁止"边写边猜接口"。
 2. **制定计划**：列出改哪些文件、按什么顺序、每步怎么验证。方案有分叉
    或影响面拿不准时，先把方案讲清楚再继续。
-3. **执行**：小步前进，每完成一个可验证的小步骤就 `go build` 一次，
+3. **执行**：小步前进，每完成一个可验证的小步骤就 `go build` 一次，及时提交，
    保证随时可回退。
 4. **测试验证**：`go build` 必须通过，最终修改要实际验证——前端改动要
    实际打开页面看一眼（布局、交互、组件/插件注入是否正常），完成标准是
@@ -138,23 +131,21 @@ Python 依赖按「谁用谁带走」归位，禁止混装：
 
 - **同一台电脑上经常有多个 AI 同时开发本项目**：文件可能正在被别的会话
   修改——工作区里出现不是自己做的未提交改动是常态，别动它、更别顺手提交。
-- **测试验证用已在运行的主实例，不另开演示实例**：各种改动基本是热加载的
+- **组件测试验证用已在运行的主实例，不另开演示实例**：各种改动基本是热加载的
   （`-webdir web` 下前端改完刷新页面即生效；组件/插件开关即点即生效）。
-  确实需要重启就直接重启，但**尽量不要关闭实例**——可能把其他 AI 正在
+  确实需要重启就另外开开发实例，但**尽量不要关闭实例**——可能把其他 AI 正在
   跑的工作给停掉。
 - **构建/运行突然失败，先怀疑"别人改到一半"**：失败原因指向正在变动的文件
   时不要急着"修复"，等约 5 分钟再看——多半已能正常启动，或已被对方启动。
-- **跑测试只跑自己的，全量靠边**：测试文件可以写、可以运行，但每个 AI
-  只应运行自己刚写出来的、与本次改动相关的测试；除非确定近期没有其他
-  AI 在修改本项目（或用户明确指定），不跑全量——多 AI 同时修改时全量
-  经常跑不起来，失败也不说明你的改动有问题；全量测试只在正式版本出包
-  前执行。
+- 跑测试一般只跑自己的。
+
+
+以上是人工维护，以下是AI维护，未经人工详细查看验证：
 
 ### 代码约定与常见陷阱
 
 约定：注释、提交信息、UI 文案均为中文，错误信息要求用户可读；运行时产物
-不入库（`data/`、`config.json`、打包产物等，见 `.gitignore`），唯一例外
-`jx-assistant.exe`（启动程序，必须入库）。
+不入库（`data/`、`config.json`、打包产物等，见 `.gitignore`）。
 
 陷阱（每条都来自真实踩坑）：
 
@@ -252,7 +243,7 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
 | 命令沙箱 | `sandbox_windows.go`(+`_stub`) / `sandbox_linux.go`(+`_stub`) + `sandbox.go` 分派 | android 分支：无 OS 沙箱、直接执行，隔离由应用沙箱承担 |
 | 沙箱审计 | `sandbox_audit_windows.go` / `_other.go` | 常驻 ACE/密级标签仅 Windows，其余恒空 |
 | 电脑操控 | `tool_computer_windows.go` / `_other.go` | 仅 Windows，其余注册时报错 |
-| 演示记录器 | `recorder_windows.go` / `_other.go`（定义在 `recorder.go`，跨平台） | 创建技能模式专用、归用户直控（界面录制按钮 → `/api/demo-record/*` 端点，模型无录制工具）；仅 Windows 有真实现（全局钩子+截屏+waveIn 录音+VAD 分段随录随转），其余报「不支持」 |
+| 演示记录器（界面名「操作录制器」） | `recorder_windows.go` / `_other.go`（定义在 `recorder.go`，跨平台） | 归用户直控（创建技能模式的专用录制按钮 + 其余模式的加号菜单「操作录制器」挂出的录制胶囊 → `/api/demo-record/*` 端点，模型无录制工具、补转也不加工具，只在提示词里提醒可用语音组件的识别脚本）；仅 Windows 有真实现（全局钩子+截屏+waveIn 录音+VAD 分段随录随转，停录不等识别），其余报「不支持」 |
 | 进程退出信号 | `pdeathsig_android.go` / `_other.go` | android 用 PR_SET_PDEATHSIG |
 | sqlite 兼容 | `sqlite_android_amd64.go` / `sqlite_android_stub.go` | 仅 android/amd64 打 seccomp 补丁 |
 | 手机操控工具 | `tool_device_android.go` / `_other.go` | 仅安卓注册 device_*/adb_*（三件套，见 android/README.md）；桥端点 device_bridge.go 全平台编译（无壳轮询自然空闲） |
@@ -406,41 +397,6 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
   或改目录结构时，必须同步往静态段补一条**。热更路（组件块）天然合规：只
   `RemoveAll` 自己那个组件目录再整建，其余一概不碰；技能与 `_runtime` 不在
   分块体系内，只随安装包变更。
-
-## Electron 壳（jx-desktop，迁移期新形态）
-
-仓库 `electron-migration` 分支上的第三种桌面形态：壳是独立目录
-`D:\智能体工作区\jx-desktop`（Electron 44，自带 Chromium，版本随安装包
-锁定——不再被 WebView2 Evergreen 运行时回归偷袭）。Go 仓库只加了薄薄一层：
-
-- **sidecar 模式**：`-electron` 参数＝桌面模式的环境准备（cwd 锚定/默认
-  工作区迁移/禁开浏览器）但不开任何窗口，纯当本地 HTTP 服务跑，由 Electron
-  主进程拉起（`-port` 随机分配）；`main.go` 的 `anchored` 汇总两形态。
-  端口被占时**硬失败**（不静默回退随机端口——Electron 要感知失败换端口重拉）。
-- **右栏面板桥**：`browser_panel_electron.go` 实现 browserTarget 的第三个
-  形态（chromedp 宿主 / 原生 WebView2 面板 / 本桥）。Electron 主进程的
-  `panel-bridge.js` 在 127.0.0.1 随机端口起带令牌 HTTP 服务驱动页面内
-  `<webview id="bpw-webview" partition="persist:webview-browser">`；地址与
-  令牌经 `JX_ELECTRON_BRIDGE`/`JX_ELECTRON_BRIDGE_TOKEN` 环境变量注入，
-  `main.go` 发现即挂 `App.nativePanel`（缺省＝旧形态，互不影响）。工具栏
-  路径不变（仍走 /api/browser/*）；导航到达由桥 POST
-  `/api/browser/electron-report` → `onReport` 广播 browser_nav（与旧壳
-  onNavCompleted 同一事件面）。
-- **前端分支**：URL 带 `&electron=1` 时 app-core.js 给 `<html>` 加
-  `electron-shell` 类并置 `window.JX_ELECTRON`；app-right.js 的 bpwReport
-  矩形上报整体短路（webview 是 DOM 元素，无矩形同步）；style.css 控制
-  webview 仅在该形态显示。**语音听写暂缺**（Web Speech API 在 Electron
-  无免费识别通道）：按钮与快捷键提示在 electron 形态隐藏，`-browser` 与
-  旧壳不受影响，等本地 ASR（SenseVoice 路线，《语音后端化》§七）落地放开。
-- 已知 Electron webview 坑：**无 `src` 的 `<webview>` 不会创建 guest 进程**
-  （did-attach-webview 不触发），标签必须带 `src="about:blank"`。
-- 开发/打包：`打包\开发桌面版-Electron.ps1`（编引擎+npm+启动，含
-  npmmirror 二进制补装）；jx-desktop\`打包-Electron.ps1` 出 NSIS 安装包
-  （resources\go\ 是引擎自包含世界，与旧安装版同口径）。GUI 回归测试：
-  壳加 `--remote-debugging-port=9223`，gui-test 的 CDP 脚本直接可用
-  （Electron 不封调试端口），参考 electron-smoke.mjs / electron-panel.mjs。
-- **旧 WebView2 壳保留不删**（回退与语音过渡载体）；Electron 版稳定 +
-  语音落地后再清理 desktop_windows.go / browser_panel_windows.go。
 
 ## 自带的 MD 查看器（md-viewer/）
 
@@ -689,10 +645,31 @@ DSH 官方的远程工作区只在 mac/Linux 宿主上可用；本产品用纯 G
   **左上角「新工作任务」不立即建会话**：点了回到首页并聚焦输入框（`goHomeNewTask`），
   发出第一条消息才真正创建（懒创建）——避免产生一堆空会话。（曾有「点一下就出会话」
   的实现，因空会话堆积已移除，见 git 历史 081c2273。）
-- **输入区工具栏**：左下角加号菜单（文件上传 / 计划模式 / 目标模式 /
-  导出日志（运行时间线 Markdown）/ 导出原始数据（最近发给模型的请求）/
-  SSH 远程工作区）与权限芯片；
+- **输入区工具栏**：左下角加号菜单（文件上传 / 画板 / 操作录制器 / 计划模式 /
+  目标模式 / 本对话的组件与插件 / 导出日志（运行时间线 Markdown）/ 导出原始数据
+  （最近发给模型的请求）/ SSH 远程工作区）与权限芯片；
   发送按钮左侧是**模型芯片**（既是显示也是选择，按提供方分组）。
+  - **画板**（`app-whiteboard.js`，2026-11-24）：跟 AI 交流时随手画个示意图。
+    居中弹窗，白底画布（逻辑 1000×620，导出 2 倍）+ 工具条：画笔 / 文字 /
+    橡皮，黑红蓝绿黄 + 自选色（原生取色器），三档线宽，撤销 / 清空。内容存成
+    操作列表（笔画点序列 / 文字 / 橡皮=白粗线 / 清空标记），撤销与适配尺寸按
+    列表整体重画。「插入到输入框」把画布导成 PNG 走 `stageFiles` 进**发起它的
+    那个输入区**的附件区（与粘贴图片同一条通路，发送时随消息带给 AI），插入后
+    清空；关闭则保留内容下次接着画。窄屏开窗压一层历史栈（返回手势＝关窗），
+    Esc 关窗、Ctrl+Z 撤销，打字中的 Enter 落笔（IME 组合中的 Enter 不落笔）。
+  - **操作录制器**（原「演示记录」，后端仍是 recorder_*）：创建技能模式保留
+    权限芯片右侧的专用录制按钮；**其余模式从加号菜单挂出一枚录制胶囊**
+    （`demoRecFlagEl`：与「计划」胶囊同族，权限芯片右侧，▶/■ 在胶囊里起录停录、
+    ✕ 收起，录制中收起＝先停录收录；`demoRec.pinned` 按输入区记「挂出过」）。
+    录制中**所有输入区**都显示胶囊（停录按钮必须够得着，不管从哪起的录），
+    创建技能模式下胶囊不显示（专用按钮在场）、菜单项也在该模式下隐藏。同一份
+    `demoRec` 状态与 `demoRecToggle`，`demoRecSyncAll` 随 syncComposer / SSE 收敛。
+    停录后材料作为一张「演示记录 <目录名>」卡挂进停录输入区上方的附件区
+    （`stageRecord`，kind=record：红点图标 + 时长/事件/截图副标，✕ 可移除），
+    发送时【演示记录】注记进「用户附件：」块随消息到达模型（flushAttachments
+    对它不上传；注记**单行**——该块按行计），用户气泡里折成一条灰条（只露前
+    10 字、title 按句切行放全文，与引用行同款），模型照常 read INDEX.md /
+    read_image；首页录的同样跟着第一条消息走。
   **模式前端定制点**：基础前端一套不变，工作模式可对界面做定向增补——
   `CHAT_MODES` 自己那一项挂 `ui` 对象（`mount(view)` 首挂控件并返回根元素、
   常驻 DOM 只切显隐；`sync(view, s, el)` 随 `syncComposer` 刷状态，在基础
@@ -1463,7 +1440,9 @@ user/ 下误发副本，市场记账在的跳过；经迁移任务 20261030.purg
 让 AI 探路），AI 观察学习后写成 SKILL.md 并注册进 `技能/user/`。闭环三件套：
 ①**演示记录器**（`recorder.go` 定义 + `recorder_windows.go` 实现，纯 syscall
 无 cgo）：用户点输入框旁的录制按钮起录（`POST /api/demo-record/start`，模型
-不持有录制工具）——WH_MOUSE_LL/WH_KEYBOARD_LL 全局钩子
+不持有录制工具；**其他模式从加号菜单「操作录制器」挂出录制胶囊起录**，同一端点
+同一套材料，任何模式的本地会话与首页都能录——不在创建技能模式录的东西同样
+到达模型，模型按用户当时的要求分析即可，不一定是做技能）——WH_MOUSE_LL/WH_KEYBOARD_LL 全局钩子
 （回调只投递 channel，慢活全在 worker；带 LLMHF_INJECTED 标记的自家
 computer_* 注入事件被过滤）在每次点击、回车/Tab、窗口切换时截屏（复用
 BitBlt 截屏、逐字节去重、上限 400 张），连续打字聚合成 text 事件（组合键
@@ -1473,8 +1452,11 @@ waveIn 缓冲采集全程录 16kHz 单声道 16bit PCM（无麦克风自动降�
 停录（按钮 / `POST /api/demo-record/stop`；桌面退出有 `recorderShutdown`
 兜底：保音频、生成 INDEX）收录成 `工作区/演示记录/record-<时间戳>/{NNN.png,
 events.jsonl, audio.wav, 讲解.srt, INDEX.md}`——INDEX.md 是时间线对照表（事件↔截图↔
-字幕段），模型 read INDEX.md 定位、read_image 看图。停录即向所在会话追加
-【演示记录】系统通知（同文件上传机制，origin=demo）；建技能会话时若工作区
+字幕段），模型 read INDEX.md 定位、read_image 看图。停录端点把【演示记录】
+通知正文随响应返回，前端把材料作为一张卡挂进**停录输入区**上方的附件区
+（`stageRecord`，kind=record，不走上传），随用户下一条消息的「用户附件：」块
+到达模型——首页没开会话时录的也跟着第一条消息走（旧版往会话落一行注记：
+折叠成一行没人看见，首页更是无处可落）；建技能会话时若工作区
 已有材料则注入清单通知（`recorderRecentDirs`，首页「先录后聊」的入口）。
 事件毫秒时间轴与录音/字幕同源（都取 time.Since(start)），天然对齐。仅
 Windows 真实现，其他平台空桩报「不支持」（status 端点与环境快照提前公告，
@@ -1485,8 +1467,19 @@ makeLocalRec）逐常量对齐：350ms 起效 / 3 秒尾静音定稿 / 18 秒强
 经 `recorderASR` 钩子（`voiceasr.go`，NewApp 注册）直调语音组件的常驻
 X-ASR worker（组件桥 callRaw，与前端听写同一通道），文本逐段落
 `讲解.srt`（整文件重写，崩溃不丢已落盘段）；停录尾部不足 3 秒静音的余段
-照转，等在途识别上限 8 秒。语音组件停用时优雅降级为纯录音（该段字幕丢弃），
-停录通知与环境公告如实说明。③**注册闭环**：`register_skill(path[, update])` 走
+照转。**停录不等识别**（2026-11-24：首次用语音时本地模型要加载，停录曾卡
+满 8 秒）：`recorderStop` 只做停钩子/停采集/写 audio.wav（实测 30ms 级返回），
+在途段由识别 worker 后台转完（`pending` 计数＝入队+识别中，字幕落盘后才减
+→ `ASRPending`），`recorderCollectASR` 起后台 goroutine 等 `asrDone`，经
+`recorderASRDone` 钩子（server.go NewApp 注册）重建 INDEX.md 并广播
+`demo_record_transcribed{output=目录, data:{cues,note}}`，前端
+`updateRecordCards` 把还挂在输入框上方的那份材料卡「语音转写中…」换成
+「字幕 n 段」；停录通知里字幕分四种实况（已出 / 后台识别中 / 未生成 /
+无音频）。退出时 `recorderShutdown` 仍等后台识别 ≤8 秒。**补转不进客户端**
+（用户定的边界：不加模型工具、提示词里不写路径）：字幕没出来/不全时只在
+通知与提示词里提醒模型「语音组件里有本地识别脚本，可自己想办法调 Python 对
+audio.wav 重新识别」，模型按环境提示词里的客户端位置自己找脚本；语音组件停用
+时优雅降级为纯录音（该段字幕丢弃），停录通知与环境公告如实说明。③**注册闭环**：`register_skill(path[, update])` 走
 `addUserSkill` 装进 `技能/user/`（update=true 先删旧再装，支持迭代改进），
 `read_skill` 读回自查。权限默认完全访问（`handleCreateSession` 分支 +
 前端 `applyDraftMode` 联动），用户主动点按钮起录与文件上传同哲学，不走模型
@@ -1554,7 +1547,7 @@ embeddable，约 11MB + 清华镜像装 wheel），此后离线可用；装配�
   setting=1 允许，仅对列出站点生效、其余保持默认询问）。Preferences 只在
   浏览器启动时读取：`ApplyGrants` 会先停在跑的实例（等退出覆写结束）再
   注入，随后 Navigate 重开生效（登录态在 profile 无损）；右栏 WebView2
-  面板同款（Chromium 同构 profile），Electron 桥面板不支持（静默跳过）。
+  面板同款（Chromium 同构 profile）。
   具体授什么权由各技能的 SKILL.md 写明，权限名是 Chromium content settings
   类型名（网上可查）。接口：`POST
   /api/browser/{panel-rect,navigate,viewport,open-view,close}`、`GET
@@ -1593,7 +1586,7 @@ embeddable，约 11MB + 清华镜像装 wheel），此后离线可用；装配�
   原文（几 MB 铺成 DOM 会把右栏卡死）。渲染页带 CSP（`connect-src 'none'`
   等）：md 里的内联 HTML/脚本照旧执行（与 MD 查看器同策略），但拿不到产品
   同源 API（响应头 + `<meta>` 两份，后者覆盖手机外壳的 srcdoc 那条路）。
-  前端分流：桌面/Electron 走原生面板导航（`bpwNav`）；网页与手机形态走右栏
+  前端分流：桌面走原生面板导航（`bpwNav`）；网页与手机形态走右栏
   同源 `<iframe>`（`app-right.js` 的 `bpwShowFrame`，远程形态经隧道取 HTML 写
   `srcdoc`），窄屏按模板自带 500px 断点单列可读、宽表格与代码块各自横向滚。
 - **`panel_screenshot`**（无能力门控，仅桌面版）：对右侧栏截图（GDI 截屏
@@ -1817,8 +1810,8 @@ worker 的 stdin/stdout 升级为带 id 的帧协议（req/event/decision/host/h
   是绝对路径——`voiceDir()` 若只返回相对路径，调用处又会拿它当子进程的工作目录，Python 便
   按新工作目录把 `组件/voice/asr_worker.py` 再解析一遍，拼成
   `组件/voice/组件/voice/asr_worker.py` 秒退，引擎只看到「worker 无应答（已退出）」。
-  环境没有浏览器识别能力时（部分远程手机端浏览器、Electron
-  壳）自动落到本地档。发行版默认「云端」——装完即用，不依赖模型文件。
+  环境没有浏览器识别能力时（部分远程手机端浏览器）自动落到本地档。发行版
+  默认「云端」——装完即用，不依赖模型文件。
   **听写提示已精简**：识别期间不再报「已出 N 句（继续说，或点麦克风结束）」这类
   计数提示（用户判为噪声且常滞后——消息都发走了还挂着）；按停后到尾段精修回包
   这一秒（原先无任何反馈）按钮转圈 +「正在识别…」，收尾时提示一并收掉。
@@ -2166,7 +2159,7 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 
 ## 前后端接口
 
-下表是人类（前端）使用的接口。**AI 另有一条通用直通通道**：call_api 工具（仅 assistant 模式注入，其余模式一律没有）——同一批接口按「注册即元数据」开放（server.go 的 .apiRoute(..., apiMeta{...})，元数据缺席=不对 AI 开放；SSE 流、multipart 上传、二进制下载、组件桥等不适合同步直调的保持关闭），进程内直调与前端同一 handler（见 callapi.go）；完整目录（每条标注最低权限档与 ⚠ 危险标记）拼在 call_api 工具说明里静态随请求前缀，不进环境快照，会话档位不足在调用时被权限闸拒绝并提示需要的档位，危险接口（删除/清空类）调用前走审批卡。执行类工具与意图工具（dispatch_task 等）不受影响——它们与前端共用 service（sessioncreate.go / deliverToSession / stopRunBy / registerUploadPath / chatModes）。
+下表是人类（前端）使用的接口。**AI 另有一条通用直通通道**：call_api 工具（仅 assistant 模式注入，其余模式一律没有）——同一批接口按「注册即元数据」开放（server.go 的  .apiRoute(..., apiMeta{...})，元数据缺席=不对 AI 开放；SSE 流、multipart 上传、二进制下载、组件桥等不适合同步直调的保持关闭），进程内直调与前端同一 handler（见 callapi.go）；完整目录（每条标注最低权限档与 ⚠ 危险标记）拼在 call_api 工具说明里静态随请求前缀，不进环境快照，会话档位不足在调用时被权限闸拒绝并提示需要的档位，危险接口（删除/清空类）调用前走审批卡。执行类工具与意图工具（dispatch_task 等）不受影响——它们与前端共用 service（sessioncreate.go / deliverToSession / stopRunBy / registerUploadPath / chatModes）。
 
 | 方法与路径 | 说明 |
 |---|---|

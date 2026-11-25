@@ -77,7 +77,7 @@ func browserOpenTool() Tool {
 						return "", fmt.Errorf("预授权写入失败: %w", err)
 					}
 				}
-				// Electron 桥面板未实现 ApplyGrants：静默跳过（该形态无此机制）
+				// 面板形态未实现 ApplyGrants：静默跳过（该形态无此机制）
 			}
 			url, title, err := h.Navigate(p.URL)
 			if err != nil {

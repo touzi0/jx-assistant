@@ -1,19 +1,27 @@
 package main
 
-// 演示记录器：创建技能模式（skill-create）的配套记录工具，归用户直控——
-// 输入框旁的录制按钮经 HTTP 端点（/api/demo-record/*，见 server.go）起录/停录，
-// 模型不持有录制工具；停录后材料以【演示记录】系统通知进对话（同文件上传
-// 通知机制），模型 read INDEX.md 定位关键步骤、read_image 看截图，即可还原
-// 用户做了什么，进而沉淀成 SKILL.md 技能。
+// 演示记录器：操作录制器（界面名）的材料后端，归用户直控——输入区的录制按钮/
+// 胶囊经 HTTP 端点（/api/demo-record/*，见 server.go）起录/停录，模型不持有录制
+// 工具；停录端点把【演示记录】通知随响应返回，前端把材料作为一张卡挂进输入框
+// 上方的附件区，随用户下一条消息发给模型；模型 read INDEX.md 定位关键步骤、
+// read_image 看截图，即可还原用户做了什么。
 // 起录后全局鼠标/键盘钩子在每次点击、回车/Tab、窗口切换时自动截屏（画面没变
 // 则跳过），全程记事件日志与麦克风音频；停录收录成材料目录（截图序列 +
-// events.jsonl + audio.wav + INDEX.md 对照表）。
+// events.jsonl + audio.wav + 讲解.srt + INDEX.md 对照表）。
+// **停录不等语音识别**：停录只做停钩子、停采集、写 audio.wav（秒级返回）；
+// 随录随转还没识别完的段由识别 worker 在后台继续，写完 讲解.srt 再重建
+// INDEX.md 并广播 demo_record_transcribed（recorderASRDone 钩子）。首次用语音
+// 时本地模型要加载，识别可能滞后几十秒——首次停录曾因此卡 8 秒。
+// 字幕没出来/不全时的补转不进客户端（没有模型工具）：通知与提示词只提醒模型
+//「语音组件里有本地识别脚本，可自己调 Python 对 audio.wav 重新识别」。
 // 实现按平台分文件（recorder_windows.go 真实现，recorder_other.go 空桩），
-// 与 computer_* 组件同一组织方式。
+// 与 computer_* 组件同一组织方式；VAD 分段、SRT、INDEX 等纯逻辑在本文件跨平台。
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,6 +38,12 @@ import (
 // 每段经这里识别成文字，逐段落 讲解.srt——时间轴与事件/截图同源。测试环境
 // 不注册（nil）＝纯录音、无字幕，行为与接组件前完全一致。
 var recorderASR func(wav []byte) (string, error)
+
+// recorderASRDone 停录后后台识别收尾的回调（server.go 在 NewApp 注册）：识别
+// worker 把停录时在途的段全部转完（讲解.srt 写完）后调用，参数是该次记录的
+// 统计与最终字幕段数——回调里重建 INDEX.md 并广播 demo_record_transcribed，
+// 前端据此把输入框上方材料卡的「语音转写中」换成字幕段数。测试环境不注册。
+var recorderASRDone func(stats *recorderStats, cues int)
 
 // ---------- 材料 目录名约定 ----------
 
@@ -50,6 +64,11 @@ type recorderStats struct {
 	Events  int
 	Shots   int
 	AudioOK bool
+	// ASRPending：停录时随录随转还有段没识别完（识别在后台继续，完成后经
+	// recorderASRDone 回调收尾）；Cues 是停录那一刻已写出的字幕段数。
+	ASRPending bool
+	Cues       int
+	asrDone    chan struct{} // 音频会话的识别 worker 退出信号（nil = 无音频会话）
 }
 
 // recEvent 是事件日志（events.jsonl）里的一行。T 为相对记录起点的毫秒数
@@ -98,35 +117,71 @@ func recorderRecentDirs(ws string, n int) []string {
 
 // recorderShutdown 进程收尾兜底：还在录就停录（保存 audio.wav）并生成
 // INDEX.md，避免中途退出丢掉整段材料。桌面壳退出路径调用；没在录时
-// 是空操作。此处不做语音转写
-//（可能涉网络与耗时，留给停录端点与将来的补转端点）。
+// 是空操作。后台识别若还在跑，等一小会儿（recASRShutdownWait）让它把在途
+// 的段转完再退——进程一退 worker 就没了，这几秒是字幕的最后机会。
 func recorderShutdown() {
 	stats, err := recorderStop()
 	if err != nil || stats == nil {
 		return
 	}
+	if stats.asrDone != nil {
+		select {
+		case <-stats.asrDone:
+		case <-time.After(recASRShutdownWait):
+		}
+	}
 	_ = buildRecorderIndex(stats)
 }
 
-// demoRecordStopNote 停录后注入会话的【演示记录】通知正文（与文件上传通知
-// 同机制：kindReport 用户侧系统行，模型下一轮可见）。字幕行按材料实况描述
-//（随录随转：讲解.srt 是录制期间逐段落盘的，这里只如实汇报有没有、几段）。
+const recASRShutdownWait = 8 * time.Second // 退出时等后台识别的上限
+
+// demoRecordStopNote 停录端点随响应返回的【演示记录】通知正文：前端把材料作为一张
+// 卡挂进输入框上方的附件区，发送时注记进用户消息开头的「用户附件：」块（与文件
+// 上传注记同一通路，首页没开会话时录的也跟着第一条消息走）。**必须单行**：「用户
+// 附件：」块的注记按行计、一行份材料，前端把每行折成一条灰条（只露前 10 字、
+// 悬停看全文，与引用行同款）——多行会被拆成好几条灰条。字幕一句按实况分四种：
+// 已出 / 后台识别中（停录不等识别）/ 没识别到 / 没音频；需要补转的只提醒模型
+//「语音组件里有本地识别脚本，可自己调 Python 对 audio.wav 重新识别」——不给路径、
+// 不加工具，模型照环境提示词里的客户端位置自己找（用户定的边界）。
 func demoRecordStopNote(stats *recorderStats) string {
-	srtNote := "未生成（语音组件未启用，或本次没识别到有效语音）"
-	if data, err := os.ReadFile(filepath.Join(stats.Dir, recorderSrtFn)); err == nil {
-		if n := len(parseSRT(string(data))); n > 0 {
-			srtNote = fmt.Sprintf("已生成 %s（%d 段，随录随转）", recorderSrtFn, n)
-		}
-	}
-	return fmt.Sprintf("【演示记录】用户点停止按钮完成了一段操作演示，材料已收录：\n"+
-		"- 目录：%s\n- 时长 %s，事件 %d 条，截图 %d 张\n- 音频：%s；字幕：%s\n"+
-		"下一步：read %s 看时间线对照表，再按编号 read_image 看关键截图；"+
+	srtNote := demoRecordSrtNote(stats)
+	return fmt.Sprintf("【演示记录】用户点停止录制完成了一段操作演示，材料已收录：目录 %s；时长 %s，事件 %d 条，截图 %d 张；音频：%s；字幕：%s。"+
+		"下一步：read %s 看时间线对照表，再按编号 read_image 看关键截图（所在模式没有 read_image 就派子对话去看）；"+
+		"用户想让你拿这段操作做什么，以他在对话里的说明为准（分析问题、写教程、沉淀技能都有可能）；"+
 		"用户当时的口头讲解若没进对话，请他口述关键步骤的意图，不要猜。",
 		filepath.ToSlash(stats.Dir),
 		(time.Duration(stats.MS) * time.Millisecond).Round(time.Second),
 		stats.Events, stats.Shots,
 		map[bool]string{true: recorderAudioFn + " 已保存", false: "未录到（无可用麦克风）"}[stats.AudioOK],
 		srtNote, filepath.ToSlash(filepath.Join(stats.Dir, recorderIndexFn)))
+}
+
+// demoRecordSrtNote 通知里的字幕一句（按材料实况；与 demoRecordStopNote 同一
+// 判定供后台识别完成后的广播复用）。补转提示只提「语音组件」：它的识别脚本在
+// 组件目录里，模型按环境提示词里的客户端位置自己找。
+func demoRecordSrtNote(stats *recorderStats) string {
+	if !stats.AudioOK {
+		return "无音频可转写（没录到麦克风），讲解以用户在对话里说的为准"
+	}
+	if stats.ASRPending {
+		return "后台识别中（停录不等识别：通常几十秒内写出 " + recorderSrtFn + " 并更新 INDEX.md；若稍后 read 不到或想要完整讲解词，语音组件里有本地识别脚本，可自己调 Python 对 " + recorderAudioFn + " 重新识别）"
+	}
+	if n := len(recorderReadCues(stats.Dir)); n > 0 {
+		return fmt.Sprintf("已生成 %s（%d 段，随录随转）", recorderSrtFn, n)
+	}
+	if recorderASR == nil {
+		return "未生成（语音组件未启用）；需要讲解词可在设置里启用语音组件后，用它的识别脚本对 " + recorderAudioFn + " 重新识别"
+	}
+	return "未生成（本次没识别到有效语音；需要讲解词可用语音组件的识别脚本对 " + recorderAudioFn + " 重新识别）"
+}
+
+// recorderReadCues 读材料目录里已落盘的字幕段（没有/解析失败返回空）。
+func recorderReadCues(dir string) []srtCue {
+	data, err := os.ReadFile(filepath.Join(dir, recorderSrtFn))
+	if err != nil {
+		return nil
+	}
+	return parseSRT(string(data))
 }
 
 // demoRecordListNote 建技能会话时的【演示记录】清单通知正文：工作区已有
@@ -138,7 +193,7 @@ func demoRecordListNote(dirs []string) string {
 	}
 	return "【演示记录】工作区已有 " + strconv.Itoa(len(dirs)) + " 份演示材料（按时间倒序）：" +
 		strings.Join(names, "、") +
-		"。每份含 INDEX.md 时间线对照表、编号截图、events.jsonl 事件日志与 audio.wav 录音（暂无语音转文字，讲解需用户口述或对话里说明）。" +
+		"。每份含 INDEX.md 时间线对照表、编号截图、events.jsonl 事件日志与 audio.wav 录音（讲解字幕 讲解.srt 随录随转；某份没有或读不到字幕时，语音组件里有本地识别脚本，可自己调 Python 对它重新识别）。" +
 		"用户要分析某份时先 read 它的 INDEX.md，再按编号 read_image 看关键截图。"
 }
 
@@ -258,6 +313,108 @@ func recLe32(b []byte, v uint32) {
 	b[0], b[1], b[2], b[3] = byte(v), byte(v>>8), byte(v>>16), byte(v>>24)
 }
 
+// ---------- VAD 停顿分段（纯 PCM 逻辑：采集循环与文件重放共用） ----------
+//
+// 一次采集两用：PCM 全量累积（停录写 audio.wav）＋ 喂 VAD 停顿分段。VAD 分段
+// 语义与语音组件的听写线（组件/voice/client.js 的 makeLocalRec）逐常量对齐：
+// 350ms 起效 / 3s 尾静音定稿 / 18s 强制切段 / 静音垫 1.5s 上限，能量判据
+// rms > max(0.008, 底噪×3.5)、底噪自适应（0.98/0.02，上限 0.02）。定稿段经
+// recorderASR（voiceasr.go → 语音组件本地模型）识别成文字，逐段落 讲解.srt
+//（时间轴与事件/截图同源：都以记录起点为 0）。
+
+const (
+	recFrameBytes   = 3200  // 100ms @ 16kHz/16bit/单声道 —— VAD 帧长=缓冲长
+	recFrameMs      = 100   // 帧长（毫秒）
+	recSpeechMinMs  = 350   // 短于此视为噪声毛刺，丢弃
+	recFinalPauseMs = 3000  // 尾随静音满 3 秒才定稿（真停顿，非说话时长）
+	recSegMaxMs     = 18000 // 连续不停顿超 18 秒强制定稿
+	recPadMaxMs     = 1500  // 段内静音垫上限（间隙+尾部，近似停顿中点切分）
+)
+
+// recSegment VAD 定稿的一段：音频（WAV，供识别 worker 按头解析）与首尾毫秒
+//（cue 时间在定稿时就定好——识别只回文本）。dropped=true 表示语音不足
+//（噪声毛刺/不足 100ms）丢弃，不进识别。
+type recSegment struct {
+	wav     []byte
+	startMs int
+	endMs   int
+	dropped bool
+}
+
+// recVAD 能量 VAD 分段状态机：每帧（100ms）喂 feed，定稿时返回该段。时间轴以
+// 第一帧起点为 0：采集循环按设备缓冲一帧一帧喂，文件重放按同样帧长切着喂，
+// 两种来源切出来的段一致。状态只归喂它的那一方访问（采集循环 / 文件重放）。
+type recVAD struct {
+	noiseFloor     float64
+	sinceFinal     []byte // 定稿段音频（语音帧 + 限量静音垫）
+	sinceFinalMs   int    // 段内语音时长
+	finalSilenceMs int    // 尾随静音计时
+	padMs          int    // 段内已收录的静音垫
+	nowMs          int    // 已喂入的时长（当前帧的帧末时刻）
+	lastSpeechMs   int    // 最近一帧语音的帧末时刻（-1 = 还没有语音）
+	prevEndMs      int    // 上一段结束（下一段的起点）
+}
+
+func newRecVAD() *recVAD { return &recVAD{noiseFloor: 0.004, lastSpeechMs: -1} }
+
+// feed 喂一帧 100ms 的 PCM（recFrameBytes 字节），定稿返回段，否则返回 nil。
+func (v *recVAD) feed(data []byte) *recSegment {
+	rms := recRMS(data)
+	isSpeech := rms > math.Max(0.008, v.noiseFloor*3.5)
+	if !isSpeech {
+		v.noiseFloor = math.Min(0.02, v.noiseFloor*0.98+rms*0.02)
+	}
+	if isSpeech {
+		v.sinceFinal = append(v.sinceFinal, data...)
+		v.sinceFinalMs += recFrameMs
+		v.finalSilenceMs = 0
+		v.lastSpeechMs = v.nowMs + recFrameMs
+	} else if v.sinceFinalMs > 0 {
+		v.finalSilenceMs += recFrameMs
+		if v.padMs < recPadMaxMs { // 间隙/尾部静音限量入段
+			v.sinceFinal = append(v.sinceFinal, data...)
+			v.padMs += recFrameMs
+		}
+	}
+	v.nowMs += recFrameMs
+	if v.sinceFinalMs >= recSegMaxMs || (v.sinceFinalMs >= recSpeechMinMs && v.finalSilenceMs >= recFinalPauseMs) {
+		return v.finalize()
+	}
+	return nil
+}
+
+// finalize 定稿当前段：cue 终点取本段最后一帧语音+300ms（尾静音不计入），起点
+// 接上一段结束。停录收尾也调一次（尾段兜底：余下语音没有 3s 静音也照转）；
+// 没有待定稿内容时返回 dropped 段。
+func (v *recVAD) finalize() *recSegment {
+	frames, spoken := v.sinceFinal, v.sinceFinalMs
+	endMs := 300
+	if v.lastSpeechMs >= 0 {
+		endMs = v.lastSpeechMs + 300
+	}
+	startMs := v.prevEndMs
+	v.sinceFinal, v.sinceFinalMs, v.finalSilenceMs, v.padMs = nil, 0, 0, 0
+	v.prevEndMs = endMs
+	if spoken < recSpeechMinMs || len(frames) < recFrameBytes { // 噪声毛刺/音频不足 100ms：丢弃
+		return &recSegment{dropped: true}
+	}
+	return &recSegment{wav: recPcmToWav(frames), startMs: startMs, endMs: endMs}
+}
+
+// recRMS 归一化均方根（int16 LE → [0,1)），VAD 能量判据的输入。
+func recRMS(b []byte) float64 {
+	n := len(b) / 2
+	if n == 0 {
+		return 0
+	}
+	var sum float64
+	for i := 0; i+1 < len(b); i += 2 {
+		v := float64(int16(binary.LittleEndian.Uint16(b[i:])))
+		sum += v * v
+	}
+	return math.Sqrt(sum/float64(n)) / 32768
+}
+
 // buildRecorderIndex 生成 INDEX.md：事件时间线 + 截图编号 + 对应字幕段对照表。
 func buildRecorderIndex(stats *recorderStats) error {
 	raw, err := os.ReadFile(filepath.Join(stats.Dir, recorderEventsFn))
@@ -282,8 +439,10 @@ func buildRecorderIndex(stats *recorderStats) error {
 	}
 	if len(cues) > 0 {
 		fmt.Fprintf(&b, "- 字幕：`%s`（%d 段，时间与事件轴同源对齐）\n", recorderSrtFn, len(cues))
+	} else if stats.ASRPending {
+		fmt.Fprintf(&b, "- 字幕：后台识别中（停录不等识别，这份对照表生成时还有段没转完；稍后重读 %s 与本文件，或用语音组件的识别脚本对 %s 重新识别）\n", recorderSrtFn, recorderAudioFn)
 	} else {
-		fmt.Fprintf(&b, "- 字幕：未生成（转写服务未配置）；用户在对话里说的话就是讲解词\n")
+		fmt.Fprintf(&b, "- 字幕：未生成（没识别到有效语音或语音组件未启用；需要讲解词可用语音组件的识别脚本对 %s 重新识别）；用户在对话里说的话就是讲解词\n", recorderAudioFn)
 	}
 	b.WriteString("\n说明：时间轴以记录起点为 0（毫秒）。截屏发生在点击、回车/Tab、窗口切换时；" +
 		"连续打字聚合成一条 text 事件（中文输入法的上屏结果以截图为准，事件里只有原始按键）。" +

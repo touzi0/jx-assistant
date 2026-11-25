@@ -350,15 +350,24 @@ func (a *App) startChild(ctx context.Context, r sandboxRun, w io.Writer) (func()
 
 // shellCmd 起一个「输出进 w」的 shell 子进程（不受限档位的异步路径）。
 // 返回的 procTree 由调用方在 Start 成功后 attach、Wait 返回后 finish。
-// PS 5.1（含空 shell 缺省）前置编码设置并注入环境变量，同 runUnconfinedLocal。
+// Windows：PS 5.1（含空 shell 缺省）前置编码设置并注入环境变量，同 runUnconfinedLocal。
+// 非 Windows：默认 sh -c（对齐 runUnconfinedLocal 的空 shell 缺省）；显式 pwsh 照用。
 func shellCmd(ctx context.Context, r sandboxRun, w io.Writer) (*exec.Cmd, *procTree) {
 	var cmd *exec.Cmd
 	ps51 := false
-	if strings.ToLower(strings.TrimSpace(r.Shell)) == "cmd" {
+	shell := strings.ToLower(strings.TrimSpace(r.Shell))
+	if !isWindowsRuntime {
+		// 非 Windows 没有 PS 5.1 编码问题；cmd/powershell 形态不存在，缺省一律 sh。
+		if shell == "pwsh" {
+			cmd = exec.CommandContext(ctx, "pwsh", "-NoProfile", "-NonInteractive", "-Command", r.Command)
+		} else {
+			cmd = exec.CommandContext(ctx, "sh", "-c", r.Command)
+		}
+	} else if shell == "cmd" {
 		cmd = exec.CommandContext(ctx, "cmd", "/C", r.Command)
 	} else {
 		command := r.Command
-		if strings.ToLower(strings.TrimSpace(r.Shell)) != "pwsh" {
+		if shell != "pwsh" {
 			ps51 = true
 			command = ps51Prologue(r.EncodingMode) + command
 		}

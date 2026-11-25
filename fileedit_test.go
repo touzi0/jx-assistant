@@ -213,7 +213,10 @@ func TestPanelEditHelpers(t *testing.T) {
 			t.Fatalf("%q 应在工作区内", p)
 		}
 	}
-	out := []string{"../x", "..", "D:/x/y", "/etc/passwd", "..\\..\\x"}
+	out := []string{"../x", "..", "D:/x/y", "/etc/passwd"}
+	if isWindowsRuntime {
+		out = append(out, "..\\..\\x") // Windows：反斜杠是分隔符，构成穿越
+	}
 	for _, p := range out {
 		if withinWorkspace(p) {
 			t.Fatalf("%q 应判为工作区外", p)

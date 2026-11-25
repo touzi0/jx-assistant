@@ -3,8 +3,8 @@ package main
 // 分批加载（超长对话）切窗逻辑的验收测试：
 //  1. 回合边界向前对齐：窗口起点落在回合中间时向前扩到回合起点，逐批加载
 //     （before_seq 接力）并集 = 全量，无重复无遗漏（向右缩会让残段永远丢失）；
-//  2. base 基线：切点前最后一条有效 prompt 的 sys/tools 进 older.base，空壳行
-//     （已被 trim 掏成 {}）跳过；
+//  2. 快照行瘦身只按引擎记录的 chg 决定（TestSlimRowsForUI）：无变化掏空、变化
+//     全文、窗口内首条保留全文、老行逐字比较补判；切窗只报切点前条数；
 //  3. inherit 标记行不与后续首批拆开；envBoundary 取摘要覆盖边界最大值；
 //  4. isTurnStartMsg 与前端 lastTurnStart 同口径（aiuser/chat 起点，report 与
 //     旧库【前缀通知不算）；
@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -61,41 +62,97 @@ func TestSliceMsgWindowBatchesCoverAll(t *testing.T) {
 	}
 }
 
-// ② base 基线：取切点前最后一条有效 prompt；空壳（{}）跳过；envBoundary 取最大覆盖边界。
-func TestSliceMsgWindowBase(t *testing.T) {
+// ② 快照行瘦身按引擎记录的 chg 决定（这里不比对）：无变化 → 空壳；有变化 → 全文
+// 带回 chg；窗口内第一条完整快照不论变没变都保留全文（前端据此交代首见）；
+// 老行（无 chg）回退到与上一条逐字比较。
+func TestSlimRowsForUI(t *testing.T) {
+	row := func(seq int64, sys, chg string, tool string) *StoredMessage {
+		if chg != "" {
+			chg = `,"chg":` + chg
+		}
+		return &StoredMessage{Message: Message{Content: `{"sys":"` + sys + `","tools":[{"type":"function","function":{"name":"` + tool + `"}}]` + chg + `}`}, Seq: seq, Kind: "prompt"}
+	}
 	msgs := []*StoredMessage{
 		{Message: TextMessage("user", "第一轮"), Seq: 1, Kind: "chat"},
-		{Message: Message{Content: `{"sys":"提示词A","tools":[{"a":1}]}`}, Seq: 2, Kind: "prompt"},
+		row(2, "A", `{"first":true}`, "a"),
 		{Message: TextMessage("assistant", "答"), Seq: 3, Kind: "chat"},
 		{Message: TextMessage("user", "第二轮"), Seq: 4, Kind: "chat"},
-		{Message: Message{Content: "{}"}, Seq: 5, Kind: "prompt"}, // 与前一条相同，已被 trim 掏空
+		row(5, "A", `{}`, "a"), // 无变化
 		{Message: TextMessage("assistant", "答2"), Seq: 6, Kind: "chat"},
 		{Message: TextMessage("user", "第三轮"), Seq: 7, Kind: "chat"},
-		{Message: Message{Content: `{"sys":"提示词B","tools":[{"b":2}]}`}, Seq: 8, Kind: "prompt"},
+		row(8, "B", `{"sys":true,"prevSys":"A","toolsDel":["a"],"toolsAdd":["b"]}`, "b"), // 有变化
 		{Message: TextMessage("assistant", "答3"), Seq: 9, Kind: "chat"},
 		{Message: TextMessage("user", "第四轮"), Seq: 10, Kind: "chat"},
-		{Message: Message{Content: "摘要"}, Seq: 11, Kind: "summary", CoversUpTo: 6},
+		row(11, "B", `{}`, "b"), // 无变化
+		{Message: TextMessage("assistant", "答4"), Seq: 12, Kind: "chat"},
+		{Message: Message{Content: "摘要"}, Seq: 13, Kind: "summary", CoversUpTo: 6},
 	}
-	win, info := sliceMsgWindow(msgs, 9, len(msgs)) // 切点在 seq=9 之前
-	if info.Count != 9 {
-		t.Fatalf("older.count 应为切点前条数: got %d", info.Count)
+	content := func(seq int64) any {
+		for _, m := range msgs {
+			if m.Seq == seq {
+				return m.Content
+			}
+		}
+		return nil
 	}
-	if info.Sys != "提示词B" || string(info.Tools) != `[{"b":2}]` {
-		t.Fatalf("base 应取切点前最后一条有效 prompt: sys=%q tools=%s", info.Sys, info.Tools)
+	slimRowsForUI(msgs, 0, len(msgs)) // 全量：首条全文、无变化掏空、变化全文
+	if content(2) == "{}" || content(5) != "{}" || content(8) == "{}" || content(11) != "{}" {
+		t.Fatalf("全量瘦身形态不对: 2=%q 5=%q 8=%q 11=%q", content(2), content(5), content(8), content(11))
 	}
-	if info.EnvBoundary != 6 {
-		t.Fatalf("envBoundary 应取摘要覆盖边界: got %d", info.EnvBoundary)
+	// 窗口从第三轮开始：窗口首条（seq 8，有变化）保留全文；之后无变化掏空
+	msgs[4].Content = `{"sys":"A","tools":[{"type":"function","function":{"name":"a"}}],"chg":{}}`
+	msgs[10].Content = `{"sys":"B","tools":[{"type":"function","function":{"name":"b"}}],"chg":{}}`
+	slimRowsForUI(msgs, 6, len(msgs))
+	if content(8) == "{}" || content(11) != "{}" {
+		t.Fatalf("窗口首条应保留全文、其后无变化掏空: 8=%q 11=%q", content(8), content(11))
 	}
-	if win[0].Seq != 10 {
-		t.Fatalf("窗口应从回合起点（user 第10条）开始: got seq %d", win[0].Seq)
+	// 窗口首条是无变化行（seq 5）：同样保留全文（前端据此画首见）
+	msgs[10].Content = `{"sys":"B","tools":[{"type":"function","function":{"name":"b"}}],"chg":{}}`
+	slimRowsForUI(msgs, 3, 8)
+	if content(5) == "{}" || content(8) == "{}" {
+		t.Fatalf("窗口首条无变化也应保留全文: 5=%q 8=%q", content(5), content(8))
 	}
-	// 切点前只有空壳 prompt：base 退到它之前的有效行
-	win2, info2 := sliceMsgWindow(msgs, 6, len(msgs))
-	if info2.Sys != "提示词A" {
-		t.Fatalf("空壳行不作为基线，应退到前一条有效 prompt: got %q", info2.Sys)
+	// 老行（无 chg）：与上一条逐字比较补判；窗口之前的行只作基线、不进响应
+	legacy := []*StoredMessage{
+		row(1, "A", "", "a"),
+		row(2, "A", "", "a"),
+		row(3, "B", "", "a"),
+		row(4, "B", "", "b"),
 	}
-	if win2[0].Seq != 7 {
-		t.Fatalf("窗口起点应为回合起点 seq=7: got %d", win2[0].Seq)
+	slimRowsForUI(legacy, 0, len(legacy))
+	if legacy[0].Content == "{}" || legacy[1].Content != "{}" || legacy[2].Content == "{}" || legacy[3].Content == "{}" {
+		t.Fatal("老行应按逐字比较瘦身")
+	}
+	// 老行补判的结果补记进响应副本：前端拿到的形态与新行一致
+	if c := legacy[2].Content.(string); !strings.Contains(c, `"sys":true`) || !strings.Contains(c, `"prevSys":"A"`) {
+		t.Fatalf("老行 sys 变化应补记 chg.sys/prevSys: %s", c)
+	}
+	if c := legacy[3].Content.(string); !strings.Contains(c, `"toolsAdd":["b"]`) || !strings.Contains(c, `"toolsDel":["a"]`) {
+		t.Fatalf("老行工具增删应补记 chg.toolsAdd/toolsDel: %s", c)
+	}
+	if c := legacy[0].Content.(string); !strings.Contains(c, `"first":true`) {
+		t.Fatalf("老行首条应补记 chg.first: %s", c)
+	}
+	legacy = []*StoredMessage{
+		row(1, "A", "", "a"),
+		row(2, "A", "", "a"),
+		row(3, "A", "", "a"),
+	}
+	slimRowsForUI(legacy, 1, len(legacy)) // 窗口 [1,3)：首条（与窗口前相同）保留全文，再后一条掏空
+	if legacy[1].Content == "{}" || legacy[2].Content != "{}" {
+		t.Fatalf("老行窗口首条保留全文: 2=%q 3=%q", legacy[1].Content, legacy[2].Content)
+	}
+}
+
+// ②-b 切窗只报切点前的条数（基线不再由服务端接力：快照形态由 chg 决定）。
+func TestSliceMsgWindowCount(t *testing.T) {
+	msgs := tailMsgs(10)
+	win, info := sliceMsgWindow(msgs, 9, len(msgs))
+	if info.Count != 8 { // 向前对齐到 seq=9 的回合起点（索引 8）
+		t.Fatalf("older.count 应为对齐后的切点: got %d", info.Count)
+	}
+	if win[0].Seq != 9 {
+		t.Fatalf("窗口应从回合起点开始: got seq %d", win[0].Seq)
 	}
 }
 
@@ -187,5 +244,68 @@ func TestHandleGetSessionTail(t *testing.T) {
 	older := body["older"].(map[string]any)
 	if older["count"].(float64) != 13 {
 		t.Fatalf("older.count 应为 13: got %v", older["count"])
+	}
+	if _, has := older["sys"]; has {
+		t.Fatal("older 不再携带 sys/tools 基线（快照形态由引擎记录的 chg 决定）")
+	}
+}
+
+// ⑥ HTTP 层：env 行附 render（与 buildContext 同一函数算出：首条整份、后续差分），
+// prompt 行按 chg 瘦身且全文行带回 chg。
+func TestHandleGetSessionEnvRender(t *testing.T) {
+	a, main := newDispatchTestApp(t)
+	app := func(m *StoredMessage) {
+		if err := a.Store.AppendRow(main.ID, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app(&StoredMessage{Message: TextMessage("user", "第一轮"), Kind: "chat"})
+	app(&StoredMessage{Message: Message{Content: `{"sys":"A","tools":[],"chg":{"first":true}}`}, Kind: "prompt"})
+	app(&StoredMessage{Message: TextMessage("system", "# 运行环境快照\n- 时间：10:00"), Kind: "env"})
+	app(&StoredMessage{Message: TextMessage("user", "第二轮"), Kind: "chat"})
+	app(&StoredMessage{Message: Message{Content: `{"sys":"A","tools":[],"chg":{}}`}, Kind: "prompt"})
+	app(&StoredMessage{Message: TextMessage("system", "# 运行环境快照\n- 时间：10:00\n- 权限：只读"), Kind: "env"})
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/api/sessions/"+main.ID, nil)
+	rec := httptest.NewRecorder()
+	a.apiMuxOf().ServeHTTP(rec, req)
+	var body struct {
+		Messages []struct {
+			Kind    string `json:"kind"`
+			Content string `json:"content"`
+			Render  *struct {
+				Mode string `json:"mode"`
+				Text string `json:"text"`
+			} `json:"render"`
+		} `json:"messages"`
+	}
+	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &body) != nil {
+		t.Fatalf("应 200 且可解析: %d %s", rec.Code, rec.Body.String())
+	}
+	var prompts, envs int
+	for _, m := range body.Messages {
+		switch m.Kind {
+		case "prompt":
+			prompts++
+			if prompts == 1 && (m.Content == "{}" || !strings.Contains(m.Content, `"first":true`)) {
+				t.Fatalf("首条快照应全文且带 chg.first: %s", m.Content)
+			}
+			if prompts == 2 && m.Content != "{}" {
+				t.Fatalf("无变化快照应掏成空壳: %s", m.Content)
+			}
+		case "env":
+			envs++
+			if m.Render == nil {
+				t.Fatalf("env 行应附 render: %s", m.Content)
+			}
+			if envs == 1 && (m.Render.Mode != "full" || m.Render.Text != m.Content) {
+				t.Fatalf("首条 env 应整份渲染: %+v", m.Render)
+			}
+			if envs == 2 && (m.Render.Mode != "diff" || !strings.Contains(m.Render.Text, "- 权限：只读")) {
+				t.Fatalf("第二条 env 应差分渲染: %+v", m.Render)
+			}
+		}
+	}
+	if prompts != 2 || envs != 2 {
+		t.Fatalf("应下发 2 条 prompt 与 2 条 env: got %d/%d", prompts, envs)
 	}
 }

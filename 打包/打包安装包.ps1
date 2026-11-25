@@ -148,6 +148,20 @@ Copy-Item $SkillsSource (Join-Path $stage "技能") -Recurse -Force
 # （典型：释放内置 MCP 连接器 cua / windows-mcp 的任务），功能凭空缺一块。
 Remove-Item (Join-Path $stage "技能\.migrations.json") -Force -ErrorAction SilentlyContinue
 
+# 别的平台的便携运行时一律不进 Windows 包（mac 的 _runtime\macos 有 128 MB，
+# 装到 Windows 用户机器上纯属死重量）。平台隔离口径：_runtime 下按平台名分目录
+# （python=Windows、macos、linux、android*），打包时只留本平台的。
+$rtRoot = Join-Path $stage "技能\_runtime"
+if (Test-Path $rtRoot) {
+    foreach ($d in (Get-ChildItem $rtRoot -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -ne "python") {
+            $mb = [math]::Round(((Get-ChildItem $d.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB), 1)
+            Remove-Item $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host ("== 排除其他平台的运行时：技能\_runtime\{0}（{1} MB）" -f $d.Name, $mb)
+        }
+    }
+}
+
 # 技能\_runtime 按发行白名单收敛：开发机上跑用户技能时 pip 装进共享运行时的
 # 第三方包（实测 AI 剪视频技能带来 nvidia/ctranslate2/faster-whisper 等 2.5 GB）
 # 绝不能随包发给客户——用户技能的依赖由对方机器装技能时自己装配。

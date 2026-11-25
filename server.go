@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"embed"
 	"encoding/base64"
@@ -108,16 +107,15 @@ type App struct {
 	browserMu           sync.Mutex
 	browsersEmbedded    map[string]*BrowserHost  // 无头 chromedp 宿主：网页形态的内嵌目标，按会话隔离（""=共享；browser_host.go，惰性创建）
 	browsersHeaded      map[string]*BrowserHost  // 有头独立窗口宿主：按会话隔离（""=共享；browser_host.go，惰性创建）
-	nativePanel         browserTarget            // Electron 壳的右栏 <webview> 面板（单例，browser_panel_electron.go）；原生桌面壳/网页形态为 nil
 	browserActive       map[string]browserTarget // 工具作用目标：每会话最近一次 browser_open 选定的实例（键=browserProfileKey）
 	browserUserClosedAt map[string]time.Time     // 用户在右栏 ✕ 关闭浏览器页面的时刻，按会话记账（键=browserProfileKey，browserMu 保护）：browser_* 报「未在运行」时据此区分为用户主动关闭（非崩溃）；browserFor 重新打开时清零
 
-	// 原生桌面壳（desktop_windows.go）的会话面板集合：右栏浏览器每个会话
+	// 原生桌面壳的会话面板集合：右栏浏览器每个会话
 	// 一个独立 WebView2 实例与 profile（登录态/页面互不串台，与有头独立
 	// 窗口的会话隔离同款约定）。panelDispatch/panelMainWnd 是当前前端窗口
 	// 的 UI 线程投递与 HWND（每轮前端热重启时整体换新）；panelVisible 记
 	// 当前显示中的面板键——同一时刻只显示一个会话的面板，其余收屏外。
-	// 非桌面形态（网页/Electron）这些字段全为零值，不参与路由。
+	// 非桌面形态（网页/远程）这些字段全为零值，不参与路由。
 	panelMu       sync.Mutex
 	panelDispatch func(f func())
 	panelMainWnd  uintptr
@@ -238,6 +236,16 @@ func NewApp(cfg *Config, cfgPath, webDir string) (*App, error) {
 	// 演示记录器随录随转：把语音组件的本地识别 worker 接给录制器（voiceasr.go；
 	// 组件停用时调用报错、优雅降级为纯录音）
 	recorderASR = a.transcribeWavBytes
+	// 停录后后台识别收尾（停录不等识别）：在途段转完后重建 INDEX.md（把字幕并进
+	// 对照表）并广播 demo_record_transcribed——前端据此把输入框上方材料卡的
+	// 「语音转写中」换成「字幕 n 段」，通知正文按最终实况重生成
+	recorderASRDone = func(stats *recorderStats, cues int) {
+		final := *stats
+		final.ASRPending, final.Cues = false, cues
+		_ = buildRecorderIndex(&final)
+		a.broadcast(Event{Type: "demo_record_transcribed", Output: filepath.ToSlash(stats.Dir),
+			Data: map[string]any{"cues": cues, "note": demoRecordStopNote(&final)}})
+	}
 	// 文件快照保留策略：按天超龄清理 + 按会话限量驱逐（见 snapshot.go）
 	go a.snapshotJanitor()
 	// 会话浏览器 profile 的按天回收（见 browser_cleanup.go）：启动先跑一轮，之后每天
@@ -566,9 +574,6 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	// 右栏 Markdown 渲染页（mdview.go）：复用 md-viewer 的渲染网页，路径形态的
 	// 地址让 md 里的相对图片/链接天然解析到同一路由（用户手势链路，AI 调不到）
 	mux.HandleFunc("GET /api/md/{sid}/{path...}", a.handleMDView)
-	// Electron 壳面板桥的导航回报（panel-bridge.js 在 did-navigate 推送）：
-	// 更新内嵌目标状态并广播 browser_nav（旧壳由 onNavCompleted 触发同一事件）
-	mux.HandleFunc("POST /api/browser/electron-report", a.handleBrowserElectronReport)
 	// 右侧栏截图（panelshot_windows.go）：panel_screenshot 工具注入主界面的
 	// 探针 JS 把右栏矩形回传到这里
 	mux.HandleFunc("POST /api/shell/panel-view", a.handleShellPanelView)
@@ -904,7 +909,8 @@ func searchScopeWhere(r *http.Request, pfx string) (string, []any) {
 	return cond, args
 }
 
-// handleSearchTitle 按标题逐字搜索工作任务。
+// handleSearchTitle 按标题逐字搜索工作任务。走只读池 + QueryContext：与内容
+// 搜索真正并行（不被秒级扫描堵在后面），用户改词即中断。
 func (a *App) handleSearchTitle(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -912,13 +918,13 @@ func (a *App) handleSearchTitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scope, scopeArgs := searchScopeWhere(r, "")
-	rows, err := a.Store.db.Query(
+	rows, err := a.Store.reader().QueryContext(r.Context(),
 		`SELECT id, title, updated_at FROM sessions
 		 WHERE `+searchableBaseSQL("")+` AND `+scope+` AND title LIKE ? ESCAPE '\'
 		 ORDER BY updated_at DESC LIMIT 50`,
 		append(scopeArgs, likePattern(q))...)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		searchErr(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -930,12 +936,18 @@ func (a *App) handleSearchTitle(w http.ResponseWriter, r *http.Request) {
 		}
 		hits = append(hits, map[string]any{"sessionId": id, "title": title, "updatedAt": updated})
 	}
+	if err := rows.Err(); err != nil {
+		searchErr(w, r, err)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hits": hits})
 }
 
 // handleSearchContent 按聊天记录逐字搜索：只搜用户消息与模型最终输出
 // （无工具调用的 assistant 消息），忽略思考（本就不入库）、工具调用与
 // 系统注入行。每条命中返回定位用 seq 与命中点附近的片段。
+// 全表 LIKE 是秒级扫描：走只读池，不占主连接（拼装/写入照常）；带请求 ctx，
+// 用户改词即中断，不再让作废的扫描排在队列里。
 func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -943,7 +955,7 @@ func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	scope, scopeArgs := searchScopeWhere(r, "s.")
-	rows, err := a.Store.db.Query(
+	rows, err := a.Store.reader().QueryContext(r.Context(),
 		`SELECT m.session_id, s.title, m.seq, m.role, m.content, m.created_at
 		 FROM messages m JOIN sessions s ON s.id = m.session_id
 		 WHERE `+searchableBaseSQL("s.")+` AND `+scope+`
@@ -954,7 +966,7 @@ func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 		 ORDER BY s.updated_at DESC, m.seq ASC LIMIT 200`,
 		append(scopeArgs, likePattern(q))...)
 	if err != nil {
-		writeErr(w, 500, err.Error())
+		searchErr(w, r, err)
 		return
 	}
 	defer rows.Close()
@@ -970,7 +982,21 @@ func (a *App) handleSearchContent(w http.ResponseWriter, r *http.Request) {
 			"role": role, "snippet": searchSnippet(content, q), "createdAt": created,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		searchErr(w, r, err)
+		return
+	}
 	writeJSON(w, 200, map[string]any{"hits": hits})
+}
+
+// searchErr 收口两路搜索的出错路径：请求已被用户作废（改词、关搜索时前端
+// abort 断连，r.Context() 随之取消）就直接结束，不回包不报错——驱动收到取消会
+// 立刻中断正在跑的全表扫描；其他错误照常 500。
+func searchErr(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil {
+		return
+	}
+	writeErr(w, 500, err.Error())
 }
 
 // searchSnippet 截取首个命中点前后各约 40 字的片段（前端负责高亮）。
@@ -1790,16 +1816,17 @@ func (a *App) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 演示记录器端点（用户直控：输入框旁的录制按钮，见 recorder.go） ----------
 
-// demoRecordBody 起录/停录请求体：session 可选——在会话里点按钮时带上（停录后
-// 【演示记录】通知落进该会话）；首页（还没开会话）录制时不带，材料照常落全局
-// 默认工作区，建会话时由清单通知兜底。workspace 仅首页起录的兜底路径用。
+// demoRecordBody 起录/停录请求体：session 可选——在会话里点按钮时带上（材料落进
+// 该会话的工作区，停录广播也标上会话）；首页（还没开会话）录制时不带，材料照常
+// 落全局默认工作区，建会话时由清单通知兜底。workspace 仅首页起录的兜底路径用。
 type demoRecordBody struct {
 	Session   string `json:"session"`
 	Workspace string `json:"workspace"`
 }
 
-// demoRecordSession 解析可选的 session 参数并做守卫（存在、本地、创建技能模式）；
-// 没带 session 时返回 (nil, nil) 表示首页起录。
+// demoRecordSession 解析可选的 session 参数并做守卫（存在、本地）；没带 session 时
+// 返回 (nil, nil) 表示首页起录。任何模式的本地会话都可录（创建技能专用按钮与其余
+// 模式的录制胶囊走同一端点），不再限定创建技能模式。
 func (a *App) demoRecordSession(id string) (*SessionMeta, error) {
 	if id == "" {
 		return nil, nil
@@ -1810,9 +1837,6 @@ func (a *App) demoRecordSession(id string) (*SessionMeta, error) {
 	}
 	if m.Remote != nil {
 		return nil, fmt.Errorf("演示记录器仅支持本地会话（当前挂载的是 SSH 远程工作区）")
-	}
-	if m.Mode != "skill-create" {
-		return nil, fmt.Errorf("演示录制按钮只在「创建技能」模式的会话里可用")
 	}
 	return m, nil
 }
@@ -1854,9 +1878,12 @@ func (a *App) handleDemoRecordStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": 1, "dir": filepath.ToSlash(dir)})
 }
 
-// handleDemoRecordStop 停录并收录材料（停钩子、存音频、生成 INDEX.md）；带
-// session 时向该会话追加【演示记录】系统通知（同文件上传通知机制），模型下一轮
-// 即可 read INDEX.md 开始分析。
+// handleDemoRecordStop 停录并收录材料（停钩子、停采集、写 audio.wav，**不等语音
+// 识别**——在途段后台转完再重建 INDEX.md 并广播 demo_record_transcribed），把
+// 【演示记录】通知正文随响应返回：前端把材料作为一张卡挂进输入框上方的附件区，
+// 随用户下一条消息的「用户附件：」块发给模型（首页没开会话时录的也走得通；
+// 旧版往会话里落一行注记——折叠成一行没人看见，首页更是无处可落）。
+// asrPending=true 时通知里字幕写「后台识别中」，材料卡副标带「语音转写中」。
 func (a *App) handleDemoRecordStop(w http.ResponseWriter, r *http.Request) {
 	var body demoRecordBody
 	_ = json.NewDecoder(r.Body).Decode(&body)
@@ -1870,13 +1897,10 @@ func (a *App) handleDemoRecordStop(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, err.Error())
 		return
 	}
+	// INDEX.md 先按当前材料生成一份（停录不等识别：在途字幕段还没有），后台识别
+	// 收尾时再重建一次把字幕并进去（recorderASRDone）
 	if err := buildRecorderIndex(stats); err != nil {
 		log.Printf("演示记录 INDEX.md 生成失败：%v（%s 的 events.jsonl 仍可直接读）", err, stats.Dir)
-	}
-	if sess != nil {
-		note := demoRecordStopNote(stats)
-		_ = a.Store.AppendRow(sess.ID, &StoredMessage{Message: TextMessage("user", note), Kind: kindReport, Origin: "demo", CreatedAt: now()})
-		a.broadcast(Event{Type: "session_updated", SessionID: sess.ID})
 	}
 	ev := Event{Type: "demo_record_stopped", Output: filepath.ToSlash(stats.Dir)}
 	if sess != nil {
@@ -1884,7 +1908,9 @@ func (a *App) handleDemoRecordStop(w http.ResponseWriter, r *http.Request) {
 	}
 	a.broadcast(ev)
 	writeJSON(w, 200, map[string]any{"ok": 1, "dir": filepath.ToSlash(stats.Dir),
-		"ms": stats.MS, "events": stats.Events, "shots": stats.Shots, "audio": stats.AudioOK})
+		"ms": stats.MS, "events": stats.Events, "shots": stats.Shots, "audio": stats.AudioOK,
+		"asrPending": stats.ASRPending, "cues": stats.Cues,
+		"note": demoRecordStopNote(stats)})
 }
 
 // handleDemoRecordStatus 录制按钮的初始态/恢复态查询：supported 决定按钮是否
@@ -1977,52 +2003,83 @@ func (a *App) sessionFromPath(w http.ResponseWriter, r *http.Request) *SessionMe
 	return m
 }
 
-// promptBrief 下发瘦身的比对基元：prompt 快照里只取与缓存相关的 sys/tools。
-// env 逐轮必变（时间/环境），且其变化由独立的 env 行驱动前端展示，比较时忽略。
-type promptBrief struct {
-	Sys   string          `json:"sys"`
-	Tools json.RawMessage `json:"tools"`
-}
-
-// trimMessagesForUI 对下发前端的消息副本做瘦身（只改本次响应的内存对象，库内原样）：
+// slimRowsForUI 对下发前端的消息副本做瘦身（只改本次响应的内存对象，库内原样）：
 //   - request/audit 是审计工件：前端不展示（导出走 /api/sessions/{id}/export
 //     服务端直读），正文不下发——与 checkpoint 的 Before 不下发同一思路；
-//   - prompt 拼装快照与上一条的 sys+tools 相同 → 只发空壳 {}，前端跳过空壳、
-//     只见变化行（规范 §4「只讲变化」的对应瘦身）；有变化才完整下发。
+//   - prompt 拼装快照「相对上一条无变化」→ 只发空壳 {}，前端跳过空壳、只见
+//     变化行（规范 §4「只讲变化」）；有变化才完整下发（sys/tools 全文 + 引擎
+//     记录的 chg）。变化与否**不在这里比对**——上下文引擎开轮时已算好记在行里
+//     （promptChange，见 ContextEngine 契约 6），这里只按记录决定形态；老行
+//     （chg 字段出现前落的）按 sys/tools 与上一条逐字比较补判，仅作历史库兼容。
 //
-// 比对基于原始正文（上一条 prompt 的原始 sys/tools），空壳只是替换下发副本、
-// 不参与比较，否则「A→A→B」会因中间行被掏空而误判为变化。
-func trimMessagesForUI(msgs []*StoredMessage) {
-	var last *promptBrief
-	for _, m := range msgs {
+// [lo, hi) 是本次下发的窗口（不分批即全量）：窗口内第一条完整快照保留全文——
+// 不论它相对上一条变没变——前端据此交代「系统提示词已拼装 / 工具定义」的首见
+// 形态；之后的无变化行才掏空。实时推送（OpenRound）与这里同一口径：无变化只推
+// 空壳。比对基于原始正文（上一条 prompt 的原始 sys/tools），空壳不参与比较。
+func slimRowsForUI(all []*StoredMessage, lo, hi int) {
+	var last *promptRec
+	sawFull := false
+	for i := 0; i < hi && i < len(all); i++ {
+		m := all[i]
 		switch m.Kind {
 		case kindRequest, kindAudit:
 			m.Content = ""
 		case kindPrompt:
-			var cur promptBrief
+			var cur promptRec
 			if json.Unmarshal([]byte(m.Text()), &cur) != nil {
 				continue // 坏行原样下发（前端同样忽略坏行）
 			}
-			if last != nil && cur.Sys == last.Sys && bytes.Equal(cur.Tools, last.Tools) {
+			legacy := cur.Chg == nil
+			if legacy {
+				// 老行：按旧口径（与上一条 sys/tools 逐字比较）补判，并把结果补记进
+				// 响应副本——前端拿到的形态与新行一致，不必再分辨新老行
+				chg := promptChange{First: last == nil}
+				if last != nil {
+					if last.Sys != cur.Sys {
+						chg.Sys, chg.PrevSys = true, last.Sys
+					}
+					chg.ToolsAdd, chg.ToolsDel = toolNameDiff(last.Tools, cur.Tools)
+				}
+				cur.Chg = &chg
+			}
+			unchanged := !cur.Chg.changed()
+			cur.Tools = append([]ToolDef(nil), cur.Tools...) // 自持副本，别引用解码缓冲
+			last = &cur
+			if i < lo {
+				continue // 窗口之前：只作老行比较的基线，不在本次响应里
+			}
+			if unchanged && sawFull {
 				m.Content = "{}"
 				continue
 			}
-			cur.Tools = append(json.RawMessage(nil), cur.Tools...) // 自持副本，别引用解码缓冲
-			last = &cur
+			sawFull = true
+			if legacy {
+				if b, err := json.Marshal(cur); err == nil {
+					m.Content = string(b)
+				}
+			}
 		}
 	}
 }
 
-// olderInfo 是分批加载时「切点之前还有多少没下发」+ 前端 groupTurns 的接力
-// 基线：sys/tools 取切点前最后一条有效 prompt 快照（已被 trim 掏成 {} 的空壳
-// 跳过——它的基线本就是更早那条）——窗口内首条真变更的 prompt 据此显示
-// 「变更行」而非「首见」形态；envBoundary 是压缩摘要覆盖边界（模型已看不到
-// 的 env 快照，前端同样不显示，与切点无关、按全量取最大值）。
+// attachEnvRenders 给一批行里的 env 行附上 render（模型实际收到的消息文本与形态，
+// 见 context.go renderEnvRows）：renders 由会话全量原始行算出，rows 里不在其中
+// 的 env 行不附——那条模型看不到（摘要已覆盖 / 规则压缩整行省略），前端同样不显示。
+func attachEnvRenders(rows []*StoredMessage, renders map[int64]envRender) {
+	for _, m := range rows {
+		if m.Kind != kindEnv {
+			continue
+		}
+		if r, ok := renders[m.Seq]; ok {
+			r := r
+			m.Render = &r
+		}
+	}
+}
+
+// olderInfo 是分批加载时「切点之前还有多少没下发」。
 type olderInfo struct {
-	Count       int             `json:"count"`
-	Sys         string          `json:"sys,omitempty"`
-	Tools       json.RawMessage `json:"tools,omitempty"`
-	EnvBoundary int64           `json:"envBoundary,omitempty"`
+	Count int `json:"count"`
 }
 
 // isTurnStartMsg 判断某行是否回合起点（真实用户发言 / AI 发出的用户消息），
@@ -2043,7 +2100,7 @@ func isTurnStartMsg(m *StoredMessage) bool {
 	return !strings.HasPrefix(txt, "【") && !strings.HasPrefix(txt, "<goal_round>")
 }
 
-// sliceMsgWindow 在全量消息（已 trim、已并入摘要行）上切出 [lo,hi) 的分批加载
+// sliceMsgWindow 在全量消息（已并入摘要行）上切出 [lo,hi) 的分批加载
 // 窗口：lo 先按条数定，再**向前**对齐到回合起点（窗口扩大到含完整回合——若向
 // 右缩，起点之前的残段会被后续批次的对齐再次跳过，永远不被渲染）；切点停在
 // inherit 标记行之后时把标记行并入本批（继承段与其克隆历史不拆开）。
@@ -2067,21 +2124,6 @@ func sliceMsgWindow(msgs []*StoredMessage, lo, hi int) ([]*StoredMessage, olderI
 		lo = 0
 	}
 	info := olderInfo{Count: lo}
-	for i := 0; i < lo; i++ {
-		if msgs[i].Kind != kindPrompt || msgs[i].Text() == "{}" {
-			continue
-		}
-		var b promptBrief
-		if json.Unmarshal([]byte(msgs[i].Text()), &b) == nil {
-			info.Sys = b.Sys
-			info.Tools = append(json.RawMessage(nil), b.Tools...) // 自持副本（同 trim 的习惯）
-		}
-	}
-	for _, m := range msgs {
-		if m.Kind == "summary" && m.CoversUpTo > info.EnvBoundary {
-			info.EnvBoundary = m.CoversUpTo
-		}
-	}
 	return msgs[lo:hi], info
 }
 
@@ -2130,7 +2172,12 @@ func (a *App) handleSessionInherit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	trimMessagesForUI(rows) // 下发瘦身：库内原样，只削响应副本（同会话详情）
+	slimRowsForUI(rows, 0, len(rows)) // 下发瘦身：库内原样，只削响应副本（同会话详情）
+	// 继承段里的 env 行同样附 render：按父会话自身的快照序列渲染（历史视角——
+	// 这些行当时就是按那个序列发给父对话模型的）
+	if parentRaw, perr := a.Store.RawMessagesAll(mark.Parent); perr == nil {
+		attachEnvRenders(rows, renderEnvRows(parentRaw, 0))
+	}
 	title := mark.Title
 	if title == "" {
 		if p, perr := a.Store.Get(mark.Parent); perr == nil {
@@ -2153,31 +2200,44 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	trimMessagesForUI(msgs) // 下发瘦身：库内原样，只削响应副本（见函数注释）
 	// 压缩摘要行并入下发副本（按 seq 归位到发生位置）：前端把每次模型摘要压缩
 	// 显示为一枚常显卡片（覆盖到哪一条 + 点开看完整摘要）。MessagesWithSeq 的
 	// 过滤口径不动（历史读取工具等仍拿不到摘要行），只补界面这一份。
-	if sums, serr := a.Store.SummariesOf(m.ID); serr == nil && len(sums) > 0 {
+	sums, serr := a.Store.SummariesOf(m.ID)
+	if serr == nil && len(sums) > 0 {
 		msgs = append(msgs, sums...)
 		sort.Slice(msgs, func(i, j int) bool { return msgs[i].Seq < msgs[j].Seq })
 	}
-	trimMessagesForUI(msgs) // 下发瘦身：库内原样，只削响应副本（见函数注释）
+	// 环境快照行的 render（模型实际收到的消息文本与形态）按组装口径从全量行
+	// 算出（与 buildContext 同一函数，边界同为生效摘要的覆盖边界），窗口内各
+	// env 行按 seq 附上；prompt 快照行的瘦身见 slimRowsForUI
+	boundary := int64(0)
+	for _, s := range activeSummaries(msgs) {
+		if s.CoversUpTo > boundary {
+			boundary = s.CoversUpTo
+		}
+	}
+	envRenders := renderEnvRows(msgs, boundary)
+	all := msgs
 	// 分批加载（超长对话）：不带参数 = 全量下发（旧调用方零影响）。带 tail /
 	// before_seq 时切出最近一批（回合对齐，见 sliceMsgWindow），older 携带切点前
-	// 剩余条数与分组基线——前端据 older 显示「上面还有 N 条」并按需再取上一批
+	// 剩余条数——前端据 older 显示「上面还有 N 条」并按需再取上一批
 	var olderPtr *olderInfo
+	hi := len(all)
 	if n, terr := strconv.Atoi(r.URL.Query().Get("tail")); terr == nil && n > 0 {
-		win, info := sliceMsgWindow(msgs, len(msgs)-n, len(msgs))
+		win, info := sliceMsgWindow(all, len(all)-n, len(all))
 		msgs, olderPtr = win, &info
 	} else if bs, berr := strconv.ParseInt(r.URL.Query().Get("before_seq"), 10, 64); berr == nil && bs > 0 {
 		lim := 0
 		if v, lerr := strconv.Atoi(r.URL.Query().Get("limit")); lerr == nil && v > 0 {
 			lim = v
 		}
-		hi := sort.Search(len(msgs), func(i int) bool { return msgs[i].Seq >= bs })
-		win, info := sliceMsgWindow(msgs, hi-lim, hi)
+		hi = sort.Search(len(all), func(i int) bool { return all[i].Seq >= bs })
+		win, info := sliceMsgWindow(all, hi-lim, hi)
 		msgs, olderPtr = win, &info
 	}
+	slimRowsForUI(all, hi-len(msgs), hi) // 下发瘦身：库内原样，只削响应副本（见函数注释）
+	attachEnvRenders(msgs, envRenders)
 	// running 与 pending 以内存运行时为准：刷新页面后据此自动接上执行流、
 	// 恢复「已插话/已排队」的显示，不依赖刷新前的页面状态
 	cps, err := a.Store.CheckpointsAfter(m.ID, 0) // seq 从 1 起，>0 即全部

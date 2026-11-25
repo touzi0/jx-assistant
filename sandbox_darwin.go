@@ -154,8 +154,13 @@ func startConfinedDarwinAsync(ctx context.Context, r sandboxRun, w io.Writer) (f
 	return func() bool { <-waitDone; return true }, nil
 }
 
-// darwinDenialSigs Seatbelt 沙箱的拒绝方言：EPERM 在 macOS shell 里报
-// "Operation not permitted"（Landlock 侧是 EACCES 的 "Permission denied"）。
-// 其余沿用 posix 列表；收窄原则同 winDenialSigs 的注：不收泛 Unix 错误
-// 字样，避免普通程序错误被标成「策略拒绝」把模型引向申请升级。
-var darwinDenialSigs = append([]string{"operation not permitted"}, posixDenialSigs...)
+// darwinDenialSigs Seatbelt 沙箱的拒绝方言。刻意**不含** "permission
+// denied"：Seatbelt 的策略拒绝在 shell 里报 EPERM（"Operation not
+// permitted"）；而 "Permission denied"（EACCES）来自目标文件自身——执行
+// 格式不符（如对 Windows .exe 执行）或没有执行位——提权救不了它，标成
+// 「策略拒绝」会把模型引向申请一次注定无效的升级（实测踩过：内置
+// python.exe 在 mac 上 exit 126 被误标）。收窄原则同 winDenialSigs 的注。
+var darwinDenialSigs = []string{
+	"operation not permitted", "read-only file system",
+	"操作不被允许", "只读文件系统",
+}
