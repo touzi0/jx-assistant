@@ -352,7 +352,7 @@ func adbShellWithConn(conn net.Conn, command string, timeout time.Duration) (str
 	out := buf.String()
 	note := ""
 	if len(out) > 128*1024 {
-		out = out[:128*1024]
+		out = clipUTF8Tail(out, 128*1024) // 按字节切会劈开多字节字符（走同一套边界对齐）
 		note = "\n[输出过长已截断]"
 	}
 	if exit > 0 {

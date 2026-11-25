@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 )
@@ -382,3 +383,156 @@ func TestWriteWarnsWhenOverwritingGBK(t *testing.T) {
 		t.Fatalf("write 后应为 UTF-8，实得 %v", got)
 	}
 }
+
+// ---------- H1：截断的字符边界（2026-11-21 修复的回归测试）----------
+//
+// 背景：缓冲超限时从头部按字节丢、或解码前按字节切尾，都可能落在多字节字符中间。
+// utf8.Valid 因此失败 → 整段被当成 GBK 解 → **整段乱码**（0x80-0xBF 恰在 GBK 第二
+// 字节的合法区间，结构校验还会通过，所以不会报错、只会烂）。
+
+func TestAlignHeadToCharBoundary(t *testing.T) {
+	// UTF-8：丢掉 1 字节后落在"中"的续字节上 → 必须再多丢 2 字节，让剩余是合法 UTF-8
+	utf8Buf := []byte("中文中文中文")
+	got := alignHeadToCharBoundary(utf8Buf, 1)
+	if got == 1 {
+		t.Fatalf("落在续字节上应当对齐，实得 %d", got)
+	}
+	if !utf8Valid(utf8Buf[got:]) {
+		t.Fatalf("对齐后应为合法 UTF-8，实得起点 %d", got)
+	}
+	if got > 1+maxRuneBytes {
+		t.Fatalf("对齐不该多丢超过 %d 字节，实得多丢 %d", maxRuneBytes, got-1)
+	}
+
+	// 已经是字符边界：原样返回（不能白丢字节）
+	if got := alignHeadToCharBoundary(utf8Buf, 3); got != 3 {
+		t.Fatalf("已是边界应原样返回，实得 %d", got)
+	}
+
+	// GBK 流：跳续字节也成不了合法 UTF-8 → 必须原样返回，绝不破坏既有行为
+	gbk := gbkBytes(t, "中文测试中文测试中文测试")
+	if got := alignHeadToCharBoundary(gbk, 3); got != 3 {
+		t.Fatalf("GBK 流不该被动过，实得 %d", got)
+	}
+}
+
+func TestTrimIncompleteUTF8Tail(t *testing.T) {
+	full := []byte("中文测试")
+	for cut := 1; cut <= 3; cut++ { // 1~3 字节的残缺尾巴都要能收口
+		partial := full[:len(full)-cut]
+		got := trimIncompleteUTF8Tail(partial)
+		if !utf8Valid(got) {
+			t.Fatalf("切掉 %d 字节后应收口成合法 UTF-8", cut)
+		}
+		if len(partial)-len(got) > maxRuneBytes {
+			t.Fatalf("收口不该多丢超过 %d 字节，实得 %d", maxRuneBytes, len(partial)-len(got))
+		}
+	}
+	if got := trimIncompleteUTF8Tail(full); len(got) != len(full) {
+		t.Fatalf("本来就合法，不该被动：%d → %d", len(full), len(got))
+	}
+	// GBK 流：本来就是"非法 UTF-8"，但怎么切尾都成不了合法 UTF-8 → 必须原样保留
+	gbk := gbkBytes(t, "中文测试中文测试")
+	if got := trimIncompleteUTF8Tail(gbk); string(got) != string(gbk) {
+		t.Fatal("GBK 流不该被切尾（切了反而制造新乱码）")
+	}
+}
+
+func TestClipUTF8HeadTail(t *testing.T) {
+	s := "中文中文中文" // 每字 3 字节，共 18
+	for n := 1; n < len(s); n++ {
+		if got := clipUTF8Tail(s, n); !utf8Valid([]byte(got)) || len(got) > n {
+			t.Fatalf("clipUTF8Tail(%d) 不合格: %q", n, got)
+		}
+		if got := clipUTF8Head(s, n); !utf8Valid([]byte(got)) || len(got) > n {
+			t.Fatalf("clipUTF8Head(%d) 不合格: %q", n, got)
+		}
+	}
+	if got := clipUTF8Head(s, len(s)); got != s {
+		t.Fatalf("不超过上限应原样返回，实得 %q", got)
+	}
+}
+
+// H1 的端到端回归：后台作业缓冲超限时丢头部，输出仍须解成正确中文。
+func TestJobBufferHeadTruncationKeepsText(t *testing.T) {
+	var b lockedBuffer
+	// 丢弃量必须落在字符中间（drop % 3 != 0），旧实现才会落在续字节上
+	payload := strings.Repeat("中", (jobBufMax/3)+1)
+	drop := len(payload) - jobBufMax
+	if drop <= 0 || drop%3 == 0 {
+		t.Fatalf("样本构造不合格：len=%d drop=%d", len(payload), drop)
+	}
+	// 机制（确定性）：错位起点不是合法 UTF-8 —— 这正是旧实现让整段落进 GB18030
+	// 分支的原因；往前对齐 1 字节后就合法了。
+	if utf8.Valid([]byte(payload[drop:])) || !utf8.Valid([]byte(payload[drop+1:])) {
+		t.Fatalf("样本应满足「错位起点非法、对齐起点合法」（drop=%d）", drop)
+	}
+	if _, err := b.Write([]byte(payload)); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	out := b.String()
+	if !utf8Valid([]byte(out)) || strings.Contains(out, "\uFFFD") {
+		t.Fatalf("截断后的输出必须是合法 UTF-8 且无替换符（旧实现会整段变乱码）:\n%q", out)
+	}
+	if strings.Contains(out, "涓") || strings.Contains(out, "锛") { // UTF-8 被当 GBK 解的典型误码字
+		t.Fatalf("出现 UTF-8→GBK 误码字，说明整段被当 GBK 解了:\n%q", out)
+	}
+	if !strings.Contains(out, "中") {
+		t.Fatalf("应保留中文内容，实得:\n%q", out)
+	}
+}
+
+// ---------- 第 2 条：输出解码的代码页映射与显式覆盖 ----------
+
+func TestConsoleCodePageDecoder(t *testing.T) {
+	for _, cp := range []uint32{936, 54936, 950, 932, 949, 866, 1252, 437} {
+		if consoleCodePageDecoder(cp) == nil {
+			t.Fatalf("代码页 %d 应当有解码器", cp)
+		}
+	}
+	if consoleCodePageDecoder(0) != nil || consoleCodePageDecoder(99999) != nil {
+		t.Fatal("未收录的代码页应返回 nil（走 GB18030 兜底）")
+	}
+}
+
+func TestOutputEncodingOverride(t *testing.T) {
+	t.Setenv("JX_OUTPUT_ENCODING", "")
+	if outputEncodingOverride() != nil {
+		t.Fatal("未设置时不应有覆盖")
+	}
+	t.Setenv("JX_OUTPUT_ENCODING", "随便写错的值")
+	if outputEncodingOverride() != nil {
+		t.Fatal("认不出的取值应按未设置处理（不能因为变量名拼错就改变默认行为）")
+	}
+	t.Setenv("JX_OUTPUT_ENCODING", "cp932")
+	if outputEncodingOverride() == nil {
+		t.Fatal("cp932 应当被识别")
+	}
+}
+
+func TestDecodeConsoleBytesOverrideAndDefault(t *testing.T) {
+	// 默认（未设置覆盖）：GBK 流仍按中文解出——锁住"中文环境行为不变"
+	t.Setenv("JX_OUTPUT_ENCODING", "")
+	gbk := gbkBytes(t, "中文输出")
+	if got := string(decodeConsoleBytes(gbk)); !strings.Contains(got, "中文输出") {
+		t.Fatalf("GBK 流默认应解出中文，实得 %q", got)
+	}
+	// 本来就是 UTF-8：不动
+	utf8In := []byte("中文输出")
+	if got := string(decodeConsoleBytes(utf8In)); got != string(utf8In) {
+		t.Fatalf("UTF-8 流应当原样返回，实得 %q", got)
+	}
+	// 显式覆盖成 cp932：日文流按日文解（这是第 2 条的新能力）
+	sjis := []byte{0x93, 0xFA, 0x96, 0x7B, 0x8C, 0xEA} // "日本語" 的 Shift_JIS
+	t.Setenv("JX_OUTPUT_ENCODING", "cp932")
+	if got := string(decodeConsoleBytes(sjis)); !strings.Contains(got, "日本語") {
+		t.Fatalf("覆盖为 cp932 后应解出日文，实得 %q", got)
+	}
+	// 覆盖值解不了这个流时，必须回落到常规路径而不是报错/给空
+	t.Setenv("JX_OUTPUT_ENCODING", "cp437")
+	if got := string(decodeConsoleBytes(gbk)); got == "" {
+		t.Fatal("覆盖值解不了时应回落常规路径，不能返回空")
+	}
+}
+
+func utf8Valid(b []byte) bool { return utf8.Valid(b) }

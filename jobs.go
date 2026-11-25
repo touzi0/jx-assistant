@@ -38,6 +38,11 @@ func (b *lockedBuffer) Write(p []byte) (int, error) {
 	b.buf.Write(p)
 	if b.buf.Len() > jobBufMax {
 		drop := b.buf.Len() - jobBufMax
+		// 丢头部字节必须对齐字符边界：落到 UTF-8 续字节上会让整个缓冲 utf8.Valid 失败，
+		// 进而被当成 GBK 整段解成乱码（H1，2026-11-21）。多丢最多 3 字节，换整段正确。
+		if aligned := alignHeadToCharBoundary(b.buf.Bytes(), drop); aligned > drop {
+			drop = aligned
+		}
 		b.buf.Next(drop)
 		b.drop += drop
 	}

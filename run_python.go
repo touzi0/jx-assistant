@@ -257,7 +257,7 @@ func (a *App) reportPythonJob(t *toolContext, j *jobRun, scriptPath, bridgeKey s
 	bridgeDone()
 	out := j.buf.String()
 	if len(out) > jobBufMax {
-		out = out[:jobBufMax]
+		out = clipUTF8Tail(out, jobBufMax) // 解码后切字符串也要对齐字符边界（H1）
 	}
 	text := fmt.Sprintf("【后台脚本回报】作业 %s 已结束（%s，运行 %s）。\n脚本：%s\n\n输出：\n%s\n"+
 		"（run_python 后台启动；job_output 可再查。脚本若派了 jx.dispatch 子任务，它们的回报在上面输出里或已单独转交。）",
@@ -280,7 +280,7 @@ func (a *App) reportPythonJob(t *toolContext, j *jobRun, scriptPath, bridgeKey s
 func (a *App) reportCommandJob(t *toolContext, j *jobRun, command, cwd string) {
 	out := j.buf.String()
 	if len(out) > jobBufMax {
-		out = out[len(out)-jobBufMax:] // 命令输出取末尾：报错与结论都在尾部
+		out = clipUTF8Head(out, jobBufMax) // 命令输出取末尾：报错与结论都在尾部（并保证不切在字符中间）
 	}
 	text := fmt.Sprintf("【后台命令回报】作业 %s 已结束（%s，运行 %s）。\n命令：%s\n工作目录：%s\n\n输出%s：\n%s\n"+
 		"（run_command 后台启动；job_output 可再查，job_list 看全部作业。）",

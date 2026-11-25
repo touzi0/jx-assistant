@@ -8,6 +8,10 @@ package main
 //      Dispatch 系统自带 COM（WScript.Shell）成功，且脚本能写工作区外
 //      探针文件（沙箱内必被拒，参照 TestRunPythonSandboxBlocksOutsideWrite）
 //      ——两证齐全才证明走的确实是 full 策略宿主路径，而非沙箱。
+//   ④ flexBool 解析矩阵——布尔与字符串 "true" 双形态等价（XML 参数形态的
+//      宿主字符串化）、null/空视为未带、不识别值报错；
+//   ⑤ 字符串形态链路验证——com="true" 与布尔同效触发 com 分支（借只读
+//      档拒绝做探针，秒回不依赖联网）。
 // ③ 只在宿主令牌环境跑：go test 进程若本身已在命令沙箱（受限令牌）里，
 // com=true 子进程继承的还是受限令牌，「宿主直跑」无从验证——探针法检测
 // 后跳过并说明出路。运行时/pywin32 未装配的环境同样自动跳过。
@@ -82,5 +86,53 @@ func TestRunPythonComHostRunDispatch(t *testing.T) { // ③
 	out, err := runPyCall(t, a, sess, map[string]any{"code": code, "name": "com_probe", "com": true, "timeout_sec": 120})
 	if err != nil || !strings.Contains(out, "com-ok:") {
 		t.Fatalf("com=true 宿主直跑 COM 失败: %v\n%s", err, out)
+	}
+}
+
+// ④ flexBool 解析矩阵：布尔与字符串双形态等价、null/空串视为未带、
+// 不识别的值报错（不静默当 false）。XML 参数形态（Claude 协议）的工具
+// 调用里 com 到引擎已是 "true" 字符串——宽容解析是 com 通道在该形态下
+// 可用的前提（2026-11-18 排查：直解 bool 报 cannot unmarshal string）。
+func TestRunPythonComFlexBoolParse(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+		ok   bool
+	}{
+		{`true`, true, true},
+		{`"true"`, true, true},
+		{`"TRUE"`, true, true},
+		{`1`, true, true},
+		{`"1"`, true, true},
+		{`false`, false, true},
+		{`"false"`, false, true},
+		{`""`, false, true},
+		{`null`, false, true},
+		{`"yes"`, false, false},
+	}
+	for _, c := range cases {
+		var b flexBool
+		err := json.Unmarshal([]byte(c.in), &b)
+		if !c.ok {
+			if err == nil {
+				t.Errorf("flexBool(%s) 应报错却解析成功", c.in)
+			}
+			continue
+		}
+		if err != nil || bool(b) != c.want {
+			t.Errorf("flexBool(%s) = %v (err=%v)，期望 %v", c.in, b, err, c.want)
+		}
+	}
+}
+
+// ⑤ 字符串形态的链路验证：com="true"（字符串）应与布尔 true 同效走进
+// com 分支——只读档拒绝发生在装配运行时之前，秒回且不依赖联网，正好
+// 当「解析结果 = true」的链路级探针。
+func TestRunPythonComStringTrueChannel(t *testing.T) {
+	a := newRunPyTestApp(t)
+	sess := &SessionMeta{ID: "testpycom03abcdef", Workspace: a.Cfg.Workspace, Permission: permReadOnly}
+	_, err := runPyCall(t, a, sess, map[string]any{"code": "print(1)", "com": "true"})
+	if err == nil || !strings.Contains(err.Error(), "全电脑只读") {
+		t.Fatalf(`com="true" 字符串形态应与布尔同效触发只读档拒绝, got: %v`, err)
 	}
 }

@@ -2311,7 +2311,8 @@ mark {
 /* 思考过程：统一走 .proc-row 过程行（见"回合折叠条与过程行"节），此处仅留旧类名兼容清理 */
 
 /* 模型菜单：模型行；思考档位 = 向右弹出的二级浮窗 #model-sub-pop（定位见 app-chat.js syncModelSubPop）。
-   交互：桌面悬停整行即浮出档位、点行=选中并收起；点行尾箭头(.lv-hit)手动开合档位（触屏的主入口） */
+   交互：桌面悬停整行即浮出档位、点行=选中并收起；点行尾小按钮(.lv-hit)=重新弹出该行档位面板
+   （手机端没有悬停，这是改思考深度的入口；桌面点它只是把同一块面板再弹一次） */
 .model-item span:not(.lv-hit) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } /* 排除箭头命中区：它也是 span，被 flex:1 拉宽会让半行都变成箭头 */
 .model-item .caret { width: 12px; height: 12px; color: var(--text-3); flex-shrink: 0; }
 .model-item .lv-hit { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; padding: 8px; margin: -8px; } /* 箭头命中区约 28px 见方（触屏好点）；负外边距抵净内边距，不撑宽菜单 */

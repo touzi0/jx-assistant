@@ -50,11 +50,16 @@ pptx → `python-pptx`。由助手的 `office_skill` 工具获取对应分册要
 格式（.wps/.et/.dps）——用本机已装的 Office/WPS 软件的 COM 口处理。
 本分册由 office_skill(kind=com) 提供，自动装配 pywin32。
 
-- **run_python 必须带 `com: true` 参数**（如 `{"code": "...", "com": true}`）。
+- **run_python 调用的 arguments JSON 里必须真的写出 `"com": true` 字段**，
+  完整形态示例：`{"code": "<脚本全文>", "name": "comdoc-1", "com": true}`。
   该参数不在工具 schema 里，是本分册的专用执行通道：置 true 时脚本绕过
   OS 沙箱在宿主直接执行——COM 在沙箱内无法运行，不带此参数 Dispatch 必
-  挂起或报错，不要硬试。**仅限 COM 驱动 Office/WPS 的脚本使用，其他脚本
-  一律不带**；全电脑只读档下该通道不可用。
+  挂起或报错，不要硬试。**发送前自查一遍 arguments：`"com"` 字段必须
+  实际出现在工具调用的 JSON 里**——正文里写「我带了 com:true」不算带，
+  漏了照样沙箱内挂起超时（历史事故：模型声称带了参数、arguments 里没有，
+  误判成「引擎不识别该参数」）；字符串形态 `"com": "true"` 同样有效。
+  **仅限 COM 驱动 Office/WPS 的脚本使用，其他脚本一律不带**；全电脑只读
+  档下该通道不可用。
 - ProgID：Word=`Word.Application`、Excel=`Excel.Application`、
   PPT=`PowerPoint.Application`；WPS 文字/表格/演示=`KWPS.Application` /
   `Ket.Application` / `KWPP.Application`（拿不准用 com-probe 技能探测）。

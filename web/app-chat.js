@@ -8045,24 +8045,18 @@ function renderModelPop(view) {
         if ($('model-sub-pop').classList.contains('hidden')) syncModelSubPop(popView);
         return;
       }
-      const hasLv = !!modelLevelsOf(key).length;
-      modelPopExpand = hasLv ? key : '';
-      pop.querySelectorAll('.model-item.exp').forEach((x) => x.classList.remove('exp'));
-      if (hasLv) b.classList.add('exp');
+      expandModelSub(modelLevelsOf(key).length ? key : ''); // 无档位的行：收起浮窗
       syncModelSubPop(popView);
     };
     b.onclick = async (e) => {
-      // 点行尾箭头 = 只开合该行的思考档位浮窗，不选中、不收菜单。
-      // 触屏没有 hover，箭头就是开合开关；桌面悬停已能展开，箭头点开可以、
-      // 点收不行——收下之后指针还停在行上，合成悬停会把它立刻再弹出来
+      // 点行尾小按钮 = 重新弹出该行的思考档位面板，不选中、不收菜单。
+      // 触屏没有悬停，这是手机端改思考深度的唯一入口；桌面悬停本来就展开着，
+      // 点它只是把同一块面板再弹一次，没有第二种状态。
+      // 这里只改标记与行高亮、不重渲模型列表：重渲会把这次点击的目标元素从文档
+      // 里摘掉，外层「点面板外收起」于是认为点在面板外面，把刚弹出的面板立刻收掉
+      // ——手机上的表现就是点一下闪没（桌面靠悬停撑着才没暴露）。
       if (e.target.closest('.lv-hit') && modelLevelsOf(key).length) {
-        if (hoverFineMq && hoverFineMq.matches) {
-          if (modelPopExpand === key) return;
-          modelPopExpand = key;
-        } else {
-          modelPopExpand = modelPopExpand === key ? '' : key;
-        }
-        renderModelPop(popView);
+        expandModelSub(key);
         syncModelSubPop(popView);
         return;
       }
@@ -8076,8 +8070,18 @@ function renderModelPop(view) {
   requestAnimationFrame(() => syncModelSubPop(view));
 }
 
+// 把思考档位浮窗指向 key 那一行（key 为空＝收起）。只就地更新展开标记与行高亮，
+// 不重渲模型列表——重渲会让触发这次展开的点击目标脱离文档，见 renderModelPop 的
+// 行 onclick 注释。
+function expandModelSub(key) {
+  modelPopExpand = key || '';
+  $('model-pop').querySelectorAll('.model-item').forEach((b) => {
+    b.classList.toggle('exp', !!modelPopExpand && b.dataset.key === modelPopExpand);
+  });
+}
+
 // 思考档位二级浮窗：跟随 modelPopExpand 指向的模型行，向右弹出。
-// 桌面悬停整行即展开（renderModelPop 的 pointerenter），触屏点行尾箭头展开；
+// 桌面悬停整行即展开（renderModelPop 的 pointerenter），触屏点行尾小按钮展开；
 // 行滚出主面板可视区（主面板会滚动）或主面板收起时一并收起。
 function syncModelSubPop(view) {
   view = view || popView || mainView;

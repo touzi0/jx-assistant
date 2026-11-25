@@ -18,22 +18,14 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
-
-	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
-// decodeCmdOutput 把控制台输出字节还原成合法 UTF-8 文本：优先按 UTF-8，
-// 失败按 GB18030（Windows 中文控制台的默认代码页），仍不行用替换符兜底。
+// decodeCmdOutput 把控制台输出字节还原成合法 UTF-8 文本。
+// 实现已收进 encoding.go 的 decodeConsoleBytes（"输出/文件编码的唯一真源"都放那）：
+// 严格 UTF-8 → 显式覆盖 JX_OUTPUT_ENCODING → 系统 ANSI 代码页 → GB18030 → 替换符。
 // 不做这一步，GBK 输出会以非法字节入库，界面与导出都会出现乱码。
 func decodeCmdOutput(b []byte) string {
-	if utf8.Valid(b) {
-		return string(b)
-	}
-	if s, err := simplifiedchinese.GB18030.NewDecoder().Bytes(b); err == nil {
-		return string(s)
-	}
-	return strings.ToValidUTF8(string(b), "\uFFFD")
+	return string(decodeConsoleBytes(b))
 }
 
 // 工具集：每个工具 = JSON Schema 定义 + Go 实现。
@@ -1291,7 +1283,9 @@ func runUnconfinedLocal(ctx context.Context, r sandboxRun) (string, error) {
 		note += "\n[命令进程已退出，但残留的后台子进程占着输出管道，已强制收口并终止其进程树。如需进程在本命令结束后继续运行：改用 run_in_background=true，且 command 直接写服务本体（如 node server.js / python -m http.server 8000）；不要用 Start-Process 把进程脱离 shell——脱离的进程会随本命令结束被连坐清理]"
 	}
 	if len(out) > 64*1024 {
-		out = out[:64*1024]
+		// 解码前按字节截尾会把最后一个字符切成两半 → utf8.Valid 失败 → 整段被当成
+		// GBK 解成乱码（H1 的尾部形态）。先对齐到字符边界再交给解码。
+		out = trimIncompleteUTF8Tail(out[:64*1024])
 		note += "\n[输出过长已截断]"
 	}
 	res := strings.TrimRight(decodeCmdOutput(out), "\r\n") + note

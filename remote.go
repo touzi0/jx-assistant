@@ -351,7 +351,7 @@ func (c *remoteClient) run(ctx context.Context, dir, command string, timeout tim
 		note += "\n[远程命令被取消]"
 	}
 	if len(out) > 64*1024 {
-		out = out[:64*1024]
+		out = trimIncompleteUTF8Tail(out[:64*1024]) // 解码前切尾必须对齐字符边界（H1）
 		note += "\n[输出过长已截断]"
 	}
 	res := strings.TrimRight(decodeCmdOutput(out), "\r\n") + note

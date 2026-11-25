@@ -568,7 +568,7 @@ func (a *App) snapshotJanitor() {
 		for _, m := range sessions {
 			tctx := &toolContext{app: a, sess: m}
 			if days > 0 {
-				cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02T15:04:05")
+				cutoff := snapshotCutoff(time.Now(), days)
 				if ids, err := a.Store.PruneCheckpointsOlderThan(m.ID, cutoff); err != nil {
 					log.Printf("[快照] 会话 %s 超龄清理失败: %v", m.ID, err)
 				} else if len(ids) > 0 {
@@ -593,4 +593,14 @@ func (a *App) snapshotJanitor() {
 	for range t.C {
 		run()
 	}
+}
+
+// snapshotCutoff 超龄清理的截止时刻：早于它的快照才算超龄（>= 即保留）。
+// 布局必须与 checkpoints.created_at 的落库格式（now()，空格分隔）逐字一致——
+// 两者在 SQL 里是字符串比较。曾写成带「T」的形态：空格(0x20) < T(0x54)，截止日
+// 当天的快照被整日判成超龄，最多提前近一天被删，连「同文件有未超龄快照则整组
+// 保留」的保护也被绕过（2026-11-26 跨天后首次启动，11-19 全天 308 条被清掉；
+// 回归见 snapshot_test.go）。at 传「现在」便于测试钉住时刻。
+func snapshotCutoff(at time.Time, days int) string {
+	return at.AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
 }

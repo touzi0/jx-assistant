@@ -22,7 +22,12 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
 )
 
 // TextEncoding 是探测出来的文件编码。零值即 UTF-8（无 BOM），
@@ -459,4 +464,224 @@ func alternateEncodingMode(mode string) string {
 		return encodingModeUTF8
 	}
 	return encodingModeGBK
+}
+
+// ---------- 输出侧：控制台字节解码 + 截断的字符边界 ----------
+//
+// 这一节是 2026-11-21 三方编码对比后的修复，两个由来：
+//
+//  1. **截断按字节切 → 整段乱码（H1）**：缓冲超限时从头部丢字节，剩下的字节
+//     可能以某个 UTF-8 字符的**续字节**（0x80-0xBF）起始。utf8.Valid 因此失败，
+//     整段落进 GB18030 分支——而 0x80-0xBF 恰在 GBK 第二字节的合法区间，结构
+//     校验还会通过，于是**整段输出**被解成乱码。尾部按字节截断（解码前）同理。
+//     解码后按字节切字符串则是另一种形态：只切断末尾一个字，但会产出非法 UTF-8。
+//     → alignHeadToCharBoundary（丢头部时对齐）、trimIncompleteUTF8Tail（解码前
+//     截尾时对齐）、clipUTF8Head / clipUTF8Tail（解码后切字符串时对齐）。
+//
+//  2. 解码侧原来只有"UTF-8 / GB 族"两档：非中文 Windows（日/韩/俄/西欧）的控制台
+//     输出会静默解成错字。→ consoleCodePageDecoder 按**系统 ANSI 代码页**（GetACP，
+//     只查一次并缓存）选解码器；中文环境（936）行为与以前完全一致（GBK 走
+//     GB18030，超集）。另留一个显式开关 JX_OUTPUT_ENCODING 作确定性出口。
+//
+// 这一层**不重跑命令**：字节都在手里，候选解码只是同一份字节多解一次。
+
+// maxRuneBytes UTF-8 单字符最长 4 字节，边界对齐最多回退/跳过 3 字节。
+const maxRuneBytes = 3
+
+// alignHeadToCharBoundary 返回"从头部丢字节之后"应当用的新起点：若 from 处落在
+// UTF-8 续字节上（半字符），最多再往后丢 3 字节，直到剩余字节能作为合法 UTF-8 解出。
+// 关键点：**只在"多丢几字节就能让整段成为合法 UTF-8"时才动手**——GBK 流的字节同样
+// 会被 utf8.Valid 判否，这时函数原样返回，绝不破坏既有行为。
+func alignHeadToCharBoundary(b []byte, from int) int {
+	if from <= 0 {
+		return 0
+	}
+	if from >= len(b) || utf8.Valid(b[from:]) {
+		return from
+	}
+	for i := 1; i <= maxRuneBytes && from+i < len(b); i++ {
+		if b[from+i-1]&0xC0 != 0x80 { // 只跳续字节
+			break
+		}
+		if utf8.Valid(b[from+i:]) {
+			return from + i
+		}
+	}
+	return from
+}
+
+// trimIncompleteUTF8Tail 在解码前把尾部"被切断的字符"去掉（最多 3 字节）。
+// 同样只在"去掉这几字节后整段成为合法 UTF-8"时才动手，否则原样返回——
+// 否则会把 GBK 流尾巴削掉，反而制造新的乱码。
+func trimIncompleteUTF8Tail(b []byte) []byte {
+	if len(b) == 0 || utf8.Valid(b) {
+		return b
+	}
+	for i := 1; i <= maxRuneBytes && i < len(b); i++ {
+		if utf8.Valid(b[:len(b)-i]) {
+			return b[:len(b)-i]
+		}
+	}
+	return b
+}
+
+// clipUTF8Tail 取 s 的前 n 字节，且不切断最后一个字符（解码后截断用）。
+func clipUTF8Tail(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	cut := n
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+// clipUTF8Head 取 s 的末尾 n 字节，且不从一个字符的中间开始（解码后截断用）。
+func clipUTF8Head(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
+}
+
+// outputEncodingOverride 读显式覆盖开关 JX_OUTPUT_ENCODING（只在显式设置时生效，
+// 认不出取值就当没设——绝不因为一个拼错的变量名改变默认行为）。
+func outputEncodingOverride() encoding.Encoding {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("JX_OUTPUT_ENCODING"))) {
+	case "utf8", "utf-8":
+		return encoding.Nop
+	case "gbk", "gb2312", "cp936", "936":
+		return simplifiedchinese.GBK
+	case "gb18030", "54936":
+		return simplifiedchinese.GB18030
+	case "big5", "cp950", "950":
+		return traditionalchinese.Big5
+	case "cp932", "shiftjis", "shift-jis", "sjis", "932":
+		return japanese.ShiftJIS
+	case "cp949", "euckr", "949":
+		return korean.EUCKR
+	case "cp866", "866":
+		return charmap.CodePage866
+	case "cp1252", "windows1252", "1252":
+		return charmap.Windows1252
+	case "cp1251", "1251":
+		return charmap.Windows1251
+	case "cp437", "437":
+		return charmap.CodePage437
+	}
+	return nil
+}
+
+// consoleCodePageDecoder 把 Windows 代码页映射到解码器；未收录返回 nil。
+// 只收录"控制台输出真会碰上"的几档，其余走 GB18030 兜底（与历史行为一致）。
+func consoleCodePageDecoder(cp uint32) encoding.Encoding {
+	switch cp {
+	case 936, 54936:
+		// 中文代码页直接用 GB18030：它是 GBK 的超集，与修复前的中文环境行为**逐字节一致**
+		// （GBK 解不出的四字节序列它也能解），所以中文机器上的默认路径没有变化。
+		return simplifiedchinese.GB18030
+	case 950:
+		return traditionalchinese.Big5
+	case 932:
+		return japanese.ShiftJIS
+	case 949:
+		return korean.EUCKR
+	case 866:
+		return charmap.CodePage866
+	case 874:
+		return charmap.Windows874
+	case 1250:
+		return charmap.Windows1250
+	case 1251:
+		return charmap.Windows1251
+	case 1252:
+		return charmap.Windows1252
+	case 1253:
+		return charmap.Windows1253
+	case 1254:
+		return charmap.Windows1254
+	case 1255:
+		return charmap.Windows1255
+	case 1256:
+		return charmap.Windows1256
+	case 1257:
+		return charmap.Windows1257
+	case 1258:
+		return charmap.Windows1258
+	case 437:
+		return charmap.CodePage437
+	case 850:
+		return charmap.CodePage850
+	}
+	return nil
+}
+
+// decodeConsoleBytes 是控制台输出字节 → 合法 UTF-8 文本的唯一入口。
+//
+// 顺序（每一步都不改变"本来就是 UTF-8"与"中文环境"的既有行为）：
+//  1. 严格 UTF-8 合法 → 直接返回（绝大多数情况，零成本）；
+//  2. 显式覆盖 JX_OUTPUT_ENCODING → 用它解（**非中文代码页的确定性出口**，见下）；
+//  3. GB18030（中文环境最可能的来源，与修复前逐字节一致）；
+//  4. 仅当 3 的结果**确有损**（含替换符，说明 GB18030 根本表示不了这些字节）、
+//     且本机 ANSI 代码页能解出无损结果时，才改用本机代码页的解码器。
+//
+// 为什么不无条件按本机代码页解（2026-11-21 实测后的刻意保守）：代码页之间**无法
+// 互判**——GB18030 解 Shift_JIS 日文会得到"擔杮岅偙傫偵偪偼"这种看着正常的中文串
+// （既不报错也没有替换符），反过来 cp932 解 GBK 中文会得到半角片假名+替换符。
+// 也就是说"自动换表"必然在某一侧静默解错：在中文环境以外，它会把本来能解对的中文
+// 输出解成当地文字的乱码。我们的用户绝大多数是中文 Windows（ACP=936，直接走 3），
+// 因此这里只保留"能证明主路径有损才换表"这一条；要强制按某个代码页解，用 2 的开关：
+//   JX_OUTPUT_ENCODING = gbk | gb18030 | utf8 | big5 | cp932 | cp949 | cp866 | cp1252 | cp437 ...
+func decodeConsoleBytes(b []byte) []byte {
+	if len(b) == 0 {
+		return nil
+	}
+	if utf8.Valid(b) {
+		return b
+	}
+	if enc := outputEncodingOverride(); enc != nil {
+		if out, err := encNewDecoderBytes(enc, b); err == nil {
+			return out
+		}
+		// 覆盖值解不了就继续往下走常规路径，不给用户一个更差的默认行为
+	}
+	primary := decodeGB18030Lossy(b)
+	if !strings.ContainsRune(string(primary), utf8.RuneError) {
+		return primary
+	}
+	if cp := systemANSICodePage(); cp != 0 && cp != 936 && cp != 54936 {
+		if dec := consoleCodePageDecoder(cp); dec != nil {
+			if alt, err := encNewDecoderBytes(dec, b); err == nil && !strings.ContainsRune(string(alt), utf8.RuneError) {
+				return alt
+			}
+		}
+	}
+	return primary
+}
+
+// encNewDecoderBytes 是"用某编码解一份字节"的统一封装。
+func encNewDecoderBytes(enc encoding.Encoding, b []byte) ([]byte, error) {
+	if enc == nil || enc == encoding.Nop {
+		return []byte(strings.ToValidUTF8(string(b), "\uFFFD")), nil
+	}
+	return enc.NewDecoder().Bytes(b)
+}
+
+// decodeGB18030Lossy 是历史兜底：GB18030 → 替换符。
+func decodeGB18030Lossy(b []byte) []byte {
+	if s, err := simplifiedchinese.GB18030.NewDecoder().Bytes(b); err == nil {
+		return s
+	}
+	return []byte(strings.ToValidUTF8(string(b), "\uFFFD"))
 }

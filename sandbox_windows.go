@@ -913,7 +913,8 @@ func spawnConfinedWindows(ctx context.Context, r sandboxRun) (string, error) {
 	timedOut := child.wait(ctx, r.Timeout)
 	res := strings.TrimRight(decodeCmdOutput(buf.Bytes()), "\r\n")
 	if len(res) > 64*1024 {
-		res = res[:64*1024] + "\n[输出过长已截断]"
+		// 解码后按字节切会切断末尾一个字符、产出非法 UTF-8；对齐到字符边界再截（H1 形态之一）。
+		res = clipUTF8Tail(res, 64*1024) + "\n[输出过长已截断]"
 	}
 	if timedOut {
 		res += "\n[命令超时或被取消，已终止]"

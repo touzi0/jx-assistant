@@ -4,7 +4,8 @@
 // gui-test-screenshots/modelsub-*。交互模型（2026-10 改版）：
 //   桌面悬停整行 = 右侧浮出该行的思考档位；悬停无档位行 = 收起；
 //   点行任意处 = 选中该模型并整体收起（不再顺带弹二级菜单——旧版点击会 toggle，
-//   连点两下互相抵消出现「关不掉」）；点行尾箭头(.lv-hit) = 手动开合档位浮窗；
+//   连点两下互相抵消出现「关不掉」）；点行尾小按钮(.lv-hit) = 重新弹出该行档位面板
+//   （手机端没有悬停，这是改思考深度的入口；桌面只是把同一块面板再弹一次）；
 //   在未选中的模型行上点档位 = 一并选中该模型再定档。
 // 用例：
 //   A 打开模型菜单：面板可见、无内嵌档位残留、二级浮窗默认收起
@@ -134,7 +135,7 @@ async function main() {
   const key = target.providerId + '|' + target.modelId;
   const plainKey = plain.providerId + '|' + plain.modelId;
   const rowExpr = `document.querySelector('#model-pop .model-item[data-key="${key}"]')`;
-  const LV_LABEL = { enabled: '思考·开', disabled: '思考·关', low: '思考·低', medium: '思考·中', high: '思考·高', max: '思考·深' };
+  const LV_LABEL = { enabled: '思考·开', disabled: '思考·关', low: '思考·低', medium: '思考·中', high: '思考·高', max: '思考·最大' };
 
   const t = await newTab(BASE + '/', 1280, 900);
   try {
@@ -220,24 +221,29 @@ async function main() {
     const chip2 = await read(t, `document.getElementById('model-chip-label').textContent`);
     ok('E3 未选中行定档=一并选中并收起', !e2.mainOpen && !e2.subOpen && chip2.includes(target.modelName || target.modelId) && chip2.includes(high), chip2);
 
-    // ---------- F 箭头切换与桌面语义 ----------
-    // 注：触屏分支（hover:none 下箭头=开合开关、悬停不弹）无法在无头桌面验证——
-    // 本机 Edge 的 Emulation.setEmulatedMedia 不支持 hover/pointer 特性（已实测）。
-    // 点行=选中并收起与设备无关（D 段已测），箭头展开路径与触屏共用（下面覆盖切换分支）。
+    // ---------- F 小按钮切换与桌面语义 ----------
+    // 注：触屏分支（hover:none 下悬停不弹、点小按钮重新弹出面板）无法在无头桌面验证——
+    // 本机 Edge 的 Emulation.setEmulatedMedia 不支持 hover/pointer 特性（已实测）；
+    // 手机端走真触摸另测（真机/触屏模拟）。点行=选中并收起与设备无关（D 段已测），
+    // 小按钮展开路径与触屏共用（下面覆盖切换分支）。
     await moveTo(t, 8, 8);
     await clickEl(t, `document.getElementById('model-chip')`);
     await sleep(300);
     const dsExpr = `document.querySelector('#model-pop .model-item[data-key="mock|deepseek-v4-pro"] .lv-hit')`;
-    await clickEl(t, dsExpr); // GLM 展开着（悬停）时点 DeepSeek 的箭头 → 浮窗切到 DeepSeek
+    await clickEl(t, dsExpr); // GLM 展开着（悬停）时点 DeepSeek 的小按钮 → 浮窗切到 DeepSeek
     await sleep(300);
     const f1 = await read(t, `(() => ({
       subOpen: !document.getElementById('model-sub-pop').classList.contains('hidden'),
       items: [...document.querySelectorAll('#model-sub-pop .mp-lv')].map((x) => x.textContent.trim()),
     }))()`);
-    ok('F1 点另一行箭头浮窗切到该行档位', f1.subOpen && f1.items.includes('思考·关') && !f1.items.includes('思考·高'), JSON.stringify(f1.items));
-    await clickEl(t, dsExpr); // 桌面分支：已展开的行再点箭头 = 保持展开（不误收）
+    // 期望值按 /api/models 里的实际档位算（服务端会按型号补全档位：deepseek 系是
+    // 开/关/低/高/最大，不是 mock 配置里写的那两个）
+    const dsWant = ['默认（跟随服务）', ...((dsKey && dsKey.reasoningLevels) || []).map((x) => LV_LABEL[x] || x)];
+    ok('F1 点另一行小按钮浮窗切到该行档位',
+      f1.subOpen && JSON.stringify(f1.items) === JSON.stringify(dsWant), JSON.stringify(f1.items));
+    await clickEl(t, dsExpr); // 桌面分支：已展开的行再点小按钮 = 保持展开（不误收）
     await sleep(300);
-    ok('F2 桌面上已展开行再点箭头保持展开', (await state(t)).subOpen, '');
+    ok('F2 桌面上已展开行再点小按钮保持展开', (await state(t)).subOpen, '');
     await shot(t, join(SCREEN, 'modelsub-2-caret-switch.png'));
     await clickEl(t, `document.querySelector('#model-pop .model-item[data-key="mock|deepseek-v4-pro"]')`); // 点行主体收起
     await sleep(350);
