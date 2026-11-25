@@ -3852,8 +3852,12 @@ func (a *App) handleDiag(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"))
 }
 
-// handleDeliveryDownload 提供交付文件的下载。只放行已登记进 deliveries 的
-// 路径（用户主动下载，不走模型权限审批；未登记的任意路径一律 404，防越权读）。
+// handleDeliveryDownload 提供文件下载（远程端交付卡的「下载」、对话里上传记录
+// 双击的「下载下来」）。只放行本会话登记过的路径——交付卡（deliveries）与上传
+// 记录（uploads）两张登记表（用户主动下载，不走模型权限审批；没登记的任意路径
+// 一律 404，防越权读）。上传记录也走这里：远程工作区的上传文件在 SSH 那头、
+// 远程访问端的文件在本机那头，访问端都拿不到能直接打开的路径，下载是唯一出口
+// （前端 app-chat.js 的 openUploadedFile）。
 func (a *App) handleDeliveryDownload(w http.ResponseWriter, r *http.Request) {
 	m := a.sessionFromPath(w, r)
 	if m == nil {
@@ -3864,25 +3868,18 @@ func (a *App) handleDeliveryDownload(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "需要 path")
 		return
 	}
-	dvs, err := a.Store.DeliveriesFor(m.ID)
+	tctx := &toolContext{app: a, sess: m}
+	abs, err := tctx.resolve(want)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	listed, err := a.sessionFileRegistered(tctx, abs)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	listed := false
-	for _, d := range dvs {
-		if d.Path == want {
-			listed = true
-			break
-		}
-	}
 	if !listed {
-		http.NotFound(w, r)
-		return
-	}
-	tctx := &toolContext{app: a, sess: m}
-	abs, err := tctx.resolve(want)
-	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -3898,6 +3895,42 @@ func (a *App) handleDeliveryDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename*=UTF-8''"+url.PathEscape(name))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	_, _ = w.Write(data)
+}
+
+// sessionFileRegistered 判断工作区绝对路径 abs 是否在本会话登记过（交付卡
+// deliveries 或上传记录 uploads）。登记时存的、前端回传的都是路径文本（工作区
+// 相对或绝对、分隔符与大小写形态各异），两侧都经 resolve 归一成绝对路径再比：
+// 远程工作区按 POSIX 区分大小写，Windows 不区分。
+func (a *App) sessionFileRegistered(tctx *toolContext, abs string) (bool, error) {
+	same := func(p string) bool {
+		q, err := tctx.resolve(p)
+		if err != nil {
+			return false
+		}
+		if tctx.isRemote() {
+			return path.Clean(q) == path.Clean(abs)
+		}
+		return strings.EqualFold(filepath.Clean(q), filepath.Clean(abs))
+	}
+	dvs, err := a.Store.DeliveriesFor(tctx.sess.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, d := range dvs {
+		if same(d.Path) {
+			return true, nil
+		}
+	}
+	ups, err := a.Store.UploadsFor(tctx.sess.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, u := range ups {
+		if u.CopyPath != "" && same(u.CopyPath) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // handleListApprovals 返回待决定的审批（前端轮询兜底）。

@@ -1090,6 +1090,24 @@ body.sb-collapsed #sidebar { width: 0; min-width: 0; border-right-width: 0; }
 }
 .proc-body .tc-imgs { margin: 4px 0 2px; }
 
+/* 交付结果折叠行（【交付结果】注记收成一行，app-chat.js 的 deliveryNotesRow）：
+   抬头「交付成功 / 交付失败」按结果着色，其后的摘要单行省略（全文在 title 与
+   展开正文里）；多条时给成功/失败计数，失败数红字。展开后逐条「成功/失败」
+   标签 + 注记原文 */
+.dnote-row .dn-status.ok { color: var(--green); font-weight: 500; }
+.dnote-row .dn-status.fail { color: var(--danger); font-weight: 500; }
+.dnote-row .dn-counts { flex: none; }
+.dnote-row .dn-brief {
+  flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dnote-row .dn-c.fail { color: var(--danger); font-weight: 500; }
+.dnote-row .dn-item { display: flex; align-items: flex-start; gap: 8px; }
+.dnote-row .dn-item + .dn-item { margin-top: 6px; }
+.dnote-row .dn-tag { flex: none; font-size: .93em; line-height: 1.7; padding: 0 7px; border-radius: 8px; }
+.dnote-row .dn-item.ok .dn-tag { color: var(--green); background: var(--green-bg); }
+.dnote-row .dn-item.fail .dn-tag { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, var(--bg)); }
+.dnote-row .dn-item .tk-text { flex: 1 1 auto; min-width: 0; }
+
 /* 模式选择下拉（新建对话，同目录胶囊交互） */
 .mode-pop { min-width: 300px; }
 .mode-pop .mp2-text { display: flex; flex-direction: column; min-width: 0; }
@@ -1923,6 +1941,17 @@ body.rp-open .w-handle { display: none; }
   color: var(--text-2); font-size: .93em; line-height: 1.7;
   white-space: nowrap; cursor: default;
 }
+/* 可打开的上传记录（附件行 / 正文文件胶囊 / 历史独立上传行，双击打开——
+   app-chat.js 的 bindUploadOpen）：链接式观感——点状下划线 + 手型，悬停强调色；
+   touch-action: manipulation 关掉双击缩放，手机上连点两下才派得出 dblclick */
+.msg-file {
+  cursor: pointer; touch-action: manipulation;
+  text-decoration: underline dotted; text-underline-offset: 3px;
+  text-decoration-color: var(--border);
+}
+.msg-file:hover { color: var(--accent); text-decoration-color: currentColor; }
+.msg.user .bubble .msg-quote.msg-file:hover { border-left-color: var(--accent); }
+.msg.sysnote .bubble.msg-file:hover { border-color: var(--accent); }
 /* 工具栏排布：右侧按钮组用 display:contents 展平——麦克风/圆环/模型/发送以
    个体身份参与整栏换行，能与左侧控件共享第一行（不再被组盒子挤成独立中行）。
    整栏右对齐 + 左组 margin-right:auto 靠左：单行＝左组靠左、按钮贴右，空隙在中间；

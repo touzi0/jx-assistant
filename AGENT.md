@@ -1575,6 +1575,19 @@ embeddable，约 11MB + 清华镜像装 wheel），此后离线可用；装配�
   默认应用（`/api/sessions/{id}/open-path` 与
   `/delivery/open`；用户手势直通——工作区内外都不校验、无确认弹窗，这些
   路由不在 call_api 目录里 AI 调不到，SSH 远程工作区无本机路径给直白报错）。
+- **上传记录双击打开**（2026-11-26 用户口径）：用户气泡里的【文件上传】附件行、
+  正文里对上号的文件胶囊、历史独立上传行，**双击**即打开（单击留给选字；
+  `.msg-file` 点状下划线，app-chat.js `bindUploadOpen`）。不另起打开通路——本机
+  文件走 `openWorkspacePath`（同聊天文件链接）；**远程**（SSH 远程工作区
+  `cur.remote`，或远程访问端 `isRemoteClientEnv`）按「浏览器能直接看的直接看、
+  看不成的下载下来」：浏览器可渲染类型（`BROWSER_VIEW_EXT`，与后端
+  `viewableMime` 同表）交 `openInPanelBrowser`，其余交 `deliveryDownloadFile`。
+  为此 `GET /delivery/download` 的放行范围从 deliveries 扩到 uploads 登记表
+  （`sessionFileRegistered`：两侧经 resolve 归一后比对）。工作区副本路径从注记
+  文本的固定短语后取（`uploadNotePath`）——**后端上传注记文案改了要同步它**。
+  aiuser（派发任务书）里的附件块不挂：文件登记在子会话名下，按本会话工作区
+  解析会开错文件。交付的【交付结果】注记同时收成折叠行（相邻几条并一行，
+  抬头即成功/失败，`deliveryNotesRow`；规范 §3 `dnotes`）。
 - **右栏 md 渲染页**（`mdview.go`，`GET /api/md/{sid}/{path...}`）：**显式右栏
   入口**（「右侧查看」/右键「预览（右栏）」）里的 md 在右栏渲染打开，用的就是
   自带 MD 查看器那套网页（`md-viewer/viewer-template.html`

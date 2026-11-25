@@ -800,6 +800,75 @@ function foldRow(rounds, seq, notes) {
   return row;
 }
 
+// 交付结果折叠行（【交付结果】注记：搬运成功/失败各一条，相邻的并作一行）。
+// 用户口径——交付的文件一多，这些注记一屏都放不下：收成一行，抬头就是
+// 「交付成功 / 交付失败」（多条时给成功/失败计数，失败的红字标出并把失败的
+// 文件名带在抬头），从哪搬到哪、失败原因这些细节点开再看。与思考/工具行同一族
+// （proc-row），展开记忆走 data-rk 同一套（renderItem）。
+function deliveryNotesRow(ms, seq) {
+  const infos = ms.map((m) => deliveryNoteInfo(String(m.content ?? '')));
+  const fails = infos.filter((x) => x.fail);
+  const single = infos.length === 1 ? infos[0] : null;
+  const row = document.createElement('div');
+  row.className = 'proc-row dnote-row';
+  if (seq != null) row.dataset.seq = seq;
+  row.innerHTML =
+    '<div class="proc-head">' + chev('p-chev') + '<span class="p-name dn-status"></span></div>' +
+    '<div class="proc-body"></div>';
+  const head = row.querySelector('.proc-head');
+  const name = head.querySelector('.dn-status');
+  name.textContent = single ? (single.fail ? '交付失败' : '交付成功') : '交付结果';
+  if (single) name.classList.add(single.fail ? 'fail' : 'ok');
+  head.appendChild(document.createTextNode(' · '));
+  // 抬头摘要单行省略（全文在 title 与展开正文里）：单条 = 去掉题头的那一句；
+  // 多条 = 「共 N 个 · 成功 a · 失败 b：失败的文件名」
+  if (single) {
+    const brief = document.createElement('span');
+    brief.className = 'p-sub dn-brief';
+    brief.textContent = single.brief;
+    head.appendChild(brief);
+  } else {
+    const counts = document.createElement('span');
+    counts.className = 'p-sub dn-counts';
+    counts.textContent = '共 ' + infos.length + ' 个 · 成功 ' + (infos.length - fails.length) + ' · ';
+    const fc = document.createElement('span');
+    fc.className = 'dn-c' + (fails.length ? ' fail' : '');
+    fc.textContent = '失败 ' + fails.length;
+    counts.appendChild(fc);
+    head.appendChild(counts);
+    const brief = document.createElement('span');
+    brief.className = 'p-sub dn-brief';
+    brief.textContent = fails.length ? '：' + fails.map((x) => x.file || '（未知名）').join('、') : '';
+    head.appendChild(brief);
+  }
+  head.title = '点开查看' + (single ? '完整说明' : '每条的完整说明') + '（从哪里移动到哪里 / 失败原因）';
+  const body = row.querySelector('.proc-body');
+  infos.forEach((x) => {
+    const one = document.createElement('div');
+    one.className = 'dn-item ' + (x.fail ? 'fail' : 'ok');
+    const tag = document.createElement('span');
+    tag.className = 'dn-tag';
+    tag.textContent = x.fail ? '失败' : '成功';
+    const tx = document.createElement('div');
+    tx.className = 'tk-text';
+    tx.textContent = x.text;
+    one.appendChild(tag);
+    one.appendChild(tx);
+    body.appendChild(one);
+  });
+  bindProcToggle(row);
+  return row;
+}
+
+// 交付结果注记拆解：成功与否看正文（失败注记固定是「交付《X》失败：原因」，
+// 成功注记是「已把 X 移动到 Y」）；brief = 去掉题头的那一句，文件名从《》里取
+function deliveryNoteInfo(text) {
+  const body = text.replace(/^【交付(?:结果|完成)】/, '');
+  const fail = /失败/.test(body);
+  const file = (body.match(/《([^》]+)》/) || [])[1] || '';
+  return { text, brief: body, fail, file };
+}
+
 // 思考行：标题带字数，点开看原文
 function thinkRow(text, seq, opts = {}) {
   const row = document.createElement('div');
@@ -926,6 +995,7 @@ function secCount(items, seen) {
       steps.add(k);
       added++;
     } else if (it.k === 'note') cnt.note++;
+    else if (it.k === 'dnotes') cnt.note += it.ms.length; // 交付结果折叠行：按并入的注记条数计
     else if (isMatItem(it)) cnt.mat++;
   });
   cnt.steps = added;
@@ -1130,6 +1200,12 @@ function isCompactNoteRow(m) {
   return m.kind === 'report' && String(m.content ?? '').startsWith('══════ 压缩区结束');
 }
 
+// 交付结果注记（deliver.go finishDeliveryJob 落的【交付结果】；2026-11-02 前
+// 题头为【交付完成】，仅历史行）：搬运成功/失败各一条，前端收成折叠行
+function isDeliveryNoteRow(m) {
+  return m.origin === 'delivery' || /^【交付(?:结果|完成)】/.test(String(m.content ?? ''));
+}
+
 // 行的展示类型：新行一律带显式 kind（后端保证）；旧库残留的 chat+【】前缀
 // user 行按 report 兼容（规范 §5）。此后一切分发只看 kind，不猜内容。
 function displayKindOf(m) {
@@ -1190,6 +1266,14 @@ const ROW_ITEM_BUILDERS = {
     // 挂到折叠段边界的「已折叠」行上点开查看，位置与形态才是压缩真实发生的
     if (isCompactNoteRow(m)) return;
     st.ensure();
+    // 【交付结果】（搬运成功/失败）注记：相邻几条并成一条折叠行（deliveryNotesRow）
+    // ——一行高度，抬头即见成功/失败；从哪搬到哪、失败原因点开再看
+    if (isDeliveryNoteRow(m)) {
+      const last = st.cur.items[st.cur.items.length - 1];
+      if (last && last.k === 'dnotes') last.ms.push(m);
+      else st.cur.items.push({ k: 'dnotes', ms: [m], seq: m.seq });
+      return;
+    }
     st.cur.items.push({ k: 'note', m });
   },
   // 压缩摘要：不按落库位置产条目——卡片由 groupTurns 的 sumAt 归位到覆盖
@@ -1483,6 +1567,7 @@ function renderRowItem(it, opts) {
   if (it.k === 'summary') return summaryRow(it.text, it.origin, it.covers, it.seq);
   if (it.k === 'fold') return foldRow(it.rounds, it.seq, it.notes);
   if (it.k === 'think') return thinkRow(it.text, it.seq);
+  if (it.k === 'dnotes') return deliveryNotesRow(it.ms, it.seq);
   if (it.k === 'tool') return toolRow(it.tc, it.result, { seq: it.seq });
   if (it.k === 'plancard') return planCardRow(it.tc, it.seq, it.result);
   if (it.k === 'subtask') {
@@ -1509,6 +1594,8 @@ function renderRowItem(it, opts) {
   const b = document.createElement('div');
   b.className = 'bubble';
   b.textContent = String(it.m.content ?? '');
+  // 历史库里的独立【文件上传】行（2026-10-19 前落库的形态）：与附件块同款可双击打开
+  if (isUploadNoteRow(it.m)) bindUploadOpen(b, String(it.m.content ?? ''));
   wrap.appendChild(b);
   return wrap;
 }
@@ -3342,12 +3429,13 @@ function streamKeep(items) {
 }
 
 // 执行中钉住常显的几类：系统通知（report 通道的虚线通知块——执行期间的中断/上传
-// 提示不能被折没）、运行中的子任务卡（实时进度）、计划卡、中间长正文（与完成态
+// 提示不能被折没；交付结果折叠行同理，它抬头就是成功/失败）、运行中的子任务卡
+// （实时进度）、计划卡、中间长正文（与完成态
 // 同一豁免：「先解释一大段、再连续十几次工具调用」的讲解段不能执行中途被折没）、
 // 以及「已折叠」标注行（它标记的就是折叠这件事本身，折进段里等于没标）。
 // 派发类消息（aiuser）是回合的 userMsg、永远在过程段之外，天然常显，不劳这里钉。
 function streamPinned(it) {
-  return it.k === 'note' || it.k === 'plancard' || it.k === 'fold' || it.k === 'summary' ||
+  return it.k === 'note' || it.k === 'dnotes' || it.k === 'plancard' || it.k === 'fold' || it.k === 'summary' ||
     (it.k === 'subtask' && !it.result) || (it.k === 'text' && isLongText(it.text));
 }
 
@@ -3376,8 +3464,10 @@ function finishedKeep(items, isLast) {
     if (it.k === 'plancard' || (it.k === 'text' && isLongText(it.text))) anchor.add(i);
   });
   // 「已折叠」标注行与压缩卡片常显：它们标记的就是压缩/折叠这件事本身，
-  // 折进折叠段等于没标——用户要靠它们知道对话在哪儿被压过
-  items.forEach((it, i) => { if (it.k === 'fold' || it.k === 'summary') anchor.add(i); });
+  // 折进折叠段等于没标——用户要靠它们知道对话在哪儿被压过。交付结果折叠行
+  // 同样常显：它本身就是收成一行的结果（成功/失败要一眼看到），再被折进
+  // 「已折叠 N 行」里就白收了
+  items.forEach((it, i) => { if (it.k === 'fold' || it.k === 'summary' || it.k === 'dnotes') anchor.add(i); });
   const foldable = (it) => it.k !== 'text' && it.k !== 'plancard';
   items.forEach((it, i) => {
     if (it.k !== 'note') return;
@@ -7442,6 +7532,10 @@ function appendQuotedBody(b, raw, mdBody) {
     const isRecord = n.startsWith('【演示记录】');
     line.textContent = isRecord ? quoteClip(n) : n;
     line.title = isRecord ? n.replace(/([；。])/g, '$1\n') : n;
+    // 文件注记可双击打开（见 bindUploadOpen）；只给真人用户消息——aiuser 里
+    // 的附件块是派给子会话的文件，登记在子会话名下，本会话按自己的工作区解析
+    // 会开错文件
+    if (!mdBody) bindUploadOpen(line, n);
     b.appendChild(line);
   });
   qm.quotes.forEach((q, i) => {
@@ -7509,12 +7603,78 @@ function appendQuoteBodyText(b, text, quotes, attNotes) {
         chip.className = 'quote-chip';
         chip.textContent = m[0];
         chip.title = matched;
+        bindUploadOpen(chip, matched); // 正文里的文件胶囊：与附件行同款双击打开
         b.appendChild(chip);
       }
     }
     last = rx.lastIndex;
   }
   if (last < src.length) b.appendChild(document.createTextNode(src.slice(last)));
+}
+
+/* ---------- 上传记录可打开：附件行 / 正文文件胶囊，双击 ----------
+ * 用户口径：文件上传的记录（用户气泡里那行【文件上传】注记）要能像超链接一样
+ * 点开；手势用双击（单击留给选中文字）。远程同一手势，规则是「浏览器能直接
+ * 读取、直接看的就直接看；浏览器不行的就下载下来」。打开一律复用既有通路：
+ *   · 本机文件 → openWorkspacePath（聊天里文件链接点击那条路：html 进右栏
+ *     「浏览器」面板，其余交系统默认程序——双击文件是什么程序这里就是什么程序）；
+ *   · 远程 + 浏览器可渲染的类型 → openInPanelBrowser（桌面右栏面板经
+ *     /api/browser/view 流式渲染；手机壳内页 / 远程隧道 / 新标签页各有既有分流）；
+ *   · 远程 + 其余类型 → deliveryDownloadFile（手机壳下载管理下载完自动用系统
+ *     应用打开；远程浏览器经隧道落盘；局域网浏览器与桌面壳走原生下载）。
+ * 「远程」两种都算：远程工作区（cur.remote，文件在 SSH 那头，本机没有路径）与
+ * 远程访问端（isRemoteClientEnv，文件在本机那头、人在别的设备上）。 */
+
+// 浏览器原生可渲染的后缀：与后端 browser_host.go 的 viewableMime 同一张表
+// （md 的几个别名一并算上，走右栏渲染页）
+const BROWSER_VIEW_EXT = new Set(['html', 'htm', 'svg', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'ico', 'avif',
+  'pdf', 'mp4', 'webm', 'mp3', 'wav', 'ogg', 'm4a',
+  'txt', 'md', 'markdown', 'mdown', 'mkd', 'json', 'xml', 'csv', 'js', 'css', 'log', 'yml', 'yaml', 'go', 'py']);
+
+function isBrowserViewablePath(p) { return BROWSER_VIEW_EXT.has(fileExtOf(p)); }
+
+function isUploadNoteRow(m) {
+  return m.origin === 'upload' || String(m.content ?? '').startsWith('【文件上传】');
+}
+
+// 上传注记 → 工作区里那份文件的路径（打开用）。注记是后端生成的文本（server.go
+// handleUpload 的 multipart 分支、uploadpath.go 的路径分支，几种落位各一句固定
+// 文案），工作区副本路径只出现在这几个固定短语之后——按短语取；取不到（文案
+// 改了 / 更老的格式）就当普通文字，不给打开入口，不硬猜。
+function uploadNotePath(note) {
+  const s = String(note || '');
+  if (!s.startsWith('【文件上传】')) return '';
+  const m = s.match(/(?:已保存到工作区|用户上传了文件|已复制一份到工作区|本来就在工作区内|与工作区已有文件) (.+?) *(?=(?:（(?:\d+ 字节）|用户上传的文件统一存放)|，没有另外的| 内容完全一致))/);
+  return m ? m[1].trim() : '';
+}
+
+// 给渲染好的附件行 / 胶囊挂上「双击打开」：解析不出路径的注记不挂（保持纯文字）
+function bindUploadOpen(el, note) {
+  const p = uploadNotePath(note);
+  if (!p) return;
+  const nm = String(note).match(/《([^》]+)》/);
+  el.classList.add('msg-file');
+  el.title = [nm ? '双击打开《' + nm[1] + '》' : '双击打开这个文件', el.title].filter(Boolean).join('\n');
+  el.ondblclick = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // 双击会顺手选中指针下的词：打开才是这次动作的目的，选中高亮是噪音
+    const sel = window.getSelection();
+    if (sel && sel.removeAllRanges) sel.removeAllRanges();
+    openUploadedFile(el, p, nm ? nm[1] : '');
+  };
+}
+
+function openUploadedFile(el, path, name) {
+  const view = foldViewOf(el);
+  const cur = view.state.cur;
+  if (!cur) return;
+  const sid = cur.id;
+  if (!cur.remote && !isRemoteClientEnv()) { openWorkspacePath(view, sid, path); return; }
+  if (isBrowserViewablePath(path)) { openInPanelBrowser({ session: sid, path }); return; }
+  const file = name || String(path).replace(/\\/g, '/').split('/').pop();
+  if (!jxShellBridge()) toast('正在下载 ' + file + '…（下载完成后用系统应用打开）');
+  deliveryDownloadFile(sid, { path });
 }
 
 // 胶囊条渲染：有引用才出现（hidden 零占位）；1 条显示截断文，多条收成「引用了N条」。
