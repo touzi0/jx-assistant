@@ -13,9 +13,12 @@
    3. 劫持 window.EventSource：/api/events 的 SSE 长连接改为「流式 fetch + 自动重连」
       （210 对单请求有 150s 上限，断开后 3s 重连；会话执行流的接回由应用既有
       「接回执行流」机制自动完成）
-   4. FormData 上传自动改走 multipart 帧协议；window.JX_REMOTE 提供附件/下载的
-      blob 化助手（供 app-chat.js 的少量兜底调用）与企业小程序 iframe 代载
-      （loadSitesFrame，见文末——iframe 导航不经 fetch 劫持，须整体代载）
+   4. FormData 上传自动改走 multipart 帧协议（带 init.onUploadProgress 的请求用 XHR
+      发 /relay 以回报上传进度，见 relayPost）；网关回 503「中继 offline」而请求是
+      GET/HEAD（没到家）时自动短重试（~8s 内 6 次），不让重连空窗变成用户看到的报错；
+      window.JX_REMOTE 提供附件/下载的 blob 化助手（供 app-chat.js 的少量兜底调用）、
+      企业小程序平台页 iframe 代载（loadSitesFrame）与具体站点的整站代载（openSite：
+      平台页点「打开」的 /s/<id>/ 在外壳覆盖层里经隧道拉首页与资源拼 blob，见文末）
 
    加密：非安全上下文（http 网关）无 WebCrypto，内置纯 JS AES-256-GCM
    （与 gate.html 同源代码；密钥 = SHA-256(配对密钥)，网关只见密文）。 */
@@ -350,27 +353,95 @@
     });
   }
 
+  /* ---------- 带上传进度的中继发送 ----------
+     附件上传的请求体是整份文件封成的密文（见 normalizeBody 与 seal），是隧道里
+     唯一「发出去要等一会儿」的请求。fetch 不给请求体派发进度事件，调用方带了
+     onUploadProgress（init 上的扩展参数，只有隧道认识）就改用 XHR 发 /relay：
+     upload.progress 实时报「已发出 / 总字节」——远程上传的进度条靠它；不带的
+     请求照旧走 fetch。响应仍是 NDJSON 流：XHR 按下载进度给出增量文本，灌进
+     ReadableStream，下游的帧解析与 fetch 路径是同一份代码。 */
+  function relayPost(str, init, onProg) {
+    var headers = { 'Content-Type': 'application/json', 'X-Relay-Peer': cfg.peerId };
+    if (!onProg) {
+      return realFetch('/relay', { method: 'POST', headers: headers, body: str });
+    }
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      var ctl = null, settled = false, sent = 0, upTotal = 0;
+      var stream = new ReadableStream({
+        start: function (c) { ctl = c; },
+        cancel: function () { try { xhr.abort(); } catch (e) {} },
+      });
+      var done = function () { // 响应头已到：先交出 Response，再把已到的正文灌进去
+        if (!settled) {
+          settled = true;
+          resolve(new Response(stream, { status: xhr.status }));
+        }
+        var add = xhr.responseText.slice(sent);
+        if (add) {
+          sent = xhr.responseText.length;
+          try { ctl.enqueue(new TextEncoder().encode(add)); } catch (e) {} // 流已被下游取消
+        }
+      };
+      var fail = function (e) {
+        if (settled) { try { ctl.error(e); } catch (e2) {} }
+        else { settled = true; reject(e); }
+      };
+      xhr.open('POST', '/relay');
+      xhr.setRequestHeader('Content-Type', headers['Content-Type']);
+      xhr.setRequestHeader('X-Relay-Peer', cfg.peerId);
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable && e.total > 0) { upTotal = e.total; onProg(e.loaded, e.total); }
+      };
+      xhr.upload.onload = function () { onProg(upTotal, upTotal); }; // 请求体发完：之后是服务器那一头的事
+      xhr.onprogress = done;
+      xhr.onload = function () { done(); if (ctl) { try { ctl.close(); } catch (e) {} ctl = null; } };
+      xhr.onerror = function () { fail(new Error('中继网络错误')); };
+      xhr.onabort = function () { fail(new DOMException('Aborted', 'AbortError')); };
+      if (init.signal) {
+        if (init.signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; } // 还没 send，abort 不会派发事件
+        init.signal.addEventListener('abort', function () { try { xhr.abort(); } catch (e) {} });
+      }
+      xhr.send(str);
+    });
+  }
+
+  // 中继 503「offline / 目标设备不在线」= 家端的 hub 连接此刻不在（断线重连空窗、
+  // 网关重启几秒、被踢退避中）：请求根本没到家。幂等请求（GET/HEAD）等一下重发即可，
+  // 不该把「503 中继 offline」甩到用户脸上（2026-11-27 用户「这个错误出现得挺多、
+  // 又出现了」）。非幂等方法不重试：网关在家端掉线路径回 503 时，家端可能已经收到
+  // 并执行了那一帧，重发会重复提交。
+  var RELAY_OFFLINE_RETRIES = 6; // 0.4s 起步、每次 +0.4s：累计约 8s，盖住快速重连与一两级退避
   function relayTunnelFetch(u, init, body, headers) {
     var method = (init.method || 'GET').toUpperCase();
-    var id = 'r' + (++seq);
-    var frame = { t: 'req', id: id, method: method, path: u.pathname + u.search, headers: headers };
-    if (body && body.u8) frame.body = bytesToB64(body.u8);
-    return seal({ pk: cfg.pairKey, ts: Math.floor(Date.now() / 1000), frame: frame }).then(function (pack) {
-    return realFetch('/relay', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Relay-Peer': cfg.peerId },
-      body: JSON.stringify(pack),
-    });
-    }).then(function (resp) {
-      if (!resp.ok || !resp.body) {
+    var onProg = typeof init.onUploadProgress === 'function' ? init.onUploadProgress : null;
+    var idempotent = method === 'GET' || method === 'HEAD';
+    var attempt = 0;
+    function sendOnce() {
+      var id = 'r' + (++seq);
+      var frame = { t: 'req', id: id, method: method, path: u.pathname + u.search, headers: headers };
+      if (body && body.u8) frame.body = bytesToB64(body.u8);
+      return seal({ pk: cfg.pairKey, ts: Math.floor(Date.now() / 1000), frame: frame }).then(function (pack) {
+        return relayPost(JSON.stringify(pack), init, onProg);
+      }).then(function (resp) {
+        if (resp.ok && resp.body) return resp;
         return resp.text().catch(function () { return ''; }).then(function (t) {
           var msg = t;
           try { msg = JSON.parse(t).error || t; } catch (e) {}
+          if (idempotent && resp.status === 503 && /offline|不在线/.test(msg || '') && attempt < RELAY_OFFLINE_RETRIES && !(init.signal && init.signal.aborted)) {
+            attempt++;
+            return new Promise(function (resolve, reject) {
+              var timer = setTimeout(resolve, 400 + attempt * 400);
+              if (init.signal) init.signal.addEventListener('abort', function () { clearTimeout(timer); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+            }).then(sendOnce);
+          }
           var err = new Error('中继错误 HTTP ' + resp.status + (msg ? '：' + msg : ''));
           err.status = resp.status; // 挂上中继的 HTTP 状态码（与 api() 抛错的 err.status 同形）：429 由应用层兜底重试
           throw err;
         });
-      }
+      });
+    }
+    return sendOnce().then(function (resp) {
       // NDJSON 逐帧解密 → 流式 Response
       var reader = resp.body.getReader();
       var dec = new TextDecoder();
@@ -791,16 +862,31 @@
       };
     }
     window.XMLHttpRequest = XHRShim;
-    // 新开站点预览（window.open('/s/...')）：站点是任意多资源页面，blob 单文件
-    // 装不完整；远程形态先提示回家端打开（完整预览需要整站代理，后续另做）。
+    // 新开站点（window.open('/s/...')：平台页「打开」按钮）与站点地址链接
+    //（<a class="addr" href="/s/..." target="_blank">——blob 文档里相对 URL 连构造
+    // 都会抛 Invalid URL）：远程形态交给外壳层整站代载（JX_REMOTE.openSite：经隧道
+    // 拉首页与资源、注入站点 hook、装进外壳覆盖层）。旧壳没这个入口才退回提示。
+    var remote = (parent !== window && parent.JX_REMOTE) || null;
     var realOpen = window.open ? window.open.bind(window) : null;
     window.open = function (u) {
       if (typeof u === 'string' && u.charAt(0) === '/') {
+        if (remote && typeof remote.openSite === 'function') { remote.openSite(u); return null; }
         alert('远程访问暂不支持新开站点预览：请在运行数字助理的电脑上打开。');
         return null;
       }
       return realOpen ? realOpen.apply(null, arguments) : null;
     };
+    if (remote && typeof remote.openSite === 'function') {
+      document.addEventListener('click', function (e) {
+        var el = e.target;
+        while (el && el !== document && !(el.tagName === 'A' && el.getAttribute('href'))) el = el.parentNode;
+        if (!el || el === document) return;
+        var h = el.getAttribute('href') || '';
+        if (h.indexOf('/s/') !== 0) return; // 只接管站点链接；平台页自身的锚点等不碰
+        e.preventDefault();
+        remote.openSite(h);
+      }, true);
+    }
   } + ')();';
 
   window.__jxSitesFetch = function (input, init) { return window.fetch(input, init); };
@@ -827,6 +913,270 @@
         { type: 'text/html' }));
     });
   };
+
+  /* ---------- 站点（具体小程序）远程代载（2026-11-27）----------
+     平台页里点「打开」是 window.open('/s/<id>/?user=…')：远程形态下外壳挂在网关源
+     上，这个相对地址要么被 SITES_HOOK 拦成提示（手机壳里 window.open 本来就会被
+     WebView 丢掉）、要么打到网关 404 白屏——用户实测「小程序平台能开、具体小程序
+     点了没用/白屏」。站点是任意多资源页面（js/css/图片/站内 api），blob 单文件装不下，
+     这里做「整站代载」：经隧道拉首页 HTML，把里面的相对资源引用（script/link/img…与
+     <style>/style="" 里的 url()，CSS 文件递归一层）逐个经隧道取回换成 blob URL；注入
+     站点 hook（fetch/XHR 按站点目录解析相对地址接回隧道、带上 user 身份；运行时动态
+     img/script/link 赋值同样代载；站内 <a>/window.open 在覆盖层内翻页）；装进外壳层的
+     全屏覆盖层（带返回条）。电脑远程浏览器与手机壳同一条路：不新开标签页——新标签
+     不在这套隧道里。资源 blob 在一次打开内缓存，关掉覆盖层即释放。 */
+  var SITE_FAKE = 'https://jx-site.local'; // 相对地址解析用的假源：同源=站内，站外一律放行
+  var siteAssets = {}; // 站点资源路径 → Promise<blobURL>
+  var siteView = null;
+  function siteResolveRef(ref, contextPath, base) {
+    var abs;
+    try { abs = new URL(ref, SITE_FAKE + contextPath); } catch (e) { return null; }
+    if (abs.origin !== SITE_FAKE || abs.pathname.indexOf(base) !== 0) return null;
+    return abs.pathname + abs.search;
+  }
+  function siteMime(p, ct) {
+    if (ct && ct !== 'application/octet-stream' && ct !== 'text/plain') return ct;
+    var ext = (p.replace(/\?.*$/, '').match(/\.([a-z0-9]+)$/i) || [])[1] || '';
+    return { js: 'text/javascript', mjs: 'text/javascript', css: 'text/css', html: 'text/html',
+      json: 'application/json', svg: 'image/svg+xml', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', webp: 'image/webp', ico: 'image/x-icon', woff: 'font/woff', woff2: 'font/woff2',
+      ttf: 'font/ttf', otf: 'font/otf', mp3: 'audio/mpeg', mp4: 'video/mp4' }[ext.toLowerCase()] || 'application/octet-stream';
+  }
+  function siteAssetURL(base, path) { // 站点资源 → blob URL（css 文本递归改写 url()；失败不缓存）
+    if (siteAssets[path]) return siteAssets[path];
+    var pr = window.fetch(path).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + path);
+      var ct = r.headers.get('content-type') || '';
+      if (/\.css(\?|$)/.test(path) || /text\/css/i.test(ct)) {
+        return r.text().then(function (css) { return rewriteSiteCSS(css, path, base); }).then(function (css) {
+          return URL.createObjectURL(new Blob([css], { type: 'text/css' }));
+        });
+      }
+      return r.blob().then(function (b) {
+        var type = siteMime(path, ct);
+        return URL.createObjectURL(type && b.type !== type ? new Blob([b], { type: type }) : b);
+      });
+    });
+    siteAssets[path] = pr;
+    pr.catch(function () { delete siteAssets[path]; });
+    return pr;
+  }
+  function rewriteSiteCSS(css, cssPath, base) {
+    var jobs = [];
+    var out = css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (m, q, ref) {
+      ref = ref.trim();
+      if (/^(data:|blob:|https?:|\/\/|#)/i.test(ref)) return m;
+      var p = siteResolveRef(ref, cssPath, base);
+      if (!p) return m;
+      var i = jobs.length;
+      jobs.push(siteAssetURL(base, p).catch(function () { return ref; }));
+      return 'url(__JXCSS' + i + '__)';
+    });
+    if (!jobs.length) return Promise.resolve(css);
+    return Promise.all(jobs).then(function (urls) {
+      return out.replace(/__JXCSS(\d+)__/g, function (m, i) { return urls[+i]; });
+    });
+  }
+  function rewriteSiteHTML(html, base, pagePath, user) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var jobs = [], cssJobs = [];
+    var nodes = doc.querySelectorAll('script[src], link[href], img[src], source[src], video[src], audio[src], input[type=image][src], embed[src], object[data]');
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i], tag = el.tagName;
+      if (tag === 'LINK') { // 只代载样式表与图标；preload/prefetch/manifest 去掉即可（它们指向的地址在 blob 文档里无意义）
+        var rel = (el.getAttribute('rel') || '').toLowerCase();
+        if (rel.indexOf('stylesheet') < 0 && rel !== 'icon' && rel !== 'shortcut icon') { el.removeAttribute('href'); continue; }
+      }
+      var attr = tag === 'LINK' ? 'href' : (tag === 'OBJECT' ? 'data' : 'src');
+      var ref = el.getAttribute(attr);
+      if (!ref || /^(data:|blob:|https?:|\/\/|#|javascript:|mailto:|tel:)/i.test(ref)) continue;
+      var p = siteResolveRef(ref, pagePath, base);
+      if (!p) continue;
+      (function (el, attr, k) { jobs.push(siteAssetURL(base, p).catch(function () { return ''; })); el.setAttribute(attr, '__JXASSET' + k + '__'); })(el, attr, jobs.length);
+    }
+    var styles = doc.querySelectorAll('style');
+    for (var s = 0; s < styles.length; s++) {
+      var t = styles[s].textContent;
+      if (!/url\(/i.test(t)) continue;
+      (function (node, k) { cssJobs.push(rewriteSiteCSS(t, pagePath, base).catch(function () { return t; })); node.textContent = '__JXSTYLE' + k + '__'; })(styles[s], cssJobs.length);
+    }
+    var inl = doc.querySelectorAll('[style]');
+    for (var y = 0; y < inl.length; y++) {
+      var st = inl[y].getAttribute('style');
+      if (!/url\(/i.test(st)) continue;
+      (function (node, k) { cssJobs.push(rewriteSiteCSS(st, pagePath, base).catch(function () { return st; })); node.setAttribute('style', '__JXSTYLE' + k + '__'); })(inl[y], cssJobs.length);
+    }
+    var bases = doc.querySelectorAll('base');
+    for (var b = 0; b < bases.length; b++) bases[b].remove(); // blob 文档里 <base> 只会添乱
+    // 站点 hook 放 head 最前：先于页面脚本把 fetch/XHR/window.open/动态资源接上
+    var hook = doc.createElement('script');
+    hook.textContent = 'window.JX_SITE_BASE=' + JSON.stringify(base) + ';window.JX_SITE_PAGE=' + JSON.stringify(pagePath) +
+      ';window.JX_SITE_USER=' + JSON.stringify(user || '') + ';\n' + SITE_HOOK;
+    var head = doc.head || doc.documentElement;
+    head.insertBefore(hook, head.firstChild);
+    var out = '<!DOCTYPE html>\n' + doc.documentElement.outerHTML;
+    return Promise.all(jobs).then(function (urls) {
+      return out.replace(/__JXASSET(\d+)__/g, function (m, i) { return urls[+i] || ''; });
+    }).then(function (h) {
+      return Promise.all(cssJobs).then(function (css) {
+        return h.replace(/__JXSTYLE(\d+)__/g, function (m, i) { return css[+i]; });
+      });
+    });
+  }
+  // 站点文档内的 hook：与 SITES_HOOK 同一思路，但按站点目录解析相对地址、带 user 身份、
+  // 拦截运行时资源赋值与站内导航。parent 是外壳（同一网关源，blob 由它签发）。
+  var SITE_HOOK = '(' + function () {
+    var BASE = window.JX_SITE_BASE, PAGE = window.JX_SITE_PAGE, FAKE = 'https://jx-site.local';
+    var USER = window.JX_SITE_USER || '';
+    var remote = (parent !== window && parent.JX_REMOTE) || null;
+    function inSite(u) { // 相对/绝对 → 站内隧道路径（/s/<id>/…）；站外返回 null
+      var abs;
+      try { abs = new URL(String(u), FAKE + PAGE); } catch (e) { return null; }
+      if (abs.origin !== FAKE || abs.pathname.indexOf(BASE) !== 0) return null;
+      return abs.pathname + abs.search;
+    }
+    function withUser(p) { // 代载形态下手机没有站点 cookie：身份靠打开链接上的 ?user= 透传给站内 api
+      if (!USER || /(^|[?&])user=/.test(p)) return p;
+      return p + (p.indexOf('?') >= 0 ? '&' : '?') + 'user=' + encodeURIComponent(USER);
+    }
+    var realFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      var s = typeof input === 'string' ? input : (input && input.url) || '';
+      var p = s ? inSite(s) : null;
+      if (p) return parent.__jxSitesFetch(withUser(p), init);
+      if (s.charAt(0) === '/' && /^\/(api\/|sites|s\/)/.test(s)) return parent.__jxSitesFetch(s, init);
+      return realFetch(input, init);
+    };
+    function XHRShim() { // 上传等 XHR 用法：与 SITES_HOOK 同款垫片，按站点目录解析
+      var self = this;
+      this.status = 0; this.responseText = '';
+      this._ls = {};
+      this.upload = { addEventListener: function (_, fn) { self._prog = fn; } };
+      this.addEventListener = function (t, fn) { (self._ls[t] = self._ls[t] || []).push(fn); };
+      this.setRequestHeader = function () {};
+      this.open = function (m, u) { self._m = m; self._u = u; };
+      this.send = function (body) {
+        var fire = function (t) { (self._ls[t] || []).forEach(function (fn) { fn({ target: self }); }); };
+        var prog = function (lo) { if (self._prog) self._prog({ lengthComputable: true, loaded: lo, total: 100 }); };
+        prog(1);
+        var p = inSite(self._u);
+        parent.__jxSitesFetch(p ? withUser(p) : self._u, { method: self._m, body: body }).then(function (r) {
+          return r.text().then(function (t) { self.status = r.status; self.responseText = t; prog(100); fire('load'); });
+        }).catch(function () { fire('error'); });
+      };
+    }
+    window.XMLHttpRequest = XHRShim;
+    // 运行时动态资源：img.src / script.src / link.href 赋值时是相对地址 → 经外壳代载后再设真值
+    //（HTML 解析器写属性不走 setter，静态引用由外壳在拼装时改写；这里补运行时）
+    if (remote && typeof remote.siteAssetURL === 'function') {
+      [['HTMLScriptElement', 'src'], ['HTMLImageElement', 'src'], ['HTMLSourceElement', 'src'],
+        ['HTMLMediaElement', 'src'], ['HTMLLinkElement', 'href']].forEach(function (pair) {
+        var P = window[pair[0]] && window[pair[0]].prototype;
+        if (!P) return;
+        var d = Object.getOwnPropertyDescriptor(P, pair[1]);
+        if (!d || !d.set) return;
+        Object.defineProperty(P, pair[1], {
+          configurable: true, enumerable: d.enumerable,
+          get: function () { return d.get.call(this); },
+          set: function (v) {
+            var el = this, p = (typeof v === 'string') && v && !/^\s*(data|blob):/i.test(v) ? inSite(v) : null;
+            if (!p) { d.set.call(el, v); return; }
+            remote.siteAssetURL(BASE, p).then(function (u) { d.set.call(el, u); }, function () { d.set.call(el, v); });
+          },
+        });
+      });
+      // 站内导航：<a href>（相对或 /s/<id>/…）与 window.open 都在覆盖层内翻页；站外链接放行
+      document.addEventListener('click', function (e) {
+        var el = e.target;
+        while (el && el !== document && !(el.tagName === 'A' && el.getAttribute('href'))) el = el.parentNode;
+        if (!el || el === document) return;
+        var h = el.getAttribute('href') || '';
+        if (!h || h.charAt(0) === '#' || /^(javascript:|mailto:|tel:)/i.test(h)) return;
+        var p = inSite(h);
+        if (!p) return;
+        e.preventDefault();
+        remote.openSite(p);
+      }, true);
+      var realOpen = window.open ? window.open.bind(window) : null;
+      window.open = function (u) {
+        var p = typeof u === 'string' && inSite(u);
+        if (p) { remote.openSite(p); return null; }
+        if (typeof u === 'string' && u.charAt(0) === '/') { remote.openSite(u); return null; }
+        return realOpen ? realOpen.apply(null, arguments) : null;
+      };
+    }
+  } + ')();';
+  function ensureSiteView() {
+    if (siteView) return siteView;
+    var root = document.createElement('div');
+    root.id = 'jx-site-view';
+    root.style.cssText = 'position:fixed;inset:0;z-index:2147483000;background:#fff;display:none;flex-direction:column';
+    var bar = document.createElement('div');
+    bar.style.cssText = 'display:flex;align-items:center;gap:8px;min-height:44px;padding:env(safe-area-inset-top,0) 8px 0;background:#f5f6f8;border-bottom:1px solid #e3e6ea;font:15px/1.4 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;color:#222;flex:none';
+    var back = document.createElement('button');
+    back.type = 'button';
+    back.textContent = '‹ 返回';
+    back.style.cssText = 'border:0;background:none;padding:8px 10px;font-size:16px;color:#1a73e8;cursor:pointer;flex:none';
+    var title = document.createElement('div');
+    title.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600';
+    var frame = document.createElement('iframe');
+    frame.title = '企业小程序';
+    frame.style.cssText = 'flex:1;width:100%;border:0;background:#fff';
+    var busy = document.createElement('div');
+    busy.textContent = '正在打开小程序…';
+    busy.style.cssText = 'position:absolute;left:0;right:0;top:44px;bottom:0;display:none;align-items:center;justify-content:center;color:#888;font:14px system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#fff';
+    bar.appendChild(back);
+    bar.appendChild(title);
+    root.appendChild(bar);
+    root.appendChild(frame);
+    root.appendChild(busy);
+    back.onclick = closeSiteView;
+    (document.body || document.documentElement).appendChild(root);
+    siteView = { root: root, frame: frame, title: title, busy: busy, seq: 0 };
+    return siteView;
+  }
+  function closeSiteView() {
+    if (!siteView) return;
+    siteView.root.style.display = 'none';
+    siteView.frame.src = 'about:blank';
+    siteView.seq++;
+    Object.keys(siteAssets).forEach(function (k) {
+      siteAssets[k].then(function (u) { URL.revokeObjectURL(u); }, function () {});
+    });
+    siteAssets = {};
+  }
+  function openSite(path) {
+    var u;
+    try { u = new URL(path, SITE_FAKE + '/'); } catch (e) { return Promise.reject(new Error('站点地址无效：' + path)); }
+    var m = /^\/s\/([^/]+)\//.exec(u.pathname);
+    if (!m) return Promise.reject(new Error('不是站点地址：' + path));
+    var base = '/s/' + m[1] + '/';
+    var user = u.searchParams.get('user') || '';
+    var v = ensureSiteView(), my = ++v.seq;
+    v.root.style.display = 'flex';
+    v.busy.style.display = 'flex';
+    v.busy.textContent = '正在打开小程序…';
+    v.title.textContent = '企业小程序';
+    v.frame.src = 'about:blank';
+    return window.fetch(u.pathname + u.search).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.text();
+    }).then(function (html) {
+      var t = /<title>([^<]*)<\/title>/i.exec(html);
+      if (my !== v.seq) return; // 期间又打开了别的站点：这次作废
+      if (t) v.title.textContent = t[1].trim() || '企业小程序';
+      return rewriteSiteHTML(html, base, u.pathname, user);
+    }).then(function (html) {
+      if (my !== v.seq || !html) return;
+      v.frame.src = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+      v.busy.style.display = 'none';
+    }).catch(function (e) {
+      if (my !== v.seq) return;
+      v.busy.textContent = '打开失败：' + ((e && e.message) || e) + '（点「返回」重试）';
+    });
+  }
+  window.JX_REMOTE.openSite = openSite;
+  window.JX_REMOTE.siteAssetURL = siteAssetURL;
 
   /* ---------- 外壳缓存自愈 ----------
      210 配对页（gate.html）现版每次打开都经通道从家里拉最新外壳，localStorage

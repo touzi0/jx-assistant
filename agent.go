@@ -510,6 +510,13 @@ func (a *App) probeSelfLoc() {
 		}
 		return
 	}
+	if isLinuxRuntime {
+		// Linux 与 macOS 同款口径：只探测不装配，按本平台事实给运行时段。
+		if py := a.linuxPythonExe(); py != "" {
+			a.skillRTPrompt = skillRuntimePromptTextLinux(py)
+		}
+		return
+	}
 	if runtime.GOOS != "windows" {
 		return
 	}
@@ -526,6 +533,13 @@ func (a *App) probeSelfLoc() {
 // 编码注入那一套。
 func skillRuntimePromptTextDarwin(pyExe string) string {
 	return "\n\n## 内置技能运行时\n\n技能 Python 解释器位于 `" + pyExe + "`（内置 mac 运行时或系统 python3，office / pdf 等技能共用）。需要执行 Python 时一律用这个解释器的绝对路径，不要另找别的 python；缺依赖时调用对应技能会自动经 pip 镜像补装（首次需联网）。\n\n涉及中文、引号、JSON 的处理建议用 run_python 提交 Python 脚本（脚本本身 UTF-8 落盘，无编码坑）；run_command 与 run_python 都可用，一般按此分工走：单一工具链调用（go build / git status 等一条命令）直接 run_command。注意 shell 是 macOS（BSD 用户态）：sed 就地改要写 sed -i ''；没有 grep -P（用 grep -E）与 readlink -f（用 realpath）；进程管理用 ps / pkill。\n"
+}
+
+// skillRuntimePromptTextLinux Linux 的运行时段正文：与 darwin 版同一意图，
+// 按 Linux 事实表述——GNU 用户态（sed -i 直接用、grep -P / readlink -f 都有），
+// shell 走 sh/bash，无 PS 5.1 编码注入那一套。
+func skillRuntimePromptTextLinux(pyExe string) string {
+	return "\n\n## 内置技能运行时\n\n技能 Python 解释器位于 `" + pyExe + "`（内置 Linux 运行时或系统 python3，office / pdf 等技能共用）。需要执行 Python 时一律用这个解释器的绝对路径，不要另找别的 python；缺依赖时调用对应技能会自动经 pip 镜像补装（首次需联网）。\n\n涉及中文、引号、JSON 的处理建议用 run_python 提交 Python 脚本（脚本本身 UTF-8 落盘，无编码坑）；run_command 与 run_python 都可用，一般按此分工走：单一工具链调用（go build / git status 等一条命令）直接 run_command。shell 是 GNU 用户态：sed 就地改直接 sed -i；grep -P 与 readlink -f 可用；进程管理用 ps / pkill。\n"
 }
 
 // skillRuntimePromptText 运行时段正文（纯文本构造，便于单测）。既写明

@@ -8,8 +8,21 @@
 - Linux amd64，内核 ≥ 5.19 推荐（命令沙箱用 Landlock，5.13+ 可用；更老的内核
   自动退化为不限制执行）
 - curl + tar（安装脚本用）；systemd 可选（无 systemd 也可手动运行）
-- 不需要 Python：核心功能开箱即用；需要 run_python / 技能脚本时系统装 python3
-  即可（程序会自动探测 /usr/bin/python3）
+- **不需要系统 Python**：包内自带便携运行时（技能/_runtime/linux，
+  python-build-standalone 3.14 + 内置技能全部依赖，离线可用）。运行时意外缺失
+  时自动退回系统 python3（缺依赖会经 pip 镜像补装，需联网）
+
+## 包体构成（精简口径：Go 主程序 + Python）
+
+| 成分 | 内容 |
+|---|---|
+| jx-assistant-linux-amd64 | Go 主程序（静态链接，内嵌前端与沙箱 helper） |
+| 技能/（内置技能 + _runtime/linux） | 便携 Python 3.14 运行时 + pdf / ocr / office / downloader / apkinfo / web-search-local 技能 |
+
+**刻意不带**（相对 Windows 全量安装包）：语音组件（本地 ASR 模型 xasr /
+sherpa-onnx / 独立语音输入法）、「操作电脑」内置组件（cua-driver /
+windows-mcp）、md-viewer、用户技能与用户组件。听写可走云端渠道；桌面操控是
+Windows 形态专属，Linux 侧由 run_command / 浏览器工具覆盖。
 
 ## 一键安装（服务端已发布 Linux 附件时）
 
@@ -92,10 +105,12 @@ systemctl stop jx-assistant        # 停止（SIGTERM 优雅退出）
 |---|---|
 | 网页端（对话/工具/子任务编排/技能市场/远程接入/更新检查） | ✅ 完整可用（浏览器访问形态） |
 | run_command / run_python / 文件工具 | ✅ 可用（shell 走 sh；沙箱为 Landlock） |
+| 便携 Python 运行时（run_python / pdf / ocr / office 技能） | ✅ 随包内置（技能/_runtime/linux），离线可用 |
 | 桌面窗口壳（-desktop）、系统托盘、关窗驻留 | ❌ 仅 Windows，Linux 明确报错并按浏览器模式跑 |
-| 语音听写（本地 ASR 组件、独立语音输入法 voicetype） | ❌ Windows 专属；听写可走云端渠道 |
+| 语音听写（本地 ASR 组件、独立语音输入法 voicetype） | ❌ 精简去除（听写可走云端渠道） |
+| 「操作电脑」内置组件（cua / windows-mcp） | ❌ 精简去除（桌面操控是 Windows 形态专属） |
 | 密钥保护 | ❌ 无 DPAPI，明文落盘（0600），注意目录权限 |
-| 内置组件（危险命令护栏/待办/Git 面板/语音等随包组件） | ❌ 本包不含；后续可经组件市场/服务端分块分发 |
+| 其余随包组件（危险命令护栏/待办/Git 面板等） | ❌ 本包不含；后续可经组件市场/服务端分块分发 |
 | 程序内静默自更新 | ❌ Windows 机制不适用；用 install.sh 重跑升级 |
 | WebView 依赖 | 无任何 GUI 依赖，纯 headless 服务 |
 

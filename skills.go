@@ -258,12 +258,16 @@ func skillRuntimeNotice(msg string) {
 }
 
 // runtimePyInside 共享便携运行时（技能/_runtime）里的解释器路径：
-// Windows 布局 _runtime/python/python.exe；macOS 布局 _runtime/macos/bin/python3。
+// Windows 布局 _runtime/python/python.exe；macOS 布局 _runtime/macos/bin/python3；
+// Linux 布局 _runtime/linux/bin/python3（python-build-standalone 同款形态）。
 // 组件桥（componentbridge）与运行时热更新（update_runtime）也走它——
 // 运行时共享原则：组件与技能永远用同一份。
 func runtimePyInside(rtDir string) string {
 	if isDarwinRuntime {
 		return filepath.Join(rtDir, "macos", "bin", "python3")
+	}
+	if isLinuxRuntime {
+		return filepath.Join(rtDir, "linux", "bin", "python3")
 	}
 	return filepath.Join(rtDir, "python", "python.exe")
 }
@@ -275,6 +279,8 @@ func runtimePyInside(rtDir string) string {
 // 每次调用都核对本次技能的依赖（探测结果有缓存，常态零开销）。
 // macOS 优先内置 mac 运行时（技能/_runtime/macos），缺失退系统 python3、
 // 缺依赖 pip 镜像补装（skills_darwin.go）。
+// Linux 同款口径（skills_linux.go）：内置 linux 运行时优先，缺失退系统
+// python3，缺依赖 pip 镜像补装（系统解释器走 --user + PEP 668 重试）。
 func (a *App) ensureSkillRuntime(modules, wheels []string) (*pythonRuntime, error) {
 	provisionMu.Lock()
 	defer provisionMu.Unlock()
@@ -292,6 +298,14 @@ func (a *App) ensureSkillRuntime(modules, wheels []string) (*pythonRuntime, erro
 	}
 	if isDarwinRuntime {
 		py, err := a.ensureDarwinSkillRuntime(modules, wheels, emit)
+		if err != nil {
+			return nil, err
+		}
+		provisionedPy = py
+		return py, nil
+	}
+	if isLinuxRuntime {
+		py, err := a.ensureLinuxSkillRuntime(modules, wheels, emit)
 		if err != nil {
 			return nil, err
 		}

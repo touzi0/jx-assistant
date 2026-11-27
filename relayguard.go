@@ -31,10 +31,12 @@ var relayCooldownUntil atomic.Int64
 // 重连节奏：稳定链路断了就快速重连；「注册成功后很快被断」要按退避递增——
 // 那正是被网关踢（设备号冲突）或网关异常的形态，立刻重连只会变成热循环。
 const (
-	relayRetryMin    = 5 * time.Second
-	relayRetryMax    = 30 * time.Second
-	relayStableAfter = 60 * time.Second // 连接活过这么久再断，视为「正常断线」，快速重连
-	relayRegLogEvery = time.Minute      // 「已注册」日志节流（重连风暴时别刷爆日志）
+	relayRetryMin      = 5 * time.Second
+	relayRetryMax      = 30 * time.Second
+	relayReconnectFast = time.Second      // 稳定链路正常断线后的重连延迟：手机端的 503「中继 offline」空窗就是这一秒（2026-11-27 从 5s 压下来）
+	relayStableAfter   = 60 * time.Second // 连接活过这么久再断，视为「正常断线」，快速重连
+	relayRegLogEvery   = time.Minute      // 「已注册」日志节流（重连风暴时别刷爆日志）
+	relayWriteTimeout  = 20 * time.Second // 单帧写超时：网关停读/链路停滞时写会无限期持锁卡住 ping（见 hubCtx.writeFrame）
 )
 
 // 验密失败熔断（2026-11-04 洪泛防护）：/relay 匿名，攻击者知道设备号即可持续

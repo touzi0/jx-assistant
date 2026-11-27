@@ -193,6 +193,35 @@ Python 依赖按「谁用谁带走」归位，禁止混装：
   isAndroidRuntime` 常量，禁止散落 `runtime.GOOS` 比较；差异文件索引与
   新增平台 SOP 见《平台适配》节。
 
+### 远程访问形态（手机/外部电脑访问家端）的三条铁律（2026-11-27 事故沉淀）
+
+远程外壳 = 210 配对页经中继拉回的 `/api/p2p-shell`（内联 `web/remote-boot.js`，页面
+挂在**网关源**上）。它只劫持 `window.fetch`/XHR/EventSource，于是：
+
+- **浏览器导航不经 fetch 劫持**：iframe `src`、`window.open`、`<a target=_blank>`、
+  `<img src>`、`<script src>` 这些一律打到网关源 → 404 白屏（相对地址在 blob 文档里
+  连 `new URL` 都抛 Invalid URL）。任何要在远程形态下打开的东西，必须**经隧道 fetch
+  拉回来、拼成 blob/内联**，再由外壳层承载：平台页 `/sites` 走 `JX_REMOTE.loadSitesFrame`
+  （2026-11-03），具体站点 `/s/<id>/` 走 `JX_REMOTE.openSite`（2026-11-27：首页 +
+  相对资源 + CSS `url()` 逐个经隧道取回换 blob URL，注入站点 hook——fetch/XHR 按站点
+  目录解析并带 `?user=` 身份、运行时 `img/script/link` 赋值同样代载、站内导航在覆盖层
+  内翻页——装进外壳全屏覆盖层 `#jx-site-view` 带返回条）。**手机壳里 `window.open`
+  本来就会被 WebView 丢掉**，所以永远不要靠新开标签页承载远程内容。
+- **隧道白名单两端各一份、必须同步**：`remote-boot.js` 的 `tunnelPath()`（`/api/`、
+  `/sites`、`/s/`、`/attachments/`）与家端 `relayPathAllowed`。新加一类要远程可达的
+  路径（上次是 `/attachments/` 图片信封 → 远程看不到图片），两处一起改，缺一端就是
+  404/白屏。排查白屏先看请求到底打到了哪个源（网关源 vs 隧道）。
+- **中继 hub 连接是整台设备唯一的一条**：网关侧（jxaiserver `relay.go`）任何会阻塞
+  hub 读循环的调用都是全设备故障——2026-11-27 根因：`deliver()` 在手机侧通道满时
+  无限等，手机切后台停读 → 读循环卡死 → 家端 ping/pong 进不来 → `pingLoop` 30s 判死
+  踢掉整条中继 → 手机全线 `503 中继 offline`（已修：有界等待 + 只中断停滞的那条请求）。
+  家端配套（`remoteaccess.go`）：`writeFrame` 带 `relayWriteTimeout`（20s）写超时即
+  主动断开重连，不让一帧卡死 ping 协程；稳定链路断开 `relayReconnectFast`（1s）重连；
+  断开原因进日志（`- 设备` 与家端 `中继通道断开（…原因：…）`）。手机壳 `relayTunnelFetch`
+  对 GET/HEAD 的 503「offline/不在线」自动短重试（~8s 内 6 次），非幂等方法不重试
+  （家端可能已执行那一帧）。排查这类问题先看**掉线时刻是否贴着网关 30s tick**、再查
+  两机时钟差。
+
 ### 能不造轮子就不造轮子
 
 市面上有知名、成熟的工具或库，且体积不大、许可允许时，**直接用现成的**，
@@ -369,12 +398,27 @@ android/other/无后缀文件），构建脚本零改动。拆包（建 android/
   注意 git 推送凭据（凭据管理器的 OAuth）**不能**调 API——两套体系，别再
   临时登服务器开令牌。
 
-  **Linux 版发行与发版**（`打包/linux/`，2026-11-10 首版）：源文件入库的是
+  **Linux 版发行与发版**（`打包/linux/`，2026-11-10 首版；2026-11-27 精简版）：
+  源文件入库的是
   `install.sh`（POSIX sh，dash 兼容）、`README-Linux.md`、`jx-assistant.service`、
-  `打包-linux.ps1`；tar.gz 产物已 gitignore。出包在仓库根跑
-  `powershell -File 打包\linux\打包-linux.ps1`（交叉编译 linux/amd64 → 平铺打包
-  二进制+README+unit → 打印 sha256），产物 `jx-assistant-linux-amd64.tar.gz`
-  （约 18.6 MB）。**发版时必须把该 tar.gz 作为 Release 附件一并上传**——更新源是
+  `打包-linux.ps1`、`pkg-prepare.sh`（WSL 侧组装器）；tar.gz 产物已 gitignore。
+  出包在仓库根跑
+  `powershell -File 打包\linux\打包-linux.ps1`（交叉编译 → stage 暂存 → 硬校验 →
+  WSL 组装/校验/打包），产物 `jx-assistant-linux-amd64.tar.gz`（**约 225MB**），
+  `-NoRuntime` 出纯二进制包（约 19MB）。**精简口径**：Go 主程序 + Python 运行时
+  ——包内带 `技能/_runtime/linux`（python-build-standalone 3.14 + 内置技能全部
+  依赖，离线可用），**不带**语音组件 / cua / windows-mcp / 用户技能；Linux 侧
+  技能解释器探测（skills_linux.go）：内置运行时优先，缺则退系统 python3。
+  两个硬约束（详见 `验证记录-20261127-精简版.md` 的踩坑实录）：
+  ① **tar 必须在 WSL 里打**（Windows bsdtar 丢执行位与 symlink）；
+  ② 仓库副本的 `技能/_runtime/linux` 里 symlink 一律是「内容=目标」的文本文件
+  （robocopy 复制 LX_SYMLINK 报 ERROR 1920），真链接由 pkg-prepare.sh 打包时重建；
+  顶层出现 Windows 运行时残留（Lib/Scripts/.exe/.pyd 等）打包脚本直接拒出包。
+  运行时升级流程：WSL 里 python-build-standalone 新版解压 → pip 重装依赖 →
+  tar 流拷入 `技能/_runtime/linux` → sanitize symlink → 实测 import/OCR。
+  **`技能/_runtime/linux` 不入 git（2026-11-27 用户定：672MB 历史增重不划算，
+  发行包由打包脚本从工作区副本生成）**——仓库只留装配脚本与文档，运行时在
+  打包机上按上述流程装配维护；.gitignore 已排除。**发版时必须把该 tar.gz 作为 Release 附件一并上传**——更新源是
   jxai-server 的 `/updates/latest`（不是 Gitea：Gitea 仓库匿名不可见），附件经
   `publish-update` 登记；⚠️ 当前 jxai-server 的 publish-update 只有
   -engine/-component/-runtime/-skills/-installer 通道，**尚无通用附件参数**，

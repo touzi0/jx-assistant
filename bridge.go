@@ -147,6 +147,24 @@ if _d and _d not in sys.path:
     sys.path.insert(0, _d)
 `
 
+// bridgeSiteDir 解释器对应的 site-packages 目录：
+// Windows embeddable 布局 <rt>/python/python.exe → 同目录 Lib/site-packages；
+// python-build-standalone 布局（mac _runtime/macos、linux _runtime/linux）
+// <rt>/<平台>/bin/python3 → ../lib/python3.x/site-packages。两代运行时形态
+// 都要覆盖（Linux/mac 用后者，Windows 用前者）；都找不到时按解释器同目录
+// Lib 形态兜底（首次装配前的占位，无害）。
+func bridgeSiteDir(pyExe string) string {
+	exeDir := filepath.Dir(pyExe)
+	if d := filepath.Join(exeDir, "Lib", "site-packages"); dirExists(d) {
+		return d
+	}
+	root := filepath.Dir(exeDir)
+	if hits, _ := filepath.Glob(filepath.Join(root, "lib", "python3*", "site-packages")); len(hits) > 0 {
+		return hits[0]
+	}
+	return filepath.Join(exeDir, "Lib", "site-packages")
+}
+
 // bridgePrepare 为一次 run_python 调用装配桥：生成 jx.py（注入端口与新 token）、
 // 确保 sitecustomize 就位，返回归集 key 与收尾函数。收尾函数（bridgeRelease）
 // 注销 token、把未取走的子任务回报转交常规投递——前台在 runChild 返回后调，
@@ -157,7 +175,7 @@ func (a *App) bridgePrepare(t *toolContext, pyExe string) (string, func(), error
 		return "", nil, fmt.Errorf("创建脚本目录失败: %w", err)
 	}
 	if pyExe != "" { // 运行时就绪才写（未就绪时 jx.py 也写——前台报错路径同样无害）
-		sp := filepath.Join(filepath.Dir(pyExe), "Lib", "site-packages")
+		sp := bridgeSiteDir(pyExe)
 		if err := os.MkdirAll(sp, 0o755); err == nil {
 			_ = os.WriteFile(filepath.Join(sp, "sitecustomize.py"), []byte(bridgeSitecustomize), 0o644)
 		}

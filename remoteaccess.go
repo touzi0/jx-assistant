@@ -254,7 +254,7 @@ func runRemoteAccess(ctx context.Context, app *App, port int, cfg RemoteAccessCf
 		remoteConnected.Store(false)
 		switch {
 		case wasRegistered && up >= relayStableAfter:
-			delay = relayRetryMin // 稳定链路正常断线：快速重连
+			delay = relayReconnectFast // 稳定链路正常断线：快速重连
 		case wasRegistered:
 			// 注册成功却很快被断：按退避递增（被踢/网关异常的形态，别热循环）
 			delay = min(max(delay, relayRetryMin)*2, relayRetryMax)
@@ -268,13 +268,19 @@ func runRemoteAccess(ctx context.Context, app *App, port int, cfg RemoteAccessCf
 				delay = d
 			}
 		}
-		log.Printf("[远程] 中继通道断开（本次存活 %s），%s 后重连", up.Round(time.Second), delay.Round(time.Second))
+		// 断开原因一并进日志（2026-11-27 排查 jx-go 反复掉线：原因只存在状态接口里，
+		// 日志只有「断开…重连」，分不清是网关判死、读错还是自己写超时）
+		reason, _ := remoteLastError.Load().(string)
+		if reason == "" {
+			reason = "未知"
+		}
+		log.Printf("[远程] 中继通道断开（本次存活 %s，原因：%s），%s 后重连", up.Round(time.Second), reason, delay.Round(time.Second))
 		select {
 		case <-ctx.Done():
 			return
 		case <-netChanged:
 			log.Printf("[远程] 检测到网络环境变化，立即重新注册中继")
-			delay = relayRetryMin
+			delay = relayReconnectFast
 		case <-time.After(delay):
 		}
 	}
@@ -349,9 +355,8 @@ func (h *hubCtx) run() bool {
 					_ = conn.Close()
 					return
 				}
-				h.writeMu.Lock()
-				_ = wsutil.WriteClientMessage(conn, ws.OpPing, nil)
-				h.writeMu.Unlock()
+				// 经 writeFrame 写（带写超时）：网关停读时裸写会无限期卡住这条协程
+				_ = h.sendRaw(ws.OpPing, nil)
 			}
 		}
 	}()
@@ -377,7 +382,7 @@ func (h *hubCtx) run() bool {
 	for {
 		hdr, err := rd.NextFrame()
 		if err != nil {
-			remoteLastError.Store(fmt.Sprintf("通道读取失败: %v", err))
+			h.noteReadErr(err)
 			return h.registered
 		}
 		if hdr.OpCode != ws.OpText {
@@ -386,7 +391,7 @@ func (h *hubCtx) run() bool {
 			// 210 侧靠 isAlive 标记清理死链，两轮无 pong 即 terminate
 			payload, err := io.ReadAll(io.LimitReader(rd, 125))
 			if err != nil {
-				remoteLastError.Store(fmt.Sprintf("通道读取失败: %v", err))
+				h.noteReadErr(err)
 				return h.registered
 			}
 			if hdr.OpCode == ws.OpPing {
@@ -401,7 +406,7 @@ func (h *hubCtx) run() bool {
 		}
 		data, err := io.ReadAll(io.LimitReader(rd, 1<<26))
 		if err != nil {
-			remoteLastError.Store(fmt.Sprintf("通道读取失败: %v", err))
+			h.noteReadErr(err)
 			return h.registered
 		}
 		h.lastPong.Store(time.Now().UnixMilli())
@@ -859,28 +864,54 @@ func (h *hubCtx) replyErr(rid, id string, key []byte, msg string) {
 	_ = h.sendJSON(map[string]any{"t": "done", "rid": rid})
 }
 
+// noteReadErr 读循环出错时记原因：自己主动关连接（写超时/心跳僵死）之后的
+// "use of closed network connection" 不是原因，别把已经记下的真实原因盖掉。
+func (h *hubCtx) noteReadErr(err error) {
+	if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+		return
+	}
+	remoteLastError.Store(fmt.Sprintf("通道读取失败: %v", err))
+}
+
 /* ---------- ws 底层发送 ---------- */
+
+// writeFrame 串行写一帧（中继回帧/regok/ping/pong 全走这里），**带写超时**：
+// 网关停读或链路停滞时，裸写会在内核发送缓冲满后无限期阻塞并一直持有 writeMu，
+// ping 协程跟着卡死 → 网关 30s 内判死踢人、手机端全线 503（2026-11-27 jx-go 反复
+// 掉线；网关侧已修 deliver 不再卡读循环，这里是家端的兜底）。超时即视为链路
+// 已死：关掉连接让读循环退出、进入快速重连，不等网关来踢。
+func (h *hubCtx) writeFrame(op ws.OpCode, data []byte) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	conn := h.conn
+	if conn == nil {
+		return fmt.Errorf("hub not connected")
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(relayWriteTimeout))
+	err := wsutil.WriteClientMessage(conn, op, data)
+	_ = conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			remoteLastError.Store(fmt.Sprintf("写超时（网关 %s 未读走一帧），主动断开重连", relayWriteTimeout))
+			log.Printf("[远程] 中继通道写超时（%s 内网关未读走一帧，%d 字节），主动断开重连", relayWriteTimeout, len(data))
+			_ = conn.Close()
+		}
+		return err
+	}
+	return nil
+}
 
 func (h *hubCtx) sendJSON(v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	if h.conn == nil {
-		return fmt.Errorf("hub not connected")
-	}
-	return wsutil.WriteClientMessage(h.conn, ws.OpText, data)
+	return h.writeFrame(ws.OpText, data)
 }
 
 func (h *hubCtx) sendRaw(op ws.OpCode, data []byte) error {
-	h.writeMu.Lock()
-	defer h.writeMu.Unlock()
-	if h.conn == nil {
-		return fmt.Errorf("hub not connected")
-	}
-	return wsutil.WriteClientMessage(h.conn, op, data)
+	return h.writeFrame(op, data)
 }
 
 // validRemoteID 设备号格式：2~32 位字母/数字/中划线/下划线（网关按它做

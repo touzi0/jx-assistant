@@ -9,8 +9,10 @@
 #   sh install.sh --no-service          # 只放文件，不注册 systemd
 #   sh install.sh --insecure            # 下载源为自签证书时（curl -k）
 #
-# 安装目录只覆盖 jx-assistant / README-Linux.md / systemd unit；
-# config.json、data/、技能/、工作区 永不触碰——重复执行即为原地升级。
+# 安装目录覆盖 jx-assistant / README-Linux.md / systemd unit / 技能区
+# （内置技能 + _runtime/linux 便携运行时；包里没有的子目录一概不动，用户技能
+# 技能/user 天然保留）；config.json、data/、工作区 永不触碰——重复执行即为
+# 原地升级。旧版纯二进制包（无 技能/ 目录）同样可装，自动跳过技能区。
 set -eu
 
 BASE="https://jxaizz.com:2227"
@@ -107,6 +109,38 @@ $SUDO mkdir -p "$DEST"
 $SUDO install -m 0755 "$BIN_SRC" "$DEST/jx-assistant"
 [ -f "$README_SRC" ] && $SUDO install -m 0644 "$README_SRC" "$DEST/README-Linux.md"
 
+# ---- 技能区落位（随包分发：内置技能 + _runtime/linux 便携运行时）----
+# 只删/覆盖「包里有的」子目录：用户技能（技能/user 不在包内）与本地其他内容
+# 天然保留。纯二进制包（无 技能/ 目录）自动跳过。
+if [ -d "$EXDIR/技能" ]; then
+  echo "== 落位技能区（内置技能 + 便携 Python 运行时）"
+  $SUDO mkdir -p "$DEST/技能"
+  for d in "$EXDIR/技能"/*; do
+    [ -e "$d" ] || continue
+    name="$(basename "$d")"
+    $SUDO rm -rf "$DEST/技能/$name"
+    $SUDO cp -a "$d" "$DEST/技能/$name"
+  done
+  # 权限规整：tar 在无 metadata 文件系统上打出的模式位不可信（可能全 777），
+  # 按形态统一——目录 755、普通文件 644、运行时 bin 下 755。chmod 对 symlink
+  # 跟随目标，bin 下的别名链接指向的文件本就是 755，不冲突。
+  $SUDO find "$DEST/技能" -type d -exec chmod 0755 {} +
+  $SUDO find "$DEST/技能" -type f -exec chmod 0644 {} +
+  RTBIN="$DEST/技能/_runtime/linux/bin"
+  if [ -d "$RTBIN" ]; then
+    $SUDO find "$RTBIN" -maxdepth 1 -type f -exec chmod 0755 {} +
+    PYPICK=""
+    for cand in python3 python3.14; do
+      [ -x "$RTBIN/$cand" ] && PYPICK="$RTBIN/$cand" && break
+    done
+    if [ -n "$PYPICK" ]; then
+      "$PYPICK" --version >/dev/null 2>&1 \
+        || { echo "便携运行时自检失败（无法执行）: $PYPICK" >&2; exit 1; }
+      echo "   便携运行时就绪: $("$PYPICK" --version 2>&1)"
+    fi
+  fi
+fi
+
 # ---- systemd ----
 if [ "$HAVE_SYSTEMD" = "1" ]; then
   UNIT_DST="/etc/systemd/system/jx-assistant.service"
@@ -141,3 +175,5 @@ echo ""
 echo "首次启动会生成 $DEST/config.json（默认监听 127.0.0.1:8788）。"
 echo "其他机器访问：bindHost 改 0.0.0.0 后 systemctl restart jx-assistant（注意防火墙）。"
 echo "离线体验：config.json 的 baseURL 填 mock，无需 API Key。"
+echo "包内自带便携 Python（技能/_runtime/linux）：run_python 与 pdf / ocr / office"
+echo "等内置技能离线可用，不依赖系统 python3。"

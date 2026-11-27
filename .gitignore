@@ -6,6 +6,12 @@ config.json
 # 共享便携 Python 运行时入库（全部内置技能与语音组件共用，全新克隆零装配即用）：
 # 放在 *.exe 规则之后放行运行时内全部文件（含 python.exe、Scripts\*.exe）
 !技能/_runtime/**
+# 例外（2026-11-27 用户定）：Linux 便携运行时不入库——672MB 解压量直接进
+# git 历史得不偿失，且发行 tar.gz 由打包脚本从工作区副本生成、不依赖 git；
+# 装配/重建流程见 打包\linux\README-Linux.md 与验证记录（WSL + python-build-
+# standalone + pip + sanitize）。隔离的历史烂账目录同理（重启后物理删除）。
+技能/_runtime/linux/
+技能/_runtime/linux-烂账-重启后删/
 # 共享运行时只放基线（内置技能/组件依赖），任务域依赖放各自工具目录——
 # 归属规范见 AGENT.md「运行时与依赖归属」。装错地方会直接出现在 git status，不做忽略遮丑。
 # bridge.go 运行期幂等维护的 run_python 工具桥（删了自动重建，属运行时状态非基线）
