@@ -549,8 +549,9 @@ async function loadSessionInto(id, tok, opts) {
     state.cur.unread = false;
     api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
   }
-  // 会话正在执行（含刷新页面后重新打开）：接上它的流，继续实时显示
-  if (!state.streaming && (data.running || state.cur.status === 'running')) attachRun(mainView);
+  // 会话正在执行（含刷新页面后重新打开）：接上它的流，继续实时显示。基础窗刚落地，
+  // 接流前的对齐只补断点之后的增量（不再把刚取的窗口再拉一遍）
+  if (!state.streaming && (data.running || state.cur.status === 'running')) attachRun(mainView, { sinceSeq: lastSeqOf(mainView) });
   loadSessions();
   JX.emit('session:open', state.cur);
 }
@@ -3646,14 +3647,15 @@ function refreshCurrentSoon(delay) {
 }
 
 // 同款节流的 reloadMessages（attachRun 跟随后台执行时，轮内每条 message 事件
-// 都整包重取——汇报轮几十条消息就是几十次全量拉取）。按视图各管各的。
+// 都要重取——汇报轮几十条消息就是几十次拉取）。按视图各管各的。带 sinceSeq
+// 走增量（?after_seq）：跟随时界面只缺断点之后的新消息，不再每次整窗重拉
 const reloadTimers = {};
 function reloadMessagesSoon(view, delay) {
   view = view || mainView;
   clearTimeout(reloadTimers[view.key]);
   reloadTimers[view.key] = setTimeout(() => {
     reloadTimers[view.key] = 0;
-    reloadMessages(view);
+    reloadMessages(view, { sinceSeq: lastSeqOf(view) });
   }, delay == null ? 400 : delay);
 }
 
@@ -6141,10 +6143,11 @@ async function endTurn(view, aborted, stream) {
   } else {
     await refreshIfDangling(view); // 流断但后端仍在跑：接回去继续看
     // 正常收尾也重取一次：文件改动面板与交付卡片当轮即出（此前只有
-    // 重开会话时才会拉到 deliveries/checkpoints，同页跑完的回合永远不显示）
-    if (!view.state.streaming) await reloadMessages(view);
+    // 重开会话时才会拉到 deliveries/checkpoints，同页跑完的回合永远不显示）。
+    // 本轮消息流已逐条推到界面，这里只要断点之后的尾巴与登记——走增量，不整窗
+    if (!view.state.streaming) await reloadMessages(view, { sinceSeq: lastSeqOf(view) });
   }
-  // 中途的 await（backendRunning / reloadMessages 都取会话详情）在慢网下可达数秒，
+  // 中途的 await（运行态探测 / reloadMessages）在慢网下可能拖几秒，
   // 期间用户可能已切走/回首页：收尾前复验这条流仍属于当前界面，否则整个尾巴不动。
   // 晚到的旧续体曾把空消息盖到首页问候区上、连里面的输入卡一起销毁
   if (stream && (view.state.abort !== stream.abort ||
@@ -6517,19 +6520,13 @@ async function sendMidrun(content, viaInput, view, voiceUsed) {
   }
 }
 
-// 本轮 chat 是否已落库：从会话详情倒序找最后一条用户发言（role=user 且
-// kind=chat/空——注入回报行不算用户发言），正文与本次一致即认定服务端已收下。
-// 给 send 的断连兜底用：误判代价不对称——把已落库的消息再发一遍会重复执行一
+// 本轮 chat 是否已落库：拿运行态接口（/run）里的最后一条用户发言（服务端口径：
+// role=user 且 kind=chat/空——注入回报行不算用户发言），正文与本次一致即认定服务端
+// 已收下。给 send 的断连兜底用：误判代价不对称——把已落库的消息再发一遍会重复执行一
 // 轮（执行记录+排队项两条一样的），把没落库的误判成已落库只是少发一条（界面
 // 随后接回流，用户看得见会话还在跑，重发即可）。
-function userChatLanded(msgs, content) {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i];
-    if (m.role !== 'user') continue;
-    if (m.kind && m.kind !== 'chat') continue;
-    return m.content === content;
-  }
-  return false;
+function userChatLanded(lastUserChat, content) {
+  return !!(lastUserChat && typeof lastUserChat.content === 'string' && lastUserChat.content === content);
 }
 
 // prepareSend 是 send 的准备段：发送前钩子（可等待）→ 空文案守卫 → 懒建会话 →
@@ -6726,10 +6723,11 @@ async function send(forceContent, view) {
       let running = false;
       if (!accepted) {
         try {
-          const d = await api('/api/sessions/' + sid);
+          // 运行态轻接口（不拉整段历史）：此前这里不带分页参数调会话详情＝全量下发
+          const d = await api('/api/sessions/' + sid + '/run');
           if (d.pending && view.state.cur && view.state.cur.id === sid) applyPending(view, d.pending, sid);
-          running = !!(d.running || (d.meta && d.meta.status === 'running'));
-          accepted = userChatLanded(d.messages || [], content);
+          running = !!(d.running || d.status === 'running');
+          accepted = userChatLanded(d.lastUserChat, content);
         } catch (e2) { /* 探测也失败（服务不可达）：按没收下处理，走下面的兜底 */ }
       }
       if (accepted) {
@@ -6960,10 +6958,14 @@ function detachStream(view) {
 async function backendRunning(sid, view) {
   const v = view || mainView;
   try {
-    const d = await api('/api/sessions/' + sid);
+    // 运行态走轻接口（不带消息）。此前这里调的是会话详情且不带分页参数＝整段历史
+    // 全量下发：超长对话几 MB，而本函数每轮收尾（endTurn）、切回前台（visibilitychange）、
+    // 流看门狗重建、壳的刷新按钮都要调一次——远程手机上「退到别处再回来就几兆每秒
+    // 加载、半天加载不完」正是它（2026-11-27 用户报）。
+    const d = await api('/api/sessions/' + sid + '/run');
     // 慢网下响应可能晚于导航：pending 属于被探测的会话，只对仍停在它上面的界面生效
     if (d.pending && v.state.cur && v.state.cur.id === sid) applyPending(v, d.pending, sid);
-    return !!(d.running || (d.meta && d.meta.status === 'running'));
+    return !!(d.running || d.status === 'running');
   } catch (e) { return false; }
 }
 
@@ -6973,15 +6975,14 @@ async function refreshIfDangling(view) {
   if (!sid0) return;
   if (!(await backendRunning(sid0, view))) return;
   if (!view.state.cur || view.state.cur.id !== sid0) return; // 探测期间已切走：不接流
-  attachRun(view);
+  attachRun(view, { sinceSeq: lastSeqOf(view) }); // 界面已有到这个序号的内容：只补之后的
 }
 
 // reloadMessages 只重取当前会话的消息与待生效队列（不触发接流，避免与 attachRun 互相递归）
-// opts.sinceSeq：增量补拉——带上界面已有的最后一条消息序号，只把这条之后的新消息
-// 追加进列表（流重建自愈用）。服务端详情接口只支持 tail / before_seq，所以请求还是
-// 那一个基础窗，但「要哪一段」由这里的序号判定：窗口起点盖住了断点就追加、不重取
-// 历史（DOM 前缀照旧复用，视口原地不动）；盖不住（断流期间新增超过一个窗口）才退回
-// 整窗对齐，宁可多取一次也不让中间缺条。
+// opts.sinceSeq：增量补拉——带上界面已有的最后一条消息序号，服务端只回这条之后的新消息
+// （?after_seq），追加进列表（流重建自愈 / 跟随后台执行时的节流重取都用它）。此前请求
+// 仍是基础窗 tail、只是落地时按序号筛——网络上一分没省，远程手机上每轮收尾照样拉整窗。
+// 无 sinceSeq 的整窗对齐照旧 ?tail（打开/切回/断流后重对齐）。
 async function reloadMessages(view, opts) {
   view = view || mainView;
   if (!view.state.cur) return;
@@ -6989,17 +6990,16 @@ async function reloadMessages(view, opts) {
   const sinceSeq = (opts && opts.sinceSeq) || 0;
   const nav = navTok[view.key]; // 导航令牌：慢网下响应可能晚于切走/回首页，落地前必须复验
   try {
-    // 分批口径：只重取基础窗（tail），已上翻加载的头部原样保留——attached 事件
-    // 刷新不再把整段历史反复拉回（这正是主对话被事件轰炸时最大的流量来源）
-    const d = await api('/api/sessions/' + view.state.cur.id + '?tail=' + LOAD_BATCH);
+    const d = await api('/api/sessions/' + view.state.cur.id + (sinceSeq > 0 ? '?after_seq=' + sinceSeq : '?tail=' + LOAD_BATCH));
     // 已被更新的导航取代：晚到的旧会话数据不落地——否则 state.cur 被旧 meta 复活、
     // 界面被旧消息顶回旧会话，正是远程访问时「切过去又被跳回来」的根源
     if (nav !== navTok[view.key]) return;
     const incoming = d.messages || [];
-    const delta = sinceSeq > 0 && incoming.length > 0 && incoming[0].seq <= sinceSeq;
-    if (delta) {
-      // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）
-      view.state.msgs = view.state.msgs.concat(incoming.filter((m) => (m.seq || 0) > sinceSeq));
+    if (sinceSeq > 0) {
+      // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）。上界取
+      // 落地时的最后序号而非请求时的：期间流/另一次重取已推进的条目不重复追加
+      const upto = Math.max(sinceSeq, lastSeqOf(view));
+      if (incoming.length) view.state.msgs = view.state.msgs.concat(incoming.filter((m) => (m.seq || 0) > upto));
     } else {
       if (snapshotStale(view, view.state.cur.id, incoming)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
       const head = incoming.length ? view.state.msgs.filter((m) => m.seq < incoming[0].seq) : [];
@@ -7049,8 +7049,9 @@ async function attachRun(view, opts) {
   view.state.streaming = false;
   view.state.attached = false;
   setStreamUI(false, view);
-  // 执行可能在这一段里结束了：重取一次，落库内容与待生效队列都归位
-  if (view.state.cur && view.state.cur.id === cur.id) await reloadMessages(view);
+  // 执行可能在这一段里结束了：重取一次，落库内容与待生效队列都归位（跟随时界面
+  // 只缺断点之后的尾巴：增量即可，整窗对齐由 done 事件触发的就地翻新去做）
+  if (view.state.cur && view.state.cur.id === cur.id) await reloadMessages(view, { sinceSeq: lastSeqOf(view) });
   if (view === mainView) {
     loadSessions();
     refreshCtxChip();

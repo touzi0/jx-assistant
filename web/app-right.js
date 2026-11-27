@@ -502,8 +502,9 @@ async function openSubSession(id) {
     setSubPlaceholder('向子对话发消息…'); // 已进入子对话：空态的「自动新建」引导退场
     autoGrow($('sub-input'));
     restoreQuoteLS(subView); // 这个子对话挂着的引用胶囊也一并回来
-    // 这个子对话正在后台执行：接上它的流，右栏就地实时跟随
-    if (!subState.streaming && (data.running || subState.cur.status === 'running')) attachRun(subView);
+    // 这个子对话正在后台执行：接上它的流，右栏就地实时跟随。基础窗刚落地，接流前的
+    // 对齐只补断点之后的增量（主对话 loadSessionInto 同款）
+    if (!subState.streaming && (data.running || subState.cur.status === 'running')) attachRun(subView, { sinceSeq: lastSeqOf(subView) });
   } catch (e) {
     if (tok !== navTok.sub) return;
     // 会话已被删除（换对话时恢复的子对话可能早没了）：回空态，别留一个永远失败的重试

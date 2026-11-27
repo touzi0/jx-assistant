@@ -1351,6 +1351,19 @@ func (s *Store) LastSeq(id string) (int64, error) {
 	return n, err
 }
 
+// LastUserChat 取会话最后一条用户发言（role=user 且 kind 为 chat/空——AI 注入的
+// aiuser/report 行不算，与前端 userChatLanded 同口径）。运行态接口 /run 用它回答
+// 「刚才那条消息服务端收下了没」：发送断连兜底只需要这一条，不必为此拉整段历史
+//（超长对话整包几 MB，远程手机上正是它把下载通道占满）。
+func (s *Store) LastUserChat(id string) (*StoredMessage, error) {
+	row := s.db.QueryRow(`SELECT `+messageCols+` FROM messages WHERE session_id=? AND role='user' AND (kind='' OR kind='chat') ORDER BY seq DESC LIMIT 1`, id)
+	sm, err := scanMessage(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return sm, err
+}
+
 // RawMessagesAll 读取会话全部消息（含摘要行），供上下文组装与压缩使用。
 func (s *Store) RawMessagesAll(id string) ([]*StoredMessage, error) {
 	rows, err := s.db.Query(`SELECT `+messageCols+` FROM messages WHERE session_id=? ORDER BY seq`, id)

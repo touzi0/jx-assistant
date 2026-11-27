@@ -8,7 +8,8 @@ package main
 //  3. inherit 标记行不与后续首批拆开；envBoundary 取摘要覆盖边界最大值；
 //  4. isTurnStartMsg 与前端 lastTurnStart 同口径（aiuser/chat 起点，report 与
 //     旧库【前缀通知不算）；
-//  5. HTTP 层：不带参数 = 全量且无 older 字段（旧调用方零影响）；tail=N 带older。
+//  5. HTTP 层：缺省 = 最近 sessionTailDefault 条（带 older，不再隐式全量）；tail=N
+//     带 older；after_seq 只回增量；/run 运行态不带消息、带最后一条用户发言。
 
 import (
 	"context"
@@ -199,7 +200,8 @@ func TestIsTurnStartMsg(t *testing.T) {
 	}
 }
 
-// ⑤ HTTP 层：缺省 = 全量无 older；tail=N 返回 older。
+// ⑤ HTTP 层：缺省 = 最近 sessionTailDefault 条（不再隐式全量，带 older）；tail=N 返回
+// older；after_seq 只回增量（无 older）；/run 运行态不带消息、带最后一条用户发言。
 func TestHandleGetSessionTail(t *testing.T) {
 	a, main := newDispatchTestApp(t)
 	for i := 0; i < 20; i++ {
@@ -209,8 +211,8 @@ func TestHandleGetSessionTail(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	get := func(q string) (int, string, map[string]any) {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/api/sessions/"+main.ID+q, nil)
+	get := func(path string) (int, string, map[string]any) {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		a.apiMuxOf().ServeHTTP(rec, req)
 		var body map[string]any
@@ -219,34 +221,90 @@ func TestHandleGetSessionTail(t *testing.T) {
 		}
 		return rec.Code, rec.Body.String(), body
 	}
-	code, raw, body := get("")
+	detail := func(q string) (int, string, map[string]any) { return get("/api/sessions/" + main.ID + q) }
+	// 缺省不再全量：超过 sessionTailDefault 的只回最近一批，older 报剩余。追加的
+	// 1000 行按 user/assistant 交替（回合对齐最多多带 1 行，断言可写死）
+	for i := 0; i < 500; i++ {
+		if err := a.Store.AppendRow(main.ID, &StoredMessage{
+			Message: TextMessage("user", fmt.Sprintf("追加轮 %d", i)), Kind: "chat",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Store.AppendRow(main.ID, &StoredMessage{
+			Message: TextMessage("assistant", "答"), Kind: "chat",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, raw, body := detail("")
 	if code != 200 {
 		t.Fatalf("缺省应 200: %d %s", code, raw)
 	}
-	if _, has := body["older"]; has {
-		t.Fatal("不带分页参数时不应有 older 字段（全量，旧调用方零影响）")
+	if n := len(body["messages"].([]any)); n != sessionTailDefault {
+		t.Fatalf("缺省应下发最近 %d 条（不再隐式全量）: got %d", sessionTailDefault, n)
 	}
-	if len(body["messages"].([]any)) != 20 {
-		t.Fatal("缺省应全量下发")
+	if older := body["older"].(map[string]any); older["count"].(float64) != 20 {
+		t.Fatalf("缺省 older.count 应为 20: got %v", older["count"])
 	}
-	code, raw, body = get("?tail=7")
+	code, raw, body = detail("?tail=7")
 	if code != 200 {
 		t.Fatalf("tail 应 200: %d %s", code, raw)
 	}
 	msgs := body["messages"].([]any)
-	if len(msgs) != 7 {
-		t.Fatalf("tail=7 应下发 7 条: got %d", len(msgs))
+	if len(msgs) != 8 { // 7 条窗口起点落在 assistant 行：向前对齐到回合起点多带 1 行
+		t.Fatalf("tail=7 对齐后应下发 8 条: got %d", len(msgs))
 	}
 	first := msgs[0].(map[string]any)
-	if first["content"] != "第 14 轮" {
-		t.Fatalf("tail 窗口应取最近 7 条: 首条 %v", first["content"])
+	if first["content"] != "追加轮 496" {
+		t.Fatalf("tail 窗口应从回合起点开始: 首条 %v", first["content"])
 	}
 	older := body["older"].(map[string]any)
-	if older["count"].(float64) != 13 {
-		t.Fatalf("older.count 应为 13: got %v", older["count"])
+	if older["count"].(float64) != 1012 {
+		t.Fatalf("older.count 应为 1012: got %v", older["count"])
 	}
 	if _, has := older["sys"]; has {
 		t.Fatal("older 不再携带 sys/tools 基线（快照形态由引擎记录的 chg 决定）")
+	}
+	// after_seq：只回 seq 大于它的行，无 older（增量补拉不接上翻）
+	lastSeq, _ := a.Store.LastSeq(main.ID)
+	code, raw, body = detail("?after_seq=" + fmt.Sprint(lastSeq-3))
+	if code != 200 {
+		t.Fatalf("after_seq 应 200: %d %s", code, raw)
+	}
+	if msgs = body["messages"].([]any); len(msgs) != 3 {
+		t.Fatalf("after_seq 应只回 3 条增量: got %d", len(msgs))
+	}
+	if _, has := body["older"]; has {
+		t.Fatal("after_seq 是增量：不应带 older")
+	}
+	if _, has := body["meta"]; !has {
+		t.Fatal("after_seq 与 tail 同一份信封：meta/pending 等照常下发")
+	}
+	code, raw, body = detail("?after_seq=" + fmt.Sprint(lastSeq))
+	if code != 200 || len(body["messages"].([]any)) != 0 {
+		t.Fatalf("after_seq=末条 应 200 且 0 条: %d %s", code, raw)
+	}
+	// /run：运行态不带消息；最后一条用户发言按存储口径（role=user 且 kind=chat/空）
+	code, raw, body = get("/api/sessions/" + main.ID + "/run")
+	if code != 200 {
+		t.Fatalf("/run 应 200: %d %s", code, raw)
+	}
+	if _, has := body["messages"]; has {
+		t.Fatalf("/run 不带消息: %s", raw)
+	}
+	if body["running"] != false || body["pending"] == nil || body["error"] != "" {
+		t.Fatalf("/run 字段形态不对: %s", raw)
+	}
+	lu := body["lastUserChat"].(map[string]any)
+	if lu["content"] != "追加轮 499" || lu["seq"].(float64) != 1019 {
+		t.Fatalf("lastUserChat 应是最后一条用户发言（追加轮 499）: %v", lu)
+	}
+	if err := a.Store.AppendRow(main.ID, &StoredMessage{Message: TextMessage("user", "【派发回报】xx"), Kind: "report"}); err != nil {
+		t.Fatal(err)
+	}
+	_, raw, body = get("/api/sessions/" + main.ID + "/run")
+	if lu = body["lastUserChat"].(map[string]any); lu["content"] != "追加轮 499" {
+		t.Fatalf("注入回报行不算用户发言: %v", lu)
 	}
 }
 

@@ -333,7 +333,8 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/providers/fetch", a.handleFetchModels)
 	a.apiRoute(mux, "GET /api/sessions", a.handleListSessions, apiMeta{Summary: "会话列表", Params: "parent=按父会话查子对话", Perm: permReadOnly})
 	a.apiRoute(mux, "POST /api/sessions", a.handleCreateSession, apiMeta{Summary: "新建会话", Params: "mode/workspace/title/provider/model/permission/planMode/parent/inheritContext 等", Perm: permWorkspace})
-	a.apiRoute(mux, "GET /api/sessions/{id}", a.handleGetSession, apiMeta{Summary: "会话详情（含运行态/排队/最近错误）", Perm: permReadOnly})
+	a.apiRoute(mux, "GET /api/sessions/{id}", a.handleGetSession, apiMeta{Summary: "会话详情（meta/消息/运行态/排队/最近错误）", Params: "tail=N 最近 N 条（缺省 1000，不再全量）；before_seq=S&limit=N 取更早一批；after_seq=S 只取增量", Perm: permReadOnly})
+	a.apiRoute(mux, "GET /api/sessions/{id}/run", a.handleSessionRun, apiMeta{Summary: "会话运行态（轻量，不带消息）：是否在执行/排队/最近错误/最后一条用户发言", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/sessions/{id}/inherit", a.handleSessionInherit, apiMeta{Summary: "子对话承接段的更早历史（懒加载，只读）", Params: "before_seq=父会话游标、limit≤500（缺省 200）", Perm: permReadOnly})
 	a.apiRoute(mux, "GET /api/sessions/{id}/messages", a.handleSessionMessages, apiMeta{Summary: "会话消息轻量文本列表", Params: "role 过滤（如 user）、limit 从最新往回收", Perm: permReadOnly})
 	a.apiRoute(mux, "PATCH /api/sessions/{id}", a.handlePatchSession, apiMeta{Summary: "改会话设置", Params: "title/model/provider/permission/thinking/archived/unread 等", Perm: permWorkspace})
@@ -2077,6 +2078,10 @@ func attachEnvRenders(rows []*StoredMessage, renders map[int64]envRender) {
 	}
 }
 
+// sessionTailDefault 会话详情不带分页参数时的缺省窗口（条）：与前端 LOAD_BATCH
+// 同口径。详情接口不再有「不带参数 = 全量」的形态（见 handleGetSession）。
+const sessionTailDefault = 1000
+
 // olderInfo 是分批加载时「切点之前还有多少没下发」。
 type olderInfo struct {
 	Count int `json:"count"`
@@ -2219,21 +2224,35 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	envRenders := renderEnvRows(msgs, boundary)
 	all := msgs
-	// 分批加载（超长对话）：不带参数 = 全量下发（旧调用方零影响）。带 tail /
-	// before_seq 时切出最近一批（回合对齐，见 sliceMsgWindow），older 携带切点前
-	// 剩余条数——前端据 older 显示「上面还有 N 条」并按需再取上一批
+	// 消息窗口由查询参数选，三种口径，**没有隐式全量**（2026-11-27 起缺省也按
+	// sessionTailDefault 取最近一批）：此前不带参数 = 整段历史全量下发，而前端
+	// 「后端还在跑吗」的探测（每轮收尾 / 切回前台 / 流看门狗 / 刷新按钮）正是
+	// 不带参数调的详情——超长对话几 MB，远程手机上切回前台一次就是几 MB 下载，
+	// 把同一条中继通道上的对话流挤成假死。要更早的历史显式 before_seq 接力；
+	// 真要全量的只有导出（/export）与历史读取工具，它们直读库、不走这里。
+	//   tail=N        最近 N 条（回合对齐，见 sliceMsgWindow），older 携带切点前剩余条数
+	//   before_seq=S  切点之前一批（limit 可选），同样回合对齐——前端上翻接力
+	//   after_seq=S   只取 seq 大于 S 的增量（流断线补拉：已加载的一条不重传），无 older
 	var olderPtr *olderInfo
 	hi := len(all)
-	if n, terr := strconv.Atoi(r.URL.Query().Get("tail")); terr == nil && n > 0 {
+	q := r.URL.Query()
+	after, _ := strconv.ParseInt(q.Get("after_seq"), 10, 64)
+	if n, terr := strconv.Atoi(q.Get("tail")); terr == nil && n > 0 {
 		win, info := sliceMsgWindow(all, len(all)-n, len(all))
 		msgs, olderPtr = win, &info
-	} else if bs, berr := strconv.ParseInt(r.URL.Query().Get("before_seq"), 10, 64); berr == nil && bs > 0 {
+	} else if bs, berr := strconv.ParseInt(q.Get("before_seq"), 10, 64); berr == nil && bs > 0 {
 		lim := 0
-		if v, lerr := strconv.Atoi(r.URL.Query().Get("limit")); lerr == nil && v > 0 {
+		if v, lerr := strconv.Atoi(q.Get("limit")); lerr == nil && v > 0 {
 			lim = v
 		}
 		hi = sort.Search(len(all), func(i int) bool { return all[i].Seq >= bs })
 		win, info := sliceMsgWindow(all, hi-lim, hi)
+		msgs, olderPtr = win, &info
+	} else if after > 0 {
+		lo := sort.Search(len(all), func(i int) bool { return all[i].Seq > after })
+		msgs = all[lo:hi]
+	} else {
+		win, info := sliceMsgWindow(all, len(all)-sessionTailDefault, len(all))
 		msgs, olderPtr = win, &info
 	}
 	slimRowsForUI(all, hi-len(msgs), hi) // 下发瘦身：库内原样，只削响应副本（见函数注释）
@@ -2264,7 +2283,36 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		"titlePinned": m.TitlePinned,    // 手动命名钉住：AI 自动标题（组件 session-title）停改
 	}
 	if olderPtr != nil {
-		resp["older"] = *olderPtr // 分批加载：上面未下发的条数 + 分组基线（无此字段 = 全量）
+		resp["older"] = *olderPtr // 分批加载：上面未下发的条数 + 分组基线（无此字段 = 增量/无更早）
+	}
+	writeJSON(w, 200, resp)
+}
+
+// handleSessionRun 会话运行态（轻量，**不带消息**）：是否在执行、排队/插话队列、
+// 最近一次失败原因、最后一条用户发言。前端「后端还在跑吗」的探测——每轮收尾
+// （endTurn）、切回前台（visibilitychange）、流看门狗重建、壳的刷新按钮——全走
+// 这里。此前它们调会话详情且不带分页参数，等于整段历史全量下发：超长对话几 MB，
+// 远程手机上切回前台一次就是几 MB 下载，与同一通道上的对话流抢带宽（2026-11-27
+// 用户报「退到别处再回来就几兆每秒加载、半天加载不完」的根源之一）。
+// 响应：{running, status, pending, error, lastUserChat:{seq,content}|null}
+func (a *App) handleSessionRun(w http.ResponseWriter, r *http.Request) {
+	m := a.sessionFromPath(w, r)
+	if m == nil {
+		return
+	}
+	resp := map[string]any{
+		"running": a.IsRunning(m.ID),
+		"status":  m.Status,
+		"pending": a.pendingOf(m.ID),
+		"error":   a.runError(m.ID),
+		// 发送断连兜底要判「刚才那条消息服务端收下了没」（前端 userChatLanded）：
+		// 只需最后一条用户发言，带在运行态里一并回，省掉一次消息拉取
+		"lastUserChat": nil,
+	}
+	if last, err := a.Store.LastUserChat(m.ID); err == nil && last != nil {
+		if s, ok := last.Content.(string); ok {
+			resp["lastUserChat"] = map[string]any{"seq": last.Seq, "content": s}
+		}
 	}
 	writeJSON(w, 200, resp)
 }
