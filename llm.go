@@ -387,14 +387,24 @@ func streamProtoOnce(ctx context.Context, baseURL, apiKey string, body []byte, p
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return errors.New(upstreamErrText(resp.StatusCode, snippet))
+		return errors.New(upstreamErrText(resp.StatusCode, snippet, imagesInBody(body)))
 	}
 	return proto.parse(resp.Body, cb)
 }
 
+// imagesInBody 数请求体里内联了几张图（data:image/ 前缀三协议通用：OpenAI
+// 兼容的 image_url、Anthropic 的 image、Responses 的 input_image 都是它）。
+// 报错时据此给出图片相关线索——网关拒收大请求体时只会回一句干巴巴的状态码。
+func imagesInBody(body []byte) int {
+	return bytes.Count(body, []byte(`"data:image/`))
+}
+
 // upstreamErrText 把网关返回的错误整理成用户看得懂的一行：优先取 JSON 里的
 // error.message / message（余额不足、限流、鉴权失败这类都在这），否则回退原文摘要。
-func upstreamErrText(status int, body []byte) string {
+// imgs 是本次请求携带的图片张数：带图的请求被拒（400/413 等）时补一句图片线索，
+// 用户才知道该去缩小图片还是去查别的——2026-11-27 的真 bug 就是一张超大图
+// 让每个视觉模型都报一句看不懂的 4xx，换纯文本模型才「好了」。
+func upstreamErrText(status int, body []byte, imgs int) string {
 	type apiErr struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -420,14 +430,28 @@ func upstreamErrText(status int, body []byte) string {
 		}
 	}
 	if text == "" {
-		text = strings.TrimSpace(string(body))
+		// nginx 这类网关的 413/414 回的是整页 HTML：剥掉标签只留一句人话
+		if status == http.StatusRequestEntityTooLarge {
+			text = "请求体过大（Request Entity Too Large）"
+		} else if strings.Contains(strings.ToLower(string(body)), "<html") {
+			text = http.StatusText(status)
+		} else {
+			text = strings.TrimSpace(string(body))
+		}
 	}
 	// 折叠成单行并限长：报错条是一行提示，不是日志
 	text = strings.Join(strings.Fields(text), " ")
 	if text == "" {
 		text = http.StatusText(status)
 	}
-	return fmt.Sprintf("模型服务返回 %d：%s", status, truncateRunes(text, 300))
+	msg := fmt.Sprintf("模型服务返回 %d：%s", status, truncateRunes(text, 300))
+	switch {
+	case status == http.StatusRequestEntityTooLarge:
+		msg += "（服务端拒绝了过大的请求：通常是携带的图片或超长内容超出它的限制；图片会自动压缩到预算内，若仍失败请换模型或先压缩历史）"
+	case imgs > 0 && (status == 400 || status == 415 || status == 422):
+		msg += fmt.Sprintf("（本次请求携带 %d 张图片，可能是图片体积或格式被该模型/网关拒绝；可换模型再试，或先用 OCR 识别文字）", imgs)
+	}
+	return msg
 }
 
 // connErrText 把底层连接错误整理成一句人话（超时/拒连/证书各说各的）。
@@ -484,10 +508,10 @@ func isModelUnavailableErr(err error) bool {
 
 // isRetryableModelErr 判断一次模型调用失败是否值得自动重试。值得的是瞬态
 // 网络类：连接失败/超时（"无法连接模型服务"）、流中途断开（parseSSE 抛出的
-// 原始 IO 错误）、网关 5xx 与限流 429。请求级错误（400/401/402/403/404——
-// 请求非法/鉴权失败/余额不足/模型不存在）换个时机结果一样；上下文超限交给
-// overflowCompact 兜底——两者都不在此重试。调用方还需自行排除 ctx 取消
-// （用户点了停止，绝不重试）。
+// 原始 IO 错误）、网关 5xx 与限流 429。请求级错误（400/401/402/403/404 与
+// 413/415/422——请求非法/鉴权失败/余额不足/模型不存在/请求体过大或格式
+// 不受支持）换个时机结果一样；上下文超限交给 overflowCompact 兜底——两者都
+// 不在此重试。调用方还需自行排除 ctx 取消（用户点了停止，绝不重试）。
 func isRetryableModelErr(err error) bool {
 	if err == nil || isOverflowError(err) {
 		return false
@@ -498,7 +522,9 @@ func isRetryableModelErr(err error) bool {
 		return false
 	}
 	s := err.Error()
-	for _, sc := range []int{400, 401, 402, 403, 404} {
+	// 413/415/422 与 4xx 同列：请求体过大/格式不支持/无法处理，重发一字不改
+	// 结果一样（带大图的请求被网关拒收就是这种），不白等 5 次重试
+	for _, sc := range []int{400, 401, 402, 403, 404, 413, 415, 422} {
 		if strings.Contains(s, fmt.Sprintf("模型服务返回 %d", sc)) {
 			return false
 		}

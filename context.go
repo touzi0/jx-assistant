@@ -1390,23 +1390,28 @@ var imgEnvAttRe = regexp.MustCompile(`attachment="([^"]*)"`)
 var imgEnvPathRe = regexp.MustCompile(`path="([^"]*)"`)
 
 func stripImageEnvelopes(text string, seq int64) string {
+	return replaceImageEnvelopes(text, func(att, path string) string {
+		note := "（图片已卸载 · 附件 " + att
+		if path != "" {
+			note += " · 源文件 " + path + " · 重看：read_image " + path
+		}
+		return note + "，或 read_session_messages(seq=" + strconv.FormatInt(seq, 10) + ")）"
+	})
+}
+
+// replaceImageEnvelopes 把文本里每个完整的图片信封标签换成 note 生成的标注行
+// （按正则匹配，信封出现在哪一行都能替换）。两处使用：规则压缩的折叠视图
+// （stripImageEnvelopes）与历史查询工具（historytools.go）——两处都是「文字
+// 回看」，图片本体一律不随之进入上下文：信封一旦原样留在文本里，
+// inlineImagesForRequest 下一轮就会把附件库里的原图内联进请求，一张超大图
+// 就会让每个读到这段文字的会话（包括长期助理）步步 400。
+func replaceImageEnvelopes(text string, note func(att, path string) string) string {
 	if !strings.Contains(text, "<image attachment=") {
 		return text
 	}
-	lines := strings.Split(text, "\n")
-	for i, ln := range lines {
-		t := strings.TrimSpace(ln)
-		if !strings.HasPrefix(t, "<image attachment=") || !strings.HasSuffix(t, "/>") {
-			continue
-		}
-		note := "（图片已卸载 · 附件 " + firstSegment(imgEnvAttRe, t)
-		if p := firstSegment(imgEnvPathRe, t); p != "" {
-			note += " · 源文件 " + p + " · 重看：read_image " + p
-		}
-		note += "，或 read_session_messages(seq=" + strconv.FormatInt(seq, 10) + ")）"
-		lines[i] = note
-	}
-	return strings.Join(lines, "\n")
+	return imageEnvelopeRe.ReplaceAllStringFunc(text, func(tag string) string {
+		return note(firstSegment(imgEnvAttRe, tag), firstSegment(imgEnvPathRe, tag))
+	})
 }
 
 // firstSegment 取正则第一个捕获组（无匹配返回空）。

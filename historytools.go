@@ -65,8 +65,9 @@ func runSearchSessions(t *toolContext, args json.RawMessage) (string, error) {
 		if title == "" {
 			title = "(未命名)"
 		}
+		// 片段可能截自带图片信封的工具结果：同样只留引用，不把信封原样带回去
 		lines = append(lines, fmt.Sprintf("- %s｜id=%s｜模式=%s｜第 %d 条 %s：%s",
-			title, h.SessionID, h.Mode, h.Seq, h.Role, h.Snippet))
+			title, h.SessionID, h.Mode, h.Seq, h.Role, replaceImageEnvelopes(h.Snippet, historyImageNote)))
 	}
 	return strings.Join(lines, "\n") + "\n（要细看用 read_session_messages（from_seq=命中 seq）从该位置往后读原文；只要那一条就传 seq=命中 seq，整条完整返回）", nil
 }
@@ -292,6 +293,22 @@ func renderHistoryEntryFull(m *StoredMessage) string {
 	return head + body
 }
 
+// historyImageNote 历史查询里的图片信封替换文案：只给引用不给本体。读历史
+// 是文字回看，原图不随之内联进上下文（设计动机见 replaceImageEnvelopes）；
+// 真要看图让模型按源文件路径显式 read_image——附件路径指向的是本机附件库，
+// 换台电脑读同一份历史时它根本不存在，更不能当成可内联的图。
+func historyImageNote(att, path string) string {
+	note := "（图片"
+	if path != "" {
+		note += " " + path
+	}
+	if att != "" {
+		note += " · 附件 " + att
+	}
+	note += "，历史读取不带原图；需要看内容：read_image 源文件路径，或用 OCR 识别文字）"
+	return note
+}
+
 // historyRowParts 把一条消息拆成「标识头 + 正文」：正文保留原始换行（历史查询看
 // 的就是原文格式）。思考原文完整保留；工具调用参数按档位折叠：full=false（倒序
 // 翻页 / from_seq 窗口，字数预算场景）按 argKeepLimit 折叠并注明；full=true
@@ -299,6 +316,8 @@ func renderHistoryEntryFull(m *StoredMessage) string {
 // read_session_messages(seq=N)」必须兑现，否则被压缩的工具调用只剩前 500 字、
 // 且渲染文本已「显示完整」连续读入口都没有，原文就再也找不回来了（前端能显示
 // 的原文，模型就必须能读回；2026-11-19 修）。超长由调用方的预算与续读兜底。
+// 工具结果里的图片信封一律换成引用标注（historyImageNote）——seq 完整读取
+// 也不例外：图片本体本来就不在文字里，换成标注不丢任何模型能读到的信息。
 func historyRowParts(m *StoredMessage, full bool) (head, body string) {
 	head = fmt.Sprintf("[%d] %s：", m.Seq, m.Role)
 	var b strings.Builder
@@ -306,6 +325,9 @@ func historyRowParts(m *StoredMessage, full bool) (head, body string) {
 		b.WriteString("【思考】" + m.Thinking + "\n")
 	}
 	if s := m.Text(); strings.TrimSpace(s) != "" {
+		if m.Role == "tool" {
+			s = replaceImageEnvelopes(s, historyImageNote)
+		}
 		b.WriteString(strings.TrimSpace(s))
 	}
 	for _, tc := range m.ToolCalls {
