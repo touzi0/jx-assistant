@@ -440,7 +440,9 @@ function subClearCurrent() {
   autoGrow($('sub-input'));
 }
 
-// 子对话只在右栏显示，绝不切换主对话区
+// 子对话只在右栏显示，绝不切换主对话区。这里只是导航壳（放开本地流 / 导航令牌 / 乐观
+// 切换 / 失败提示），取数与落地走 loadSessionDetail——与主对话 openSession 同一条链路
+// （2026-11-28 之前这里另写了一份同款的取数/落地/壳/接流，两条相同的路，已合并）
 async function openSubSession(id) {
   // 右栏换子对话：同样先放开本地这条流（后端执行照旧，回来自动接上）
   if (subState.streaming && (!subState.cur || subState.cur.id !== id)) detachStream(subView);
@@ -451,60 +453,7 @@ async function openSubSession(id) {
   const brief = (state.sessions || []).find((s) => s.id === id);
   if (brief && (!subState.cur || subState.cur.id !== id)) optimisticSwitch(subView, brief);
   try {
-    // 分批口径与主对话同款：只取最近一批（超长子对话整包同样卡），上翻预取接管更早的
-    const data = await api('/api/sessions/' + id + '?tail=' + LOAD_BATCH);
-    if (tok !== navTok.sub) return; // 已被更新的导航取代：晚到的旧响应不落地
-    subState._loading = false; // 数据落地：退出加载态（必须在 renderMessages 之前）
-    // 迟到的旧快照（见 app-chat.js 的 snapshotStale，同会话才可比）：右栏已被
-    // 流式帧推进到更新，整包不应用，只收掉加载态并按现状重绘
-    if (snapshotStale(subView, id, data.messages)) {
-      renderMessages(subState.msgs, subView);
-      return;
-    }
-    // 落盘必须在 cur 改写之前（persistSubDraftLS 认的是当前 subState.cur）：此刻
-    // cur 可能是上一个子对话（没走乐观切换）或已是目标（乐观切换已把 cur 换了），
-    // 两种都对。放在 cur 之后再 flush 就会把上一个子对话的字写进目标子对话的草稿键
-    flushSubDraft();
-    subState.cur = data.meta;
-    subState.msgs = data.messages || [];
-    // 分批记账：本窗之上的未加载条数、批栈清零（主对话同款）
-    subState.older = data.older ? { count: data.older.count || 0 } : undefined;
-    subState._batches = [];
-    // 打开即视为已读（与主对话 openSession 同款）：清红点与完成绿点，下拉清单数据同步
-    delete dotDone[id];
-    if (subState.cur.unread) {
-      subState.cur.unread = false;
-      const kid = subKids.find((k) => k.id === id);
-      if (kid) kid.unread = false;
-      api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
-    }
-    landPendingSnapshot(subState, data.pending, subView); // 在途旧快照不抹掉已画上的排队坞/插话框
-    // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
-    subState.queueHeld = subState.pendingQueue.length > 0 && !subState.queuePaused &&
-      !(data.running || (subState.cur && subState.cur.status === 'running'));
-    subState.checkpoints = data.checkpoints || [];
-    subState.deliveries = data.deliveries || [];
-    if (data.error) showRunError(subView, data.error); else hideRunError(subView);
-    subState.streamText = '';
-    subState.streamThinking = '';
-    subRenderHeader();
-    renderMessages(subState.msgs, subView, { jump: true });
-    renderLoadOlderBar(subView); // 分批顶条（右栏同款）
-    renderQueueDock(subView);
-    syncComposer(subView); // 右栏那套输入区控件跟着这个子对话刷新（权限/模型/模式/上下文圆环）
-    syncComposerPad(subView); // 悬浮输入区：重算子对话消息列的垫高与按钮锚点
-    renderPanels(); // 待决定的浮窗：这个子对话自己的卡落在右栏输入区上方，主对话区那份随之撤掉
-    // 输入框整体替换为该子对话的草稿（打字时已即时落盘；没有草稿就是空，不残留上一个子对话的字）。
-    // 落盘已在 cur 改写之前做过（见上方 flushSubDraft），这里只读目标草稿
-    try {
-      $('sub-input').value = localStorage.getItem(subDraftKey(id)) || '';
-    } catch (e) { $('sub-input').value = ''; }
-    setSubPlaceholder('向子对话发消息…'); // 已进入子对话：空态的「自动新建」引导退场
-    autoGrow($('sub-input'));
-    restoreQuoteLS(subView); // 这个子对话挂着的引用胶囊也一并回来
-    // 这个子对话正在后台执行：接上它的流，右栏就地实时跟随。基础窗刚落地，接流前的
-    // 对齐只补断点之后的增量（主对话 loadSessionInto 同款）
-    if (!subState.streaming && (data.running || subState.cur.status === 'running')) attachRun(subView, { sinceSeq: lastSeqOf(subView) });
+    await loadSessionDetail(subView, id, tok);
   } catch (e) {
     if (tok !== navTok.sub) return;
     // 会话已被删除（换对话时恢复的子对话可能早没了）：回空态，别留一个永远失败的重试

@@ -2275,40 +2275,51 @@ func (a *App) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	// meta 一并带上钉住标记：title_worker 的预检读 meta.titlePinned——此前只有
 	// 顶层字段，预检永远落空，钉住会话每个节奏轮都白调一次模型再吃 409
 	m.TitlePinned = a.titlePinned(m.ID)
-	resp := map[string]any{
-		"meta": m, "messages": msgs,
-		"running": a.IsRunning(m.ID), "pending": a.pendingOf(m.ID),
-		"checkpoints": cps, "deliveries": dvs,
-		"error":       a.runError(m.ID), // 最近一次失败原因（输入框上方报错条 + 重试）
-		"titlePinned": m.TitlePinned,    // 手动命名钉住：AI 自动标题（组件 session-title）停改
-	}
+	// 运行态与 /run 轻接口同一份（sessionRunState）：详情 = 运行态 + 数据（meta/消息窗口/
+	// 检查点/交付），/run = 运行态 + 最后一条用户发言；两处口径不可能分叉
+	resp := a.sessionRunState(m)
+	resp["meta"] = m
+	resp["messages"] = msgs
+	resp["checkpoints"] = cps
+	resp["deliveries"] = dvs
+	// meta 一并带上钉住标记：title_worker 的预检读 meta.titlePinned——此前只有
+	// 顶层字段，预检永远落空，钉住会话每个节奏轮都白调一次模型再吃 409
+	resp["titlePinned"] = m.TitlePinned // 手动命名钉住：AI 自动标题（组件 session-title）停改
 	if olderPtr != nil {
-		resp["older"] = *olderPtr // 分批加载：上面未下发的条数 + 分组基线（无此字段 = 增量/无更早）
+		resp["older"] = *olderPtr // 分批加载：上面未下发的条数（无此字段 = 增量/无更早）
 	}
 	writeJSON(w, 200, resp)
 }
 
-// handleSessionRun 会话运行态（轻量，**不带消息**）：是否在执行、排队/插话队列、
-// 最近一次失败原因、最后一条用户发言。前端「后端还在跑吗」的探测——每轮收尾
-// （endTurn）、切回前台（visibilitychange）、流看门狗重建、壳的刷新按钮——全走
-// 这里。此前它们调会话详情且不带分页参数，等于整段历史全量下发：超长对话几 MB，
-// 远程手机上切回前台一次就是几 MB 下载，与同一通道上的对话流抢带宽（2026-11-27
-// 用户报「退到别处再回来就几兆每秒加载、半天加载不完」的根源之一）。
+// sessionRunState 会话运行态（以内存运行时为准）：是否在执行、库里的状态列、待生效
+// 队列（插话/排队/暂停）、最近一次失败原因。会话详情与 /run 轻接口共用这一份——
+// 「打开会话」连消息一起拿，「后端还在跑吗」的探测只要这一份，两处口径不可能分叉。
+// 响应键：running / status / pending / error
+func (a *App) sessionRunState(m *SessionMeta) map[string]any {
+	return map[string]any{
+		"running": a.IsRunning(m.ID),
+		"status":  m.Status,
+		"pending": a.pendingOf(m.ID),
+		"error":   a.runError(m.ID), // 最近一次失败原因（输入框上方报错条 + 重试）
+	}
+}
+
+// handleSessionRun 会话运行态（轻量，**不带消息**）= sessionRunState + 最后一条用户
+// 发言。前端「后端还在跑吗」的探测——每轮收尾（endTurn）、切回前台（visibilitychange）、
+// 流看门狗重建、壳的刷新按钮、发送断连兜底——全走这里。此前它们调会话详情且不带
+// 分页参数，等于整段历史全量下发：超长对话几 MB，远程手机上切回前台一次就是几 MB
+// 下载，与同一通道上的对话流抢带宽（2026-11-27 用户报「退到别处再回来就几兆每秒
+// 加载、半天加载不完」的根源之一）。
 // 响应：{running, status, pending, error, lastUserChat:{seq,content}|null}
 func (a *App) handleSessionRun(w http.ResponseWriter, r *http.Request) {
 	m := a.sessionFromPath(w, r)
 	if m == nil {
 		return
 	}
-	resp := map[string]any{
-		"running": a.IsRunning(m.ID),
-		"status":  m.Status,
-		"pending": a.pendingOf(m.ID),
-		"error":   a.runError(m.ID),
-		// 发送断连兜底要判「刚才那条消息服务端收下了没」（前端 userChatLanded）：
-		// 只需最后一条用户发言，带在运行态里一并回，省掉一次消息拉取
-		"lastUserChat": nil,
-	}
+	resp := a.sessionRunState(m)
+	// 发送断连兜底要判「刚才那条消息服务端收下了没」（前端 userChatLanded）：
+	// 只需最后一条用户发言，带在运行态里一并回，省掉一次消息拉取
+	resp["lastUserChat"] = nil
 	if last, err := a.Store.LastUserChat(m.ID); err == nil && last != nil {
 		if s, ok := last.Content.(string); ok {
 			resp["lastUserChat"] = map[string]any{"seq": last.Seq, "content": s}

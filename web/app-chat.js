@@ -146,7 +146,7 @@ async function openSession(id, opts) {
   // 放在乐观切换之后：各视图的就位逻辑以 state.cur 为准，此刻它已是目标对话
   if (oldSid !== id) rpRestoreSession(id);
   try {
-    await loadSessionInto(id, tok, { stay: stay });
+    await loadSessionDetail(mainView, id, tok, { stay }); // 取数与落地：与右栏子对话同一条链路
   } catch (e) {
     // 加载失败：留在目标会话的壳里，给原因与「重试」，绝不静默退回旧会话
     if (tok === navTok.main) showChatLoadError(mainView, e.message, () => {
@@ -162,7 +162,7 @@ async function openSession(id, opts) {
 }
 
 // 乐观切换的落地：壳（标题/徽标/输入区/草稿/侧栏高亮）立即换到目标会话，消息区置为
-// 加载态；数据到达后 loadSessionInto / openSubSession 整体接管。列表项当临时 cur，
+// 加载态；数据到达后 loadSessionDetail（openSession / openSubSession 共用）整体接管。列表项当临时 cur，
 // 消息与派生数据清空，_pfxSid 失效（渲染缓存随会话作废）
 function optimisticSwitch(view, brief) {
   const st = view.state;
@@ -180,7 +180,7 @@ function optimisticSwitch(view, brief) {
   st.streamText = '';
   st.streamThinking = '';
   st._pfxSid = null;
-  st._batches = []; // 分批窗口随会话作废（顶条与 older 由 loadSessionInto 重设）
+  st._batches = []; // 分批窗口随会话作废（顶条与 older 由 landSessionDetail 重设）
   st.older = undefined;
   cancelReleaseOlder(view);
   renderLoadOlderBar(view);
@@ -205,7 +205,7 @@ function applySessionChrome(view) {
   syncComposer(view);
   renderPanels(); // 待决定的浮窗跟着会话归属走
   // ① 输入框整体换成目标对话的草稿；② 调用方必须已经「在 cur 改写之前」把源对话
-  // 输入框里的字落过盘（optimisticSwitch / loadSessionInto 各自负责，见那里的注释）——
+  // 输入框里的字落过盘（optimisticSwitch / loadSessionDetail 各自负责，见那里的注释）——
   // 这里不能自己 flush：此刻 st.cur 已是目标对话，flush 等于把源对话的字写进目标键
   try {
     viewEl(view, 'input').value = localStorage.getItem(
@@ -345,7 +345,7 @@ async function loadOlder(view) {
   cancelReleaseOlder(view); // 上翻即取消「到顶释放」计时
   renderLoadOlderBar(view);
   try {
-    const d = await api('/api/sessions/' + sid + '?before_seq=' + firstSeq + '&limit=' + LOAD_BATCH);
+    const d = await fetchSessionDetail(sid, { beforeSeq: firstSeq });
     if (!st.cur || st.cur.id !== sid || !st.msgs.length || st.msgs[0].seq !== firstSeq) return false;
     const batch = d.messages || [];
     if (!batch.length) { st.older = { ...st.older, count: 0 }; return false; }
@@ -479,81 +479,125 @@ function releaseOlder(view) {
   renderLoadOlderBar(view);
 }
 
-async function loadSessionInto(id, tok, opts) {
-  // stay＝停留本页的就地翻新（事件驱动 refreshCurrent）：同会话时保留已上翻
-  // 加载的分批窗口与阅读状态；跨会话/首次打开照旧走全新加载
-  const stay = !!(opts && opts.stay) && !!state.cur && state.cur.id === id;
-  // 分批加载：只取最近 LOAD_BATCH 条（超长对话整包要几 MB，打开即卡）；上方
-  // 剩余的 older 信息由顶条与上翻预取接管。旧后端不认 tail 参数（返回全量且
-  // 无 older 字段）→ 安全降级为现状
-  const data = await api('/api/sessions/' + id + '?tail=' + LOAD_BATCH);
-  // 已被更新的导航（切换/回首页）取代：晚到的旧响应不落地，否则会把界面顶回旧会话
-  if (tok !== navTok.main) return;
-  state._loading = false; // 数据落地：退出加载态（必须在 renderMessages 之前）
-  // 迟到的旧快照（见 snapshotStale）：界面已被流式帧推进到更新，整包不应用，
-  // 只收掉加载态并按现状重绘——壳与列表由后续事件（title/done/session_updated）纠正
-  if (snapshotStale(mainView, id, data.messages)) {
-    // 旧快照丢的只是消息；权限/能力这类配置仍以服务端为准——否则胶囊会被
-    // 这份「不应用」的快照留在旧档（切走再切回才变，正是用户报的现象之一）
-    applySessionPermToViews(data.meta);
-    renderMessages(state.msgs, mainView);
+/* ---------- 会话详情：唯一一条「取数 + 落地」链路 ----------
+   前端所有加载/刷新会话消息的动作，都由下面两个函数承担：
+   ① fetchSessionDetail——唯一一处拼 GET /api/sessions/{id} 请求（tail 整窗 / after_seq 增量 /
+      before_seq 更早一批），服务端三种窗口口径只在这里对接；
+   ② landSessionDetail——唯一一处把详情信封写进视图状态（cur / 消息窗口与 older / pending /
+      checkpoints / deliveries / error 及其直接投影：报错条、分批顶条），三种落地形态：
+        open   全新打开：整窗替换、分批记账清零
+        stay   整窗对齐：只重取基础窗，已上翻加载的头部原样保留、older 扣掉已加载部分
+        delta  增量补拉（after_seq）：只追加断点之后的新消息
+   驱动它的只有两类时机——导航打开（openSession / openSubSession → loadSessionDetail，连壳
+   与周边一起就位）和就地重取（reloadMessages，只动消息与队列）；上翻一批（loadOlder）只借
+   ①取数、自己前插。2026-11-28 之前这里有三份拼请求、三份落地（loadSessionInto /
+   reloadMessages / 右栏 openSubSession 各写一遍），用户追问「是同一条路还是两条相同的路」
+   ——合并成这一条；改加载口径（批量、合并规则、信封字段）只动这两个函数。 */
+function fetchSessionDetail(sid, opts) {
+  opts = opts || {};
+  if (opts.sinceSeq > 0) return api('/api/sessions/' + sid + '?after_seq=' + opts.sinceSeq);
+  if (opts.beforeSeq > 0) return api('/api/sessions/' + sid + '?before_seq=' + opts.beforeSeq + '&limit=' + (opts.limit || LOAD_BATCH));
+  return api('/api/sessions/' + sid + '?tail=' + (opts.tail || LOAD_BATCH));
+}
+
+// 返回 false ＝ 迟到的旧快照（界面已被流式帧推进到更新，同会话才可比，见 snapshotStale）：
+// 什么都不写，调用方按现状重绘即可。旧后端不认 tail 参数（返回全量且无 older 字段）→
+// 安全降级为现状
+function landSessionDetail(view, data, opts) {
+  const st = view.state;
+  const mode = (opts && opts.mode) || 'open';
+  const incoming = data.messages || [];
+  if (mode === 'delta') {
+    // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）。上界取落地时
+    // 的最后序号而非请求时的：期间流/另一次重取已推进的条目不重复追加
+    const upto = Math.max((opts && opts.sinceSeq) || 0, lastSeqOf(view));
+    if (incoming.length) st.msgs = st.msgs.concat(incoming.filter((m) => (m.seq || 0) > upto));
+  } else {
+    if (snapshotStale(view, data.meta && data.meta.id, incoming)) return false;
+    // 整窗：已上翻加载的头部（seq 小于新窗首条）原样保留，older 扣掉已加载部分
+    const head = mode === 'stay' && incoming.length ? st.msgs.filter((m) => m.seq < incoming[0].seq) : [];
+    if (head.length && data.older) data.older = { count: Math.max(0, (data.older.count || 0) - head.length) };
+    st.msgs = head.concat(incoming);
+    st.older = data.older ? { count: data.older.count || 0 } : undefined; // 分批记账：本窗之上的未加载条数
+    if (mode === 'open') st._batches = []; // 全新加载：批栈清零
+  }
+  st.cur = data.meta;
+  landPendingSnapshot(st, data.pending, view); // 在途旧快照不抹掉已画上的排队坞/插话框
+  // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
+  st.queueHeld = st.pendingQueue.length > 0 && !st.queuePaused &&
+    !(data.running || (st.cur && st.cur.status === 'running'));
+  st.checkpoints = data.checkpoints || [];
+  st.deliveries = data.deliveries || [];
+  // 报错条以服务端为准（runError 新一轮开始/重试成功即清）：有就显示、没有就收起
+  if (data.error) showRunError(view, data.error); else hideRunError(view);
+  if (mode !== 'delta') renderLoadOlderBar(view); // 分批顶条：有余量则提示「上面还有 N 条」
+  return true;
+}
+
+// loadSessionDetail 把一条会话打开到视图上：取基础窗 → 落地 → 壳与周边就位 → 在跑就接流。
+// 主对话（openSession）与右栏子对话（openSubSession）共用；导航令牌 tok 由导航方给，
+// 落地前对不上即丢弃（晚到的旧响应不得把界面顶回旧会话）。失败原样抛出，由导航方提示。
+// opts.stay＝停留本页的就地翻新（事件驱动 refreshCurrent）：同会话时保留已上翻加载的
+// 分批窗口与阅读状态；跨会话/首次打开照旧全新加载
+async function loadSessionDetail(view, id, tok, opts) {
+  const st = view.state;
+  const stay = !!(opts && opts.stay) && !!st.cur && st.cur.id === id;
+  // 分批加载：只取最近 LOAD_BATCH 条（超长对话整包要几 MB，打开即卡）；上方剩余的
+  // older 信息由顶条与上翻预取接管
+  const data = await fetchSessionDetail(id);
+  if (tok !== navTok[view.key]) return;
+  st._loading = false; // 数据落地：退出加载态（必须在 renderMessages 之前）
+  // 落盘必须在 cur 改写之前（见 optimisticSwitch 的注释）：列表里查不到 brief 时不走乐观
+  // 切换，cur 此刻还是上一个对话——先把它输入框里的字落到它自己的草稿键
+  if (view === mainView) flushMainDraft(); else flushSubDraft();
+  // 迟到的旧快照：整包不应用，只收掉加载态并按现状重绘——壳与列表由后续事件
+  // （title/done/session_updated）纠正
+  if (!landSessionDetail(view, data, { mode: stay ? 'stay' : 'open' })) {
+    // 旧快照丢的只是消息；权限/能力这类配置仍以服务端为准——否则胶囊会被这份「不应用」
+    // 的快照留在旧档（切走再切回才变，正是用户报的现象之一）
+    if (view === mainView) applySessionPermToViews(data.meta);
+    renderMessages(st.msgs, view);
     return;
   }
-  // 落盘必须在 cur 改写之前（见 optimisticSwitch 的注释）：列表里查不到 brief 时
-  // 不走乐观切换，cur 此刻还是上一个对话——先把它输入框里的字落到它自己的草稿键
-  flushMainDraft();
-  // stay 的分批合并：与 reloadMessages 同款——只重取基础窗，已上翻加载的头部
-  // （seq 小于新窗首条）原样保留，older 扣掉已加载部分
-  if (stay && state.msgs && state.msgs.length && data.messages && data.messages.length) {
-    const head = state.msgs.filter((m) => m.seq < data.messages[0].seq);
-    if (head.length) {
-      data.messages = head.concat(data.messages);
-      if (data.older) data.older = { ...data.older, count: Math.max(0, (data.older.count || 0) - head.length) };
+  if (view === mainView) {
+    // 计划/目标二选一：旧数据可能两个都开着，收敛为只留计划并落库
+    if (st.cur.planMode && st.cur.goalMode) {
+      st.cur.goalMode = false;
+      api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ goalMode: false }) }).catch(() => {});
     }
+  } else {
+    st.streamText = '';
+    st.streamThinking = '';
   }
-  state.cur = data.meta;
-  state.msgs = data.messages || [];
-  // 分批记账：本窗之上的未加载条数、批栈清零
-  state.older = data.older ? { count: data.older.count || 0 } : undefined;
-  if (!stay || !state._batches || !state._batches.length) {
-    state._batches = stay ? (state._batches || []) : [];
+  applySessionChrome(view); // 壳与乐观阶段同一套：标题/徽标/侧栏高亮/输入区/草稿/浮窗
+  if (view === mainView) {
+    refreshDrawer();
+    refreshCtxChip();
+    loadProgress();
+    // 右栏各视图已随切换就位（openSession 的 rpRestoreSession，计划/子对话/文件/Git
+    // 统一走那里）；这里只剩「本对话来了没自动开过的待审批计划」这一件事——
+    // 它在恢复之后跑，必要时把右栏翻到计划视图（比恢复优先：审批等不起）
+    maybeAutoOpenPlan();
+  } else {
+    setSubPlaceholder('向子对话发消息…'); // 已进入子对话：空态的「自动新建」引导退场
   }
-  landPendingSnapshot(state, data.pending, mainView);
-  // 空闲但队列有保留（上轮停止/出错/暂停后留下的）：横幅给「继续」入口
-  state.queueHeld = state.pendingQueue.length > 0 && !state.queuePaused &&
-    !(data.running || (state.cur && state.cur.status === 'running'));
-  state.checkpoints = data.checkpoints || [];
-  state.deliveries = data.deliveries || [];
-  if (data.error) showRunError(mainView, data.error); else hideRunError(mainView);
-  // 计划/目标二选一：旧数据可能两个都开着，收敛为只留计划并落库
-  if (state.cur.planMode && state.cur.goalMode) {
-    state.cur.goalMode = false;
-    api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ goalMode: false }) }).catch(() => {});
-  }
-  applySessionChrome(mainView); // 壳与乐观阶段同一套：标题/徽标/侧栏高亮/输入区/草稿/浮窗
-  refreshDrawer();
-  refreshCtxChip();
-  loadProgress();
-  // 右栏各视图已随切换就位（openSession 的 rpRestoreSession，计划/子对话/文件/Git
-  // 统一走那里）；这里只剩「本对话来了没自动开过的待审批计划」这一件事——
-  // 它在恢复之后跑，必要时把右栏翻到计划视图（比恢复优先：审批等不起）
-  maybeAutoOpenPlan();
-  // stay（事件就地翻新）不 jump：钉住阅读、展开记忆与视口全保留；全新打开
-  // 照旧 jump 到底并清记忆
-  renderMessages(state.msgs, mainView, stay ? null : { jump: true });
-  renderQueueDock(mainView);
-  renderLoadOlderBar(mainView); // 分批顶条：有余量则提示「上面还有 N 条」
+  // stay（事件就地翻新）不 jump：钉住阅读、展开记忆与视口全保留；全新打开照旧 jump 到底并清记忆
+  renderMessages(st.msgs, view, stay ? null : { jump: true });
+  renderQueueDock(view);
   // 打开即视为已读：清红点与绿点
   delete dotDone[id];
-  if (state.cur && state.cur.unread) {
-    state.cur.unread = false;
+  if (st.cur.unread) {
+    st.cur.unread = false;
+    if (view !== mainView) { const kid = subKids.find((k) => k.id === id); if (kid) kid.unread = false; } // 右栏下拉清单数据同步
     api('/api/sessions/' + id, { method: 'PATCH', body: JSON.stringify({ unread: false }) }).catch(() => {});
   }
   // 会话正在执行（含刷新页面后重新打开）：接上它的流，继续实时显示。基础窗刚落地，
   // 接流前的对齐只补断点之后的增量（不再把刚取的窗口再拉一遍）
-  if (!state.streaming && (data.running || state.cur.status === 'running')) attachRun(mainView, { sinceSeq: lastSeqOf(mainView) });
-  loadSessions();
-  JX.emit('session:open', state.cur);
+  if (!st.streaming && (data.running || st.cur.status === 'running')) attachRun(view, { sinceSeq: lastSeqOf(view) });
+  if (view === mainView) {
+    loadSessions();
+    JX.emit('session:open', st.cur);
+  }
 }
 
 /* ---------- 消息渲染（回合分组 + 折叠体系，逻辑对齐数字助理2 的 dsh-transcript-fold） ---------- */
@@ -3233,7 +3277,7 @@ function renderMessages(msgs, view, opts) {
     Object.keys(turnOpen).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) delete turnOpen[k]; });
     Array.from(foldOpenMem.keys()).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) foldOpenMem.delete(k); });
     Array.from(procOpenMem.keys()).forEach((k) => { if (k.lastIndexOf(pfx, 0) === 0) procOpenMem.delete(k); });
-    st._batches = []; // 全新加载：分批窗口重置（loadSessionInto 已设好新 older）
+    st._batches = []; // 全新加载：分批窗口重置（landSessionDetail 已设好新 older）
     cancelReleaseOlder(view);
   }
   anchorSave(view); // 任何重建（前缀全量重建/尾部重建）之前锚定视口（仅钉住阅读时生效）
@@ -6427,8 +6471,8 @@ function applyPending(view, pending, sessionId) {
   if (view.state.cur) renderMessages(view.state.msgs, view);
 }
 
-// landPendingSnapshot 整包加载点（会话详情 loadSessionInto / reloadMessages /
-// 子会话打开）落地 pending 快照：与广播/响应的 applyPending 同一套版本纪律。
+// landPendingSnapshot 整包加载点（会话详情的落地函数 landSessionDetail：导航打开
+// loadSessionDetail 与就地重取 reloadMessages 都经它）落地 pending 快照：与广播/响应的 applyPending 同一套版本纪律。
 // 整包响应在途期间可能又发生队列变更（插话广播已把新状态画上）——旧快照的
 // pending 部分不落地（消息部分由调用方各自的 seq 对账把关），否则插话刚画上
 // 的排队坞/插话框会被迟到的响应抹掉，直到下一次整包刷新才回来（用户看到的
@@ -6978,45 +7022,23 @@ async function refreshIfDangling(view) {
   attachRun(view, { sinceSeq: lastSeqOf(view) }); // 界面已有到这个序号的内容：只补之后的
 }
 
-// reloadMessages 只重取当前会话的消息与待生效队列（不触发接流，避免与 attachRun 互相递归）
-// opts.sinceSeq：增量补拉——带上界面已有的最后一条消息序号，服务端只回这条之后的新消息
-// （?after_seq），追加进列表（流重建自愈 / 跟随后台执行时的节流重取都用它）。此前请求
-// 仍是基础窗 tail、只是落地时按序号筛——网络上一分没省，远程手机上每轮收尾照样拉整窗。
-// 无 sinceSeq 的整窗对齐照旧 ?tail（打开/切回/断流后重对齐）。
+// reloadMessages 就地重取当前会话（不触发接流，避免与 attachRun 互相递归）：只动消息与
+// 队列，不碰壳（壳与周边由 loadSessionDetail 负责）。取数与落地走同一条链路
+// （fetchSessionDetail / landSessionDetail）。opts.sinceSeq：增量补拉——服务端只回这条
+// 序号之后的新消息追加进列表（流重建自愈 / 跟随后台执行时的节流重取都用它）；无
+// sinceSeq 整窗对齐（已上翻加载的头部照旧保留）。
 async function reloadMessages(view, opts) {
   view = view || mainView;
   if (!view.state.cur) return;
-  if (view.state._loading) return; // 会话正在整包加载：由 loadSessionInto 收口，不并发重取
+  if (view.state._loading) return; // 会话正在整包加载：由 loadSessionDetail 收口，不并发重取
   const sinceSeq = (opts && opts.sinceSeq) || 0;
   const nav = navTok[view.key]; // 导航令牌：慢网下响应可能晚于切走/回首页，落地前必须复验
   try {
-    const d = await api('/api/sessions/' + view.state.cur.id + (sinceSeq > 0 ? '?after_seq=' + sinceSeq : '?tail=' + LOAD_BATCH));
+    const d = await fetchSessionDetail(view.state.cur.id, { sinceSeq });
     // 已被更新的导航取代：晚到的旧会话数据不落地——否则 state.cur 被旧 meta 复活、
     // 界面被旧消息顶回旧会话，正是远程访问时「切过去又被跳回来」的根源
     if (nav !== navTok[view.key]) return;
-    const incoming = d.messages || [];
-    if (sinceSeq > 0) {
-      // 增量：断点之后的新消息追加到现有列表（已加载的历史一条不重取）。上界取
-      // 落地时的最后序号而非请求时的：期间流/另一次重取已推进的条目不重复追加
-      const upto = Math.max(sinceSeq, lastSeqOf(view));
-      if (incoming.length) view.state.msgs = view.state.msgs.concat(incoming.filter((m) => (m.seq || 0) > upto));
-    } else {
-      if (snapshotStale(view, view.state.cur.id, incoming)) return; // 迟到的旧快照：界面已被流式帧推进，不回退
-      const head = incoming.length ? view.state.msgs.filter((m) => m.seq < incoming[0].seq) : [];
-      if (head.length) {
-        d.messages = head.concat(incoming);
-        if (d.older) d.older = { count: Math.max(0, (d.older.count || 0) - head.length) };
-      }
-      view.state.older = d.older ? { count: d.older.count || 0 } : undefined;
-      renderLoadOlderBar(view);
-      view.state.msgs = d.messages || [];
-    }
-    view.state.cur = d.meta;
-    landPendingSnapshot(view.state, d.pending, view); // 在途旧快照不抹掉已画上的排队坞/插话框
-    view.state.checkpoints = d.checkpoints || [];
-    view.state.deliveries = d.deliveries || [];
-    // 上一轮失败过就继续显示报错条（刷新/切换回来都还在，方便接着重试）
-    if (d.error) showRunError(view, d.error);
+    if (!landSessionDetail(view, d, { mode: sinceSeq > 0 ? 'delta' : 'stay', sinceSeq })) return; // 迟到的旧快照：保持现状
   } catch (e) { return; /* 取不到就保持现状 */ }
   renderQueueDock(view);
   renderMessages(view.state.msgs, view);
@@ -7059,9 +7081,10 @@ async function attachRun(view, opts) {
     refreshDrawer();
     refreshCtxChip(subView);
   }
-  // 本轮可能是排队消息驱动的：它发完还有下一条，继续跟着看
+  // 本轮可能是排队消息驱动的：它发完还有下一条，继续跟着看（界面已有全部内容，
+  // 接流前的对齐同样只补增量）
   if (view.state.cur && view.state.cur.id === cur.id && view.state.abort === abort) {
-    if (await backendRunning(cur.id, view)) attachRun(view);
+    if (await backendRunning(cur.id, view)) attachRun(view, { sinceSeq: lastSeqOf(view) });
   }
 }
 

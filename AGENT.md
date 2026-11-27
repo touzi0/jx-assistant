@@ -248,6 +248,16 @@ Python 依赖按「谁用谁带走」归位，禁止混装：
   探测改走 `/run`、所有增量补拉改走 `after_seq`；修后切回前台只剩 `/run` 24 ms，
   小请求 7 ms。**今后凡是要「会话状态」的地方一律 `/run`，要看消息就带 `tail` /
   `before_seq` / `after_seq`，别再调裸的详情。**
+  前端同样是**一条链路、不是几条相同的路**（2026-11-28 用户追问「两边改成一样」
+  不够——他要的是同一个函数）：会话详情的「取数」只有 `fetchSessionDetail()`（唯一
+  拼请求处）、「落地」只有 `landSessionDetail()`（唯一把信封写进视图状态处，open /
+  stay / delta 三种形态）；导航打开只有 `loadSessionDetail(view,…)`（主对话 openSession
+  与右栏 openSubSession 共用，此前右栏另抄了一份），就地重取只有 `reloadMessages()`，
+  `reloadMessagesSoon` 是它的节流、`refreshCurrent/refreshCurrentSub` 是 `openSession
+  (stay)` / `openSubSession` 的事件壳、`resumeStreamCheck` / `reviveSessionStream` /
+  `refreshIfDangling` 不取消息（探 `/run` 后交 attachRun / reloadMessages）；上翻
+  `loadOlder` 只借 fetchSessionDetail 取 `before_seq` 一批自己前插。**新增任何「拿会话
+  消息」的需求都走这两个函数，别再 `api('/api/sessions/'+id…)` 自己拼。**
 
 ### 能不造轮子就不造轮子
 
@@ -2256,7 +2266,7 @@ mcpHost 接口注入：插件侧 ccPluginHost 做 ${CLAUDE_PLUGIN_ROOT} 等替�
 | `GET /api/models` / `POST /api/providers/fetch` | 模型清单 / 从提供方拉取模型 |
 | `GET/POST /api/sessions` | 会话列表（`?parent=` 查子会话；列表项带 `status=running` 与异常中断标记 `lastStop`）/ 创建（mode/parent/provider/model） |
 | `GET/PATCH/DELETE /api/sessions/{id}` | 详情（含 `running` / `pending` / `error`：执行中、待生效消息、最近一次失败原因）。**消息窗口只有三种口径、没有隐式全量**（2026-11-27 起）：`?tail=N` 最近 N 条（回合对齐，`older.count` = 切点前剩余；不带参数 = 缺省 1000）、`?before_seq=S&limit=N` 更早一批（上翻接力）、`?after_seq=S` 只回 seq>S 的增量（无 older；流断线补拉/跟随后台执行用）。真要全量只有 `/export` 与历史读取工具（直读库）。/ 改标题、工作区、模型 / 删除 |
-| `GET /api/sessions/{id}/run` | 会话运行态轻接口（**不带消息**）：`{running, status, pending, error, lastUserChat}`。前端「后端还在跑吗」的探测（每轮收尾、切回前台、流看门狗重建、壳刷新按钮）与发送断连兜底全走它——此前探测调的是不带参数的详情＝整段历史全量下发，超长对话在远程手机上一次就是几 MB（见「远程访问形态」铁律） |
+| `GET /api/sessions/{id}/run` | 会话运行态轻接口（**不带消息**）= `sessionRunState`（`{running, status, pending, error}`，与详情响应同一份代码）+ `lastUserChat`。前端「后端还在跑吗」的探测（每轮收尾、切回前台、流看门狗重建、壳刷新按钮）与发送断连兜底全走它——此前探测调的是不带参数的详情＝整段历史全量下发，超长对话在远程手机上一次就是几 MB（见「远程访问形态」铁律） |
 | `POST /api/sessions/{id}/chat` | 发送消息；SSE 流式返回。**执行体独立于本请求**：浏览器刷新/关页只断开这条流，执行照旧跑完并落库 |
 | `GET /api/sessions/{id}/stream` | 接上正在执行的会话流（刷新页面/换窗口后继续看实时输出）；未在执行时立刻回一帧 `done` |
 | `POST /api/sessions/{id}/stop` | 显式停止本会话执行（流断开不再等于停止） |
